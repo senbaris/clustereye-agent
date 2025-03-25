@@ -1,0 +1,15 @@
+key: xxxx-xxxx-xxxx-xxxx
+name: Agent
+grpc:
+  server_address: 143.198.61.173:50051
+postgresql:
+  host: localhost
+  user: bariss
+  pass: postgres
+  port: 5432
+  cluster: postgres
+mongo:
+  user: mongo
+  pass: mongo
+  port: 27017
+  replset: rs0
