@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -18,11 +19,12 @@ import (
 
 // Reporter toplanan verileri merkezi sunucuya raporlar
 type Reporter struct {
-	cfg         *config.AgentConfig
-	grpcClient  *grpc.ClientConn
-	stream      pb.AgentService_ConnectClient
-	stopCh      chan struct{}
-	isListening bool
+	cfg          *config.AgentConfig
+	grpcClient   *grpc.ClientConn
+	stream       pb.AgentService_ConnectClient
+	stopCh       chan struct{}
+	isListening  bool
+	reportTicker *time.Ticker // Periyodik raporlama için ticker
 }
 
 // NewReporter yeni bir Reporter örneği oluşturur
@@ -64,6 +66,9 @@ func (r *Reporter) Connect() error {
 func (r *Reporter) Disconnect() {
 	close(r.stopCh)
 	r.isListening = false
+	if r.reportTicker != nil {
+		r.reportTicker.Stop()
+	}
 	if r.grpcClient != nil {
 		r.grpcClient.Close()
 		log.Printf("GRPC bağlantısı kapatıldı")
@@ -94,35 +99,79 @@ func (r *Reporter) AgentRegistration(testResult string) error {
 	hostname, _ := os.Hostname()
 	ip := utils.GetLocalIP()
 
-	// Agent bilgilerini gönder
-	agentInfo := &pb.AgentMessage{
+	// Yeni Register RPC'sini kullanarak kaydolmayı dene
+	client := pb.NewAgentServiceClient(r.grpcClient)
+
+	// Agent bilgilerini hazırla
+	agentInfo := &pb.AgentInfo{
+		Key:          r.cfg.Key,
+		AgentId:      "agent_" + hostname,
+		Hostname:     hostname,
+		Ip:           ip,
+		Platform:     r.cfg.PostgreSQL.Cluster,
+		Auth:         r.cfg.PostgreSQL.Auth,
+		Test:         testResult,
+		PostgresUser: r.cfg.PostgreSQL.User,
+		PostgresPass: r.cfg.PostgreSQL.Pass,
+	}
+
+	// RegisterRequest oluştur
+	registerRequest := &pb.RegisterRequest{
+		AgentInfo: agentInfo,
+	}
+
+	// Register RPC'sini çağır
+	registerResp, err := client.Register(context.Background(), registerRequest)
+	if err == nil {
+		// Başarılı kayıt
+		log.Printf("Agent kaydı başarıyla tamamlandı. Sonuç: %s", registerResp.Registration.String())
+
+		// Kayıt işlemi tamamlandıktan sonra komut dinlemeyi başlat
+		if !r.isListening {
+			go r.listenForCommands()
+			r.isListening = true
+			log.Println("Sunucudan komut dinleme başlatıldı")
+		}
+
+		// Periyodik raporlamayı başlat (örneğin her 30 saniyede bir)
+		r.StartPeriodicReporting(30 * time.Second)
+
+		// İlk PostgreSQL bilgilerini gönder
+		if err := r.SendPostgresInfo(); err != nil {
+			log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
+		}
+
+		return nil
+	}
+
+	// Eğer yeni RPC çağrısı başarısız olursa, eski yöntemi dene (geriye dönük uyumluluk)
+	log.Printf("Yeni Register RPC çağrısı başarısız oldu: %v. Eski yöntem deneniyor...", err)
+
+	// Eski yöntem: Agent bilgilerini stream üzerinden gönder
+	agentMessage := &pb.AgentMessage{
 		Payload: &pb.AgentMessage_AgentInfo{
-			AgentInfo: &pb.AgentInfo{
-				Key:          r.cfg.Key,
-				AgentId:      "agent_" + hostname,
-				Hostname:     hostname,
-				Ip:           ip,
-				Platform:     r.cfg.PostgreSQL.Cluster,
-				Auth:         r.cfg.PostgreSQL.Auth,
-				Test:         testResult,
-				PostgresUser: r.cfg.PostgreSQL.User,
-				PostgresPass: r.cfg.PostgreSQL.Pass,
-			},
+			AgentInfo: agentInfo,
 		},
 	}
 
-	err := r.stream.Send(agentInfo)
+	err = r.stream.Send(agentMessage)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Agent kaydı başarıyla tamamlandı. Test sonucu: %s", testResult)
+	log.Printf("Agent kaydı başarıyla tamamlandı (eski yöntem). Test sonucu: %s", testResult)
 
 	// Kayıt işlemi tamamlandıktan sonra komut dinlemeyi başlat
 	if !r.isListening {
 		go r.listenForCommands()
 		r.isListening = true
 		log.Println("Sunucudan komut dinleme başlatıldı")
+	}
+
+	// PostgreSQL bilgilerini gönder
+	if err := r.SendPostgresInfo(); err != nil {
+		log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
+		// Bilgi gönderimi başarısız olsa bile agent kaydı tamamlandı, bu yüzden hata döndürme
 	}
 
 	return nil
@@ -221,4 +270,82 @@ func processQuery(command string) map[string]interface{} {
 		"result":  "Command executed successfully",
 		"time":    time.Now().String(),
 	}
+}
+
+// SendPostgresInfo PostgreSQL bilgilerini sunucuya gönderir
+func (r *Reporter) SendPostgresInfo() error {
+	log.Println("PostgreSQL bilgileri toplanıyor...")
+
+	// Hostname ve IP bilgilerini al
+	hostname, _ := os.Hostname()
+	ip := utils.GetLocalIP()
+
+	// Disk kullanım bilgilerini al
+	freeDisk, fdPercent := postgres.GetDiskUsage()
+
+	// Node durumunu al
+	nodeStatus := postgres.GetNodeStatus()
+
+	// PostgreSQL bilgilerini oluştur
+	pgInfo := &pb.PostgresInfo{
+		ClusterName:       r.cfg.PostgreSQL.Cluster,
+		Location:          r.cfg.PostgreSQL.Location,
+		Hostname:          hostname,
+		Ip:                ip,
+		PgServiceStatus:   postgres.GetPGServiceStatus(),
+		PgBouncerStatus:   "FAIL!",
+		PgVersion:         postgres.GetPGVersion(),
+		FreeDisk:          freeDisk,
+		FdPercent:         int32(fdPercent),
+		NodeStatus:        nodeStatus,
+		ReplicationLagSec: int64(postgres.GetReplicationLagSec()),
+	}
+
+	// Yeni SendPostgresInfo RPC'sini kullanarak verileri gönder
+	client := pb.NewAgentServiceClient(r.grpcClient)
+
+	// PostgresInfoRequest oluştur
+	request := &pb.PostgresInfoRequest{
+		PostgresInfo: pgInfo,
+	}
+
+	// SendPostgresInfo RPC'sini çağır
+	response, err := client.SendPostgresInfo(context.Background(), request)
+	if err != nil {
+		log.Printf("PostgreSQL bilgileri yeni RPC ile gönderilemedi: %v. Eski yöntem deneniyor...", err)
+
+		// Eski yöntem: Stream üzerinden gönder
+		err = r.Report(pgInfo)
+		if err != nil {
+			log.Printf("PostgreSQL bilgileri eski yöntemle de gönderilemedi: %v", err)
+			return err
+		}
+
+		log.Println("PostgreSQL bilgileri başarıyla eski yöntemle gönderildi")
+		return nil
+	}
+
+	log.Printf("PostgreSQL bilgileri başarıyla gönderildi. Sunucu durumu: %s", response.Status)
+	return nil
+}
+
+// StartPeriodicReporting periyodik raporlamayı başlatır
+func (r *Reporter) StartPeriodicReporting(interval time.Duration) {
+	r.reportTicker = time.NewTicker(interval)
+
+	go func() {
+		for {
+			select {
+			case <-r.stopCh:
+				r.reportTicker.Stop()
+				return
+			case <-r.reportTicker.C:
+				if err := r.SendPostgresInfo(); err != nil {
+					log.Printf("Periyodik raporlama hatası: %v", err)
+				}
+			}
+		}
+	}()
+
+	log.Printf("Periyodik raporlama başlatıldı (aralık: %v)", interval)
 }

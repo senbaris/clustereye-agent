@@ -4,7 +4,7 @@ go 1.24.1
 
 require (
 	github.com/lib/pq v1.10.9
-	github.com/sefaphlvn/clustereye-test v0.0.0-20250325181355-5b2484b69248
+	github.com/sefaphlvn/clustereye-test v0.0.0-20250326064055-482065e05746
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v2 v2.4.0

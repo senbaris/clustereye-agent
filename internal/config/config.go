@@ -17,12 +17,13 @@ type AgentConfig struct {
 
 	// PostgreSQL Bağlantı Bilgileri
 	PostgreSQL struct {
-		Host    string `yaml:"host"`
-		User    string `yaml:"user"`
-		Pass    string `yaml:"pass"`
-		Port    string `yaml:"port"`
-		Cluster string `yaml:"cluster"`
-		Auth    bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
+		Host     string `yaml:"host"`
+		User     string `yaml:"user"`
+		Pass     string `yaml:"pass"`
+		Port     string `yaml:"port"`
+		Cluster  string `yaml:"cluster"`
+		Auth     bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
+		Location string `yaml:"location"`
 	} `yaml:"postgresql"`
 
 	// MongoDB Bağlantı Bilgileri
