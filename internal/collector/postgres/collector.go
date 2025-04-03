@@ -153,7 +153,6 @@ func getDataDirectoryFromConfig() (string, error) {
 		line = strings.Split(line, "#")[0]
 		line = strings.TrimSpace(line)
 
-		log.Printf("Checking line: %s", line) // Debug log
 
 		if strings.HasPrefix(line, "data_directory") {
 			// Split on = and handle any whitespace
@@ -230,4 +229,14 @@ func GetReplicationLagSec() float64 {
 	}
 
 	return lag
+}
+
+// GetPGBouncerStatus PgBouncer servisinin durumunu kontrol eder
+func GetPGBouncerStatus() string {
+	out, err := exec.Command("pgrep", "pgbouncer").Output()
+	if err != nil || len(out) == 0 {
+		log.Println("pgrep pgbouncer returns empty", out, err)
+		return "FAIL!"
+	}
+	return "RUNNING"
 }

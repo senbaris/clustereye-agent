@@ -293,7 +293,7 @@ func (r *Reporter) SendPostgresInfo() error {
 		Hostname:          hostname,
 		Ip:                ip,
 		PgServiceStatus:   postgres.GetPGServiceStatus(),
-		PgBouncerStatus:   "FAIL!",
+		PgBouncerStatus:   postgres.GetPGBouncerStatus(),
 		PgVersion:         postgres.GetPGVersion(),
 		FreeDisk:          freeDisk,
 		FdPercent:         int32(fdPercent),
