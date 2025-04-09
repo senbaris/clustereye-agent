@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"log"
 
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
@@ -28,30 +29,31 @@ func NewAgent(cfg *config.AgentConfig) *Agent {
 	}
 }
 
-// Start agent'ı başlatır
+// Agent tarafında
 func (a *Agent) Start() error {
-	log.Printf("Agent başlatılıyor: %s", a.cfg.Name)
+    log.Printf("Agent başlatılıyor: %s", a.cfg.Name)
 
-	// GRPC bağlantısını başlat
-	if err := a.reporter.Connect(); err != nil {
-		return err
-	}
+    // GRPC bağlantısını başlat
+    err := a.reporter.Connect()
+    if err != nil {
+        return err
+    }
 
-	// PostgreSQL bağlantı testi yap
-	testResult := a.collector.TestPostgresConnection()
-	log.Printf("PostgreSQL bağlantı testi sonucu: %s", testResult)
+    // PostgreSQL bağlantı testi yap
+    testResult := a.collector.TestPostgresConnection()
+    log.Printf("PostgreSQL bağlantı testi sonucu: %s", testResult)
 
-	// Agent kaydını yap ve test sonucunu bildir
-	if err := a.reporter.AgentRegistration(testResult); err != nil {
-		log.Printf("Agent kaydı yapılamadı: %v", err)
-		return err
-	}
+    // Agent bilgilerini stream üzerinden gönder
+    err = a.reporter.AgentRegistration(testResult)
+    if err != nil {
+        return fmt.Errorf("agent bilgileri gönderilemedi: %v", err)
+    }
 
-	// Veri toplama işlemini başlat
-	go a.collectData()
+    // Veri toplama işlemini başlat
+    go a.collectData()
 
-	log.Printf("Agent başarıyla başlatıldı: %s", a.cfg.Name)
-	return nil
+    log.Printf("Agent başarıyla başlatıldı: %s", a.cfg.Name)
+    return nil
 }
 
 // Stop agent'ı durdurur
