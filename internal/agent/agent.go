@@ -17,6 +17,7 @@ type Agent struct {
 	collector *collector.Collector
 	reporter  *reporter.Reporter
 	stopCh    chan struct{}
+	platform  string // Hangi platform için çalışıyor (postgres veya mongo)
 }
 
 // NewAgent yeni bir Agent örneği oluşturur
@@ -26,34 +27,65 @@ func NewAgent(cfg *config.AgentConfig) *Agent {
 		collector: collector.NewCollector(cfg),
 		reporter:  reporter.NewReporter(cfg),
 		stopCh:    make(chan struct{}),
+		platform:  "postgres", // Varsayılan olarak postgres
 	}
+}
+
+// SetPlatform agent'ın çalışacağı platformu ayarlar
+func (a *Agent) SetPlatform(platform string) {
+	a.platform = platform
+	log.Printf("Agent platformu ayarlandı: %s", platform)
 }
 
 // Agent tarafında
 func (a *Agent) Start() error {
-    log.Printf("Agent başlatılıyor: %s", a.cfg.Name)
+	log.Printf("Agent başlatılıyor: %s (Platform: %s)", a.cfg.Name, a.platform)
 
-    // GRPC bağlantısını başlat
-    err := a.reporter.Connect()
-    if err != nil {
-        return err
-    }
+	// GRPC bağlantısını başlat
+	err := a.reporter.Connect()
+	if err != nil {
+		return err
+	}
 
-    // PostgreSQL bağlantı testi yap
-    testResult := a.collector.TestPostgresConnection()
-    log.Printf("PostgreSQL bağlantı testi sonucu: %s", testResult)
+	// Platforma göre bağlantı testi yap
+	var testResult string
+	if a.platform == "postgres" {
+		testResult = a.collector.TestPostgresConnection()
+		log.Printf("PostgreSQL bağlantı testi sonucu: %s", testResult)
+	} else if a.platform == "mongo" {
+		testResult = a.testMongoConnection()
+		log.Printf("MongoDB bağlantı testi sonucu: %s", testResult)
+	}
 
-    // Agent bilgilerini stream üzerinden gönder
-    err = a.reporter.AgentRegistration(testResult)
-    if err != nil {
-        return fmt.Errorf("agent bilgileri gönderilemedi: %v", err)
-    }
+	// Agent bilgilerini stream üzerinden gönder
+	err = a.reporter.AgentRegistration(testResult, a.platform)
+	if err != nil {
+		return fmt.Errorf("agent bilgileri gönderilemedi: %v", err)
+	}
 
-    // Veri toplama işlemini başlat
-    go a.collectData()
+	// Veri toplama işlemini başlat
+	go a.collectData()
 
-    log.Printf("Agent başarıyla başlatıldı: %s", a.cfg.Name)
-    return nil
+	log.Printf("Agent başarıyla başlatıldı: %s", a.cfg.Name)
+	return nil
+}
+
+// testMongoConnection MongoDB bağlantısını test eder
+func (a *Agent) testMongoConnection() string {
+	// MongoDB bağlantı testi yap
+	log.Printf("MongoDB bağlantısı test ediliyor...")
+
+	mongoStatus := "Unknown"
+
+	// MongoDB bağlantısı test et
+	result, err := a.collector.TestMongoConnection()
+	if err != nil {
+		mongoStatus = fmt.Sprintf("ERROR: %v", err)
+	} else {
+		mongoStatus = result
+	}
+
+	return mongoStatus
 }
 
 // Stop agent'ı durdurur
@@ -65,20 +97,40 @@ func (a *Agent) Stop() {
 
 // collectData periyodik olarak veri toplar ve raporlar
 func (a *Agent) collectData() {
+	// Platforma göre farklı veri toplama metodu kullan
+	if a.platform == "postgres" {
+		// PostgreSQL bilgilerini topla
+		info := pb.PostgresInfo{
+			ClusterName:       a.cfg.PostgreSQL.Cluster,
+			Ip:                "127.0.0.1",
+			Hostname:          "localhost",
+			NodeStatus:        "RUNNING",
+			PgVersion:         "15.1",
+			Location:          a.cfg.PostgreSQL.Location,
+			PgBouncerStatus:   postgres.GetPGBouncerStatus(),
+			PgServiceStatus:   postgres.GetPGServiceStatus(),
+			ReplicationLagSec: 0,
+			FreeDisk:          "100GB",
+			FdPercent:         100,
+		}
 
-	info := pb.PostgresInfo{
-		ClusterName:       "clusterName",
-		Ip:                "127.0.0.1",
-		Hostname:          "localhost",
-		NodeStatus:        "RUNNING",
-		PgVersion:         "15.1",
-		Location:          "istanbul",
-		PgBouncerStatus:   "RUNNING",
-		PgServiceStatus:   postgres.GetPGServiceStatus(),
-		ReplicationLagSec: 0,
-		FreeDisk:          "100GB",
-		FdPercent:         100,
+		a.reporter.Report(&info)
+	} else if a.platform == "mongo" {
+		// MongoDB bilgilerini topla ve raporla
+		a.reportMongoInfo()
 	}
+}
 
-	a.reporter.Report(&info)
+// reportMongoInfo MongoDB bilgilerini toplar ve raporlar
+func (a *Agent) reportMongoInfo() {
+	// MongoDB bilgilerini topla
+	log.Printf("MongoDB bilgileri toplanıyor...")
+
+	// MongoDB bilgilerini raporla
+	err := a.reporter.SendMongoInfo()
+	if err != nil {
+		log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
+	} else {
+		log.Printf("MongoDB bilgileri başarıyla raporlandı")
+	}
 }

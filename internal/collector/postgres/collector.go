@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"log"
@@ -17,6 +18,25 @@ import (
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
 )
+
+// PostgresLogFile PostgreSQL log dosyasını temsil eder
+type PostgresLogFile struct {
+	Name         string
+	Path         string
+	Size         int64
+	LastModified int64
+}
+
+// ToProto PostgreSQL log dosyasını proto mesajına dönüştürür
+// NOT: Proto dosyasına FileInfo eklendiğinde bunu güncelleyin
+func (p *PostgresLogFile) ToProto() map[string]interface{} {
+	return map[string]interface{}{
+		"name":          p.Name,
+		"path":          p.Path,
+		"size":          p.Size,
+		"last_modified": p.LastModified,
+	}
+}
 
 // OpenDB veritabanı bağlantısını açar
 func OpenDB() (*sql.DB, error) {
@@ -597,4 +617,394 @@ func getUptime() (int64, error) {
 		return 0, err
 	}
 	return time.Now().Unix() - bootTime, nil
+}
+
+// isMatchingPostgresLogName dosya adının PostgreSQL log dosyası kalıbına uyup uymadığını kontrol eder
+func isMatchingPostgresLogName(fileName string) bool {
+	// PostgreSQL log dosyası adı kalıpları
+	patterns := []string{
+		"postgresql",
+		"postgres",
+		"pg_log",
+		"pglog",
+		"pgsql",
+	}
+
+	lowerName := strings.ToLower(fileName)
+
+	// Dosya adı kalıplarını kontrol et
+	for _, pattern := range patterns {
+		if strings.HasPrefix(lowerName, pattern) {
+			return true
+		}
+	}
+
+	// Tarih formatı içeren log dosyaları kontrolü (postgresql-2023-06-01.log gibi)
+	postgresLogPattern := regexp.MustCompile(`(postgres|postgresql|pg_log|pglog).*\d{4}[-_]\d{2}[-_]\d{2}`)
+	if postgresLogPattern.MatchString(lowerName) {
+		return true
+	}
+
+	return false
+}
+
+// isPostgresArtifact bir dosyanın PostgreSQL log dosyası olup olmadığını kontrol eder
+func isPostgresArtifact(name string) bool {
+	// Dosya adını küçük harfe çevir
+	nameLower := strings.ToLower(name)
+
+	// 1. Dosya uzantısı kontrolü
+	if !strings.HasSuffix(nameLower, ".log") &&
+		!strings.HasSuffix(nameLower, ".csv") &&
+		!strings.HasSuffix(nameLower, ".log.gz") {
+		return false
+	}
+
+	// 2. PostgreSQL ile ilgili anahtar kelimeler kontrolü
+	if !isMatchingPostgresLogName(nameLower) {
+		return false
+	}
+
+	return true
+}
+
+// FindPostgresLogFiles PostgreSQL log dosyalarını bulur ve listeler
+func FindPostgresLogFiles(logPath string) ([]*pb.PostgresLogFile, error) {
+	// PostgreSQL çalışıyor mu kontrol et
+	pgRunning := isPgRunning()
+	if !pgRunning {
+		return nil, fmt.Errorf("PostgreSQL servisi çalışmıyor, log dosyaları listelenemedi")
+	}
+
+	// Eğer logPath belirtilmemişse, varsayılan olarak bilinen lokasyonları kontrol et
+	if logPath == "" {
+		// PostgreSQL konfigürasyon dosyasını bul
+		configFile, err := findPostgresConfigFile()
+		if err == nil {
+			// Konfigürasyondan log path'i oku
+			if path := getLogPathFromConfig(configFile); path != "" {
+				logPath = path
+				log.Printf("PostgreSQL log dizini konfigürasyon dosyasından bulundu: %s", path)
+			}
+		}
+
+		// Hala log path bulunamadıysa, bilinen dizinleri kontrol et
+		if logPath == "" {
+			// Bilinen olası PostgreSQL log dizinleri
+			logDirs := []string{
+				"/var/log/postgresql",
+				"/var/log/postgres",
+				"/var/lib/postgresql/*/main/pg_log",
+				"/var/lib/postgresql/*/log",
+				"/var/lib/pgsql/data/log",
+				"/var/lib/pgsql/data/pg_log",
+				"/usr/local/var/postgres/log",
+				"/usr/local/var/postgres/pg_log",
+				"/usr/local/pgsql/data/pg_log",
+				"/usr/local/pgsql/data/log",
+				"/opt/homebrew/var/postgres/log", // macOS Homebrew Apple Silicon
+				"/usr/local/var/log/postgresql",
+				"/data/postgres/*/log",
+				"/data/postgres/*/pg_log",
+			}
+
+			// PostgreSQL veri dizinini bulmayı dene
+			dataDir, err := getDataDirectoryFromConfig()
+			if err == nil && dataDir != "" {
+				// Data dizinindeki log dizinini kontrol et
+				logDirs = append([]string{
+					filepath.Join(dataDir, "log"),
+					filepath.Join(dataDir, "pg_log"),
+					filepath.Join(dataDir, "logs"),
+				}, logDirs...)
+				log.Printf("PostgreSQL veri dizini bulundu, log için kontrol ediliyor: %s/{log,pg_log,logs}", dataDir)
+			}
+
+			// İlk bulunan geçerli dizini kullan
+			for _, dirPattern := range logDirs {
+				// Glob pattern'ı destekle
+				matches, err := filepath.Glob(dirPattern)
+				if err != nil || len(matches) == 0 {
+					continue
+				}
+
+				for _, dir := range matches {
+					if _, err := os.Stat(dir); err == nil {
+						logPath = dir
+						log.Printf("PostgreSQL log dizini bulundu: %s", logPath)
+						break
+					}
+				}
+				if logPath != "" {
+					break
+				}
+			}
+		}
+	}
+
+	if logPath == "" {
+		return nil, fmt.Errorf("PostgreSQL log dizini bulunamadı")
+	}
+
+	// logPath'in var olup olmadığını kontrol et
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("belirtilen log dizini bulunamadı: %v", err)
+	}
+
+	var logFiles []*pb.PostgresLogFile
+
+	// Eğer belirtilen path bir dosya ise ve PostgreSQL log dosyası ise, direkt olarak onu ekle
+	if !info.IsDir() {
+		if isPostgresArtifact(filepath.Base(logPath)) {
+			file := &pb.PostgresLogFile{
+				Name:         filepath.Base(logPath),
+				Path:         logPath,
+				Size:         info.Size(),
+				LastModified: info.ModTime().Unix(),
+			}
+			return []*pb.PostgresLogFile{file}, nil
+		}
+		return nil, fmt.Errorf("belirtilen dosya bir PostgreSQL log dosyası değil: %s", logPath)
+	}
+
+	// Dizindeki tüm dosyaları listele
+	entries, err := os.ReadDir(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("dizin içeriği listelenemedi: %v", err)
+	}
+
+	// Her bir dosyayı kontrol et
+	for _, entry := range entries {
+		// Sadece dosyaları işle
+		if entry.IsDir() {
+			continue
+		}
+
+		fileName := entry.Name()
+		if isPostgresArtifact(fileName) {
+			fileInfo, err := os.Stat(filepath.Join(logPath, fileName))
+			if err != nil {
+				log.Printf("Dosya bilgileri alınamadı: %v", err)
+				continue
+			}
+
+			file := &pb.PostgresLogFile{
+				Name:         fileName,
+				Path:         filepath.Join(logPath, fileName),
+				Size:         fileInfo.Size(),
+				LastModified: fileInfo.ModTime().Unix(),
+			}
+			logFiles = append(logFiles, file)
+			log.Printf("PostgreSQL log dosyası bulundu: %s", file.Path)
+		}
+	}
+
+	if len(logFiles) == 0 {
+		log.Printf("Belirtilen dizinde (%s) PostgreSQL log dosyası bulunamadı", logPath)
+	} else {
+		log.Printf("%d adet PostgreSQL log dosyası bulundu", len(logFiles))
+	}
+
+	return logFiles, nil
+}
+
+// isPgRunning PostgreSQL servisinin çalışıp çalışmadığını kontrol eder
+func isPgRunning() bool {
+	cmd := exec.Command("pgrep", "postgres")
+	err := cmd.Run()
+	return err == nil
+}
+
+// findPostgresLogPathFromProcess PostgreSQL process'inden log dosyası yolunu bulmayı dener
+func findPostgresLogPathFromProcess() string {
+	// 1. ps ile tüm PostgreSQL süreçlerini bul
+	cmd := exec.Command("sh", "-c", "ps -ef | grep postgres | grep -v grep")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		// -D parametresinden sonra data directory'yi bul
+		if idx := strings.Index(line, "-D"); idx != -1 {
+			parts := strings.Fields(line[idx:])
+			if len(parts) > 1 {
+				dataDir := parts[1]
+				// Data directory içinde log ve pg_log dizinlerini kontrol et
+				for _, logDir := range []string{"log", "pg_log", "logs"} {
+					fullPath := filepath.Join(dataDir, logDir)
+					if _, err := os.Stat(fullPath); err == nil {
+						return fullPath
+					}
+				}
+			}
+		}
+
+		// -l veya --log parametresini ara
+		if idx := strings.Index(line, "-l "); idx != -1 || strings.Index(line, "--log=") != -1 {
+			parts := strings.Fields(line[idx:])
+			if len(parts) > 0 {
+				logArg := parts[0]
+				if strings.Contains(logArg, "=") {
+					parts = strings.Split(logArg, "=")
+					if len(parts) > 1 {
+						return strings.TrimSpace(parts[1])
+					}
+				} else if len(parts) > 1 {
+					return strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// findLogFileFromOpenFD açık dosya tanımlayıcılarını kontrol ederek PostgreSQL log dosyalarını bulmayı dener
+func findLogFileFromOpenFD() string {
+	// PostgreSQL PID'sini bul
+	cmd := exec.Command("sh", "-c", "pgrep postgres")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return ""
+	}
+
+	// lsof ile açık dosyaları listele
+	cmd = exec.Command("sh", "-c", fmt.Sprintf("lsof -p %s | grep -i -E '(log|postgres)'", pid))
+	out, err = cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 {
+			filePath := fields[8]
+			// Dosya yolunu kontrol et
+			if strings.Contains(strings.ToLower(filePath), "postgres") && (strings.HasSuffix(strings.ToLower(filePath), ".log") ||
+				strings.Contains(strings.ToLower(filePath), "pg_log") ||
+				strings.Contains(strings.ToLower(filePath), "postgresql")) {
+				return filePath
+			}
+		}
+	}
+
+	return ""
+}
+
+// isPostgresLogFile dosya içeriğini kontrol ederek PostgreSQL log formatına uygun olup olmadığını belirler
+func isPostgresLogFile(filePath string) bool {
+	// Dosyanın ilk birkaç satırını oku
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	linesChecked := 0
+	for scanner.Scan() && linesChecked < 5 {
+		line := scanner.Text()
+		// PostgreSQL log satırları genellikle tarih formatı ve bazı anahtar kelimeler içerir
+		if strings.Contains(line, "postgres") ||
+			strings.Contains(line, "postgresql") ||
+			strings.Contains(line, "LOG:") ||
+			strings.Contains(line, "ERROR:") ||
+			strings.Contains(line, "FATAL:") ||
+			strings.Contains(line, "WARNING:") ||
+			strings.Contains(line, "HINT:") ||
+			strings.Contains(line, "STATEMENT:") {
+			return true
+		}
+		linesChecked++
+	}
+
+	return false
+}
+
+// checkPostgresFileDescriptors açık dosya tanımlayıcılarını kontrol ederek PostgreSQL log dosyalarını bulmayı dener
+func checkPostgresFileDescriptors() string {
+	// PostgreSQL PID'sini bul
+	cmd := exec.Command("sh", "-c", "pgrep postgres")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return ""
+	}
+
+	// lsof ile açık dosyaları listele
+	cmd = exec.Command("sh", "-c", fmt.Sprintf("lsof -p %s | grep -i 'log'", pid))
+	out, err = cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 {
+			filePath := fields[8]
+			// Dosya yolunu kontrol et
+			if strings.HasSuffix(strings.ToLower(filePath), ".log") {
+				return filePath
+			}
+		}
+	}
+
+	return ""
+}
+
+// getLogPathFromConfig postgresql.conf dosyasından log_directory ve log_filename parametrelerini okur
+func getLogPathFromConfig(configFile string) string {
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Printf("Konfigürasyon dosyası okunamadı: %v", err)
+		return ""
+	}
+
+	lines := strings.Split(string(content), "\n")
+
+	var logDirectory string
+
+	for _, line := range lines {
+		// Yorumları kaldır ve boşlukları temizle
+		line = strings.Split(line, "#")[0]
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "log_directory") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				logDirectory = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+				break
+			}
+		}
+	}
+
+	// Sadece log_directory bulundu ise
+	if logDirectory != "" {
+		if strings.HasPrefix(logDirectory, "/") {
+			// Mutlak yol
+			return logDirectory
+		} else {
+			// Göreceli yol, data directory ile birleştir
+			dataDir, err := getDataDirectoryFromConfig()
+			if err == nil && dataDir != "" {
+				return filepath.Join(dataDir, logDirectory)
+			}
+		}
+	}
+
+	return ""
 }

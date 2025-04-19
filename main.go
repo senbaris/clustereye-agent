@@ -8,11 +8,14 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL sürücüsü
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/reporter"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -27,11 +30,25 @@ type PostgresInfo struct {
 	Cluster  string `json:"cluster"`
 }
 
+// AgentService implements the agent service
+type AgentService struct {
+	pb.UnimplementedAgentServiceServer
+	reporter *reporter.Reporter
+}
+
 func main() {
 	// Konfigürasyonu yükle
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
 		log.Fatalf("Konfigürasyon yüklenemedi: %v", err)
+	}
+
+	// Reporter oluştur
+	rptr := reporter.NewReporter(cfg)
+
+	// AgentService yapısını oluştur
+	service := &AgentService{
+		reporter: rptr,
 	}
 
 	// GRPC Bağlantısı kur
@@ -92,7 +109,159 @@ func main() {
 			if query := in.GetQuery(); query != nil {
 				log.Printf("Yeni sorgu geldi: %s", query.Command)
 
-				// Sorguyu işle ve sonucu hesapla
+				// MongoDB log analizi için özel işleme
+				if strings.HasPrefix(query.Command, "analyze_mongo_log") {
+					log.Printf("MongoDB log analizi talebi alındı: %s", query.Command)
+					log.Printf("====== MONGO LOG ANALİZİ BAŞLIYOR ======")
+
+					// Sorgudan parametreleri çıkar (log_file_path|slow_query_threshold_ms)
+					parts := strings.Split(query.Command, "|")
+					if len(parts) < 2 {
+						log.Printf("Geçersiz sorgu formatı: %s", query.Command)
+
+						// Hata sonucunu gönder
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz sorgu formatı. Doğru format: analyze_mongo_log|/path/to/log|threshold_ms",
+						}
+
+						resultStruct, _ := structpb.NewStruct(errorResult)
+						anyResult, _ := anypb.New(resultStruct)
+
+						result := &pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: &pb.QueryResult{
+									QueryId: query.QueryId,
+									Result:  anyResult,
+								},
+							},
+						}
+
+						if err := stream.Send(result); err != nil {
+							log.Printf("Hata sonucu gönderilemedi: %v", err)
+						}
+						continue
+					}
+
+					// Log dosya yolunu ve threshold değerini çıkar
+					logFilePath := strings.TrimSpace(parts[1])
+					slowQueryThresholdMs := int64(0) // Default 0 means return ALL entries
+					if len(parts) > 2 {
+						thresholdStr := strings.TrimSpace(parts[2])
+						threshold, err := strconv.ParseInt(thresholdStr, 10, 64)
+						if err == nil {
+							slowQueryThresholdMs = threshold
+						}
+					}
+
+					log.Printf("MongoDB log analizi başlatılıyor: Dosya=%s, Eşik=%d ms",
+						logFilePath, slowQueryThresholdMs)
+
+					// MongoLogAnalyzeRequest oluştur
+					req := &pb.MongoLogAnalyzeRequest{
+						LogFilePath:          logFilePath,
+						SlowQueryThresholdMs: slowQueryThresholdMs,
+						AgentId:              "agent_" + hostname,
+					}
+
+					// Reporter'a analiz için ilgili dosyayı gönder
+					resp, err := service.reporter.AnalyzeMongoLog(req)
+					if err != nil {
+						log.Printf("MongoDB log analizi başarısız: %v", err)
+
+						// Hata sonucunu gönder
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB log analizi başarısız: %v", err),
+						}
+
+						resultStruct, _ := structpb.NewStruct(errorResult)
+						anyResult, _ := anypb.New(resultStruct)
+
+						result := &pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: &pb.QueryResult{
+									QueryId: query.QueryId,
+									Result:  anyResult,
+								},
+							},
+						}
+
+						if err := stream.Send(result); err != nil {
+							log.Printf("Hata sonucu gönderilemedi: %v", err)
+						}
+						continue
+					}
+
+					// MongoLogAnalyzeResponse'u map yapısına dönüştür
+					logEntriesData := make([]interface{}, 0, len(resp.LogEntries))
+					for _, entry := range resp.LogEntries {
+						// Komut alanını string'e dönüştür (nil olabilir, veya farklı bir tipte olabilir)
+						commandStr := ""
+						if entry.Command != "" {
+							commandStr = entry.Command
+						}
+
+						// Timestamp Unix formatında
+						timestamp := entry.Timestamp
+						if timestamp == 0 {
+							timestamp = time.Now().Unix()
+						}
+
+						entryMap := map[string]interface{}{
+							"timestamp":       timestamp,
+							"severity":        entry.Severity,
+							"component":       entry.Component,
+							"context":         entry.Context,
+							"message":         entry.Message,
+							"db_name":         entry.DbName,
+							"duration_millis": entry.DurationMillis,
+							"command":         commandStr,
+							"plan_summary":    entry.PlanSummary,
+							"namespace":       entry.Namespace,
+						}
+						logEntriesData = append(logEntriesData, entryMap)
+					}
+
+					// Başarılı sonucu structpb'ye dönüştür
+					analysisResult := map[string]interface{}{
+						"status":      "success",
+						"log_entries": logEntriesData,
+						"count":       len(resp.LogEntries),
+					}
+
+					resultStruct, err := structpb.NewStruct(analysisResult)
+					if err != nil {
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						continue
+					}
+
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						continue
+					}
+
+					// Sonucu gönder
+					result := &pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyResult,
+							},
+						},
+					}
+
+					if err := stream.Send(result); err != nil {
+						log.Printf("MongoDB log analizi sonucu gönderilemedi: %v", err)
+					} else {
+						log.Printf("MongoDB log analizi sonucu başarıyla gönderildi (ID: %s, %d log girişi)",
+							query.QueryId, len(resp.LogEntries))
+					}
+					continue
+				}
+
+				// Diğer sorgular için normal işleme
 				queryResult := processQuery(query.Command)
 
 				// Sorgu sonucunu hazırla
@@ -203,4 +372,11 @@ func getLocalIP() string {
 
 func getPlatformInfo() string {
 	return fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+}
+
+// AnalyzeMongoLog handles MongoDB log analysis requests
+func (s *AgentService) AnalyzeMongoLog(req *pb.MongoLogAnalyzeRequest) (*pb.MongoLogAnalyzeResponse, error) {
+	log.Printf("AnalyzeMongoLog servis metodu çağrıldı: Dosya=%s, Eşik=%d ms",
+		req.LogFilePath, req.SlowQueryThresholdMs)
+	return s.reporter.AnalyzeMongoLog(req)
 }

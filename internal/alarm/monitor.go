@@ -54,13 +54,14 @@ func (m *AlarmMonitor) monitorLoop() {
 	ticker := time.NewTicker(m.checkInterval)
 	defer ticker.Stop()
 
-	// Hemen ilk kontrolü yap
-	m.checkAlarms()
+	// Bir de daha sık checkalarm yapan bir denetim daha var o yüzden burada yapmamıza gerek yok
+	// m.checkAlarms()
 
 	// Periyodik kontrole başla
 	for {
 		select {
 		case <-ticker.C:
+			log.Printf("Periyodik alarm kontrolü yapılıyor (interval: %v)", m.checkInterval)
 			m.checkAlarms()
 		case <-m.stopCh:
 			return
@@ -87,14 +88,31 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 	status := postgres.GetPGServiceStatus()
 	alarmKey := "postgresql_service_status"
 
+	// Rate limiting için zaman kontrolü ekle
+	m.alarmCacheLock.RLock()
+	prevAlarm, exists := m.alarmCache[alarmKey]
+	m.alarmCacheLock.RUnlock()
+
+	// Önceki alarm varsa ve son 15 saniye içinde gönderilmişse, tekrar gönderme
+	if exists {
+		// Önceki alarmın zamanını parse et
+		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+		if err == nil {
+			timeSinceLastAlarm := time.Since(prevTimestamp)
+			// Son 15 saniye içinde gönderilmişse ve durum değişmemişse tekrar gönderme
+			if timeSinceLastAlarm < 15*time.Second &&
+				((status == "FAIL!" && prevAlarm.Status == "triggered") ||
+					(status == "RUNNING" && prevAlarm.Status == "resolved")) {
+				log.Printf("PostgreSQL servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
+				return
+			}
+		}
+	}
+
 	if status == "FAIL!" {
 		// Önceki bir alarm varsa ve aynı durumda ise tekrar gönderme
-		m.alarmCacheLock.RLock()
-		prevAlarm, exists := m.alarmCache[alarmKey]
-		m.alarmCacheLock.RUnlock()
-
 		if exists && prevAlarm.Status == "triggered" {
-			// Alarm zaten tetiklenmiş, tekrar gönderme
+			// Alarm zaten tetiklenmiş, tekrar gönderme (sadece log için)
 			log.Printf("PostgreSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
 			return
 		}
@@ -125,10 +143,6 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 		}
 	} else if status == "RUNNING" {
 		// Önceki bir alarm varsa ve tetiklenmişse, çözüldü mesajı gönder
-		m.alarmCacheLock.RLock()
-		prevAlarm, exists := m.alarmCache[alarmKey]
-		m.alarmCacheLock.RUnlock()
-
 		if exists && prevAlarm.Status == "triggered" {
 			// Çözüldü mesajı oluştur
 			resolvedEvent := &pb.AlarmEvent{
@@ -163,14 +177,31 @@ func (m *AlarmMonitor) checkPgBouncerStatus() {
 	status := postgres.GetPGBouncerStatus()
 	alarmKey := "pgbouncer_service_status"
 
+	// Rate limiting için zaman kontrolü ekle
+	m.alarmCacheLock.RLock()
+	prevAlarm, exists := m.alarmCache[alarmKey]
+	m.alarmCacheLock.RUnlock()
+
+	// Önceki alarm varsa ve son 15 saniye içinde gönderilmişse, tekrar gönderme
+	if exists {
+		// Önceki alarmın zamanını parse et
+		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+		if err == nil {
+			timeSinceLastAlarm := time.Since(prevTimestamp)
+			// Son 15 saniye içinde gönderilmişse ve durum değişmemişse tekrar gönderme
+			if timeSinceLastAlarm < 15*time.Second &&
+				((status == "FAIL!" && prevAlarm.Status == "triggered") ||
+					(status == "RUNNING" && prevAlarm.Status == "resolved")) {
+				log.Printf("PgBouncer servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
+				return
+			}
+		}
+	}
+
 	if status == "FAIL!" {
 		// Önceki bir alarm varsa ve aynı durumda ise tekrar gönderme
-		m.alarmCacheLock.RLock()
-		prevAlarm, exists := m.alarmCache[alarmKey]
-		m.alarmCacheLock.RUnlock()
-
 		if exists && prevAlarm.Status == "triggered" {
-			// Alarm zaten tetiklenmiş, tekrar gönderme
+			// Alarm zaten tetiklenmiş, tekrar gönderme (sadece log için)
 			log.Printf("PgBouncer servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
 			return
 		}
@@ -201,10 +232,6 @@ func (m *AlarmMonitor) checkPgBouncerStatus() {
 		}
 	} else if status == "RUNNING" {
 		// Önceki bir alarm varsa ve tetiklenmişse, çözüldü mesajı gönder
-		m.alarmCacheLock.RLock()
-		prevAlarm, exists := m.alarmCache[alarmKey]
-		m.alarmCacheLock.RUnlock()
-
 		if exists && prevAlarm.Status == "triggered" {
 			// Çözüldü mesajı oluştur
 			resolvedEvent := &pb.AlarmEvent{

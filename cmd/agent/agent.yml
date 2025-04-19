@@ -10,7 +10,9 @@ postgresql:
   cluster: postgres
   location: istanbul
 mongo:
-  user: mongo
-  pass: mongo
+  host: localhost
+  user: admin
+  pass: Dkjf334utre1!
   port: 27017
   replset: rs0
+  location: istanbul

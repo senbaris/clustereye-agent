@@ -28,11 +28,13 @@ type AgentConfig struct {
 
 	// MongoDB Bağlantı Bilgileri
 	Mongo struct {
-		User    string `yaml:"user"`
-		Pass    string `yaml:"pass"`
-		Port    string `yaml:"port"`
-		Replset string `yaml:"replset"`
-		Auth    bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
+		Host     string `yaml:"host"`
+		User     string `yaml:"user"`
+		Pass     string `yaml:"pass"`
+		Port     string `yaml:"port"`
+		Replset  string `yaml:"replset"`
+		Auth     bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
+		Location string `yaml:"location"`
 	} `yaml:"mongo"`
 
 	// GRPC Ayarları
