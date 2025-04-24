@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*' # v1.0.0 gibi tag'ler için
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build and Release
@@ -12,10 +15,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
           
@@ -37,15 +40,10 @@ jobs:
           cp cmd/agent/agent.yml.example build/
           
       - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ncipollo/release-action@v1
         with:
+          artifacts: "build/clustereye-agent-linux-amd64,build/clustereye-agent-linux-arm64,build/agent.yml.example"
+          token: ${{ secrets.GITHUB_TOKEN }}
           name: Release ${{ env.VERSION }}
           draft: false
-          prerelease: false
-          files: |
-            build/clustereye-agent-linux-amd64
-            build/clustereye-agent-linux-arm64
-            build/agent.yml.example 
+          prerelease: false 
