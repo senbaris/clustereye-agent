@@ -15,7 +15,6 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -42,6 +41,15 @@ func (p *QueryProcessor) processQuery(command string) map[string]interface{} {
 		maxValueLen      = 1000        // Maksimum değer uzunluğu
 		maxTotalDataSize = 1024 * 1024 // Maksimum toplam veri boyutu (1 MB)
 	)
+
+	// "ping" komutu için özel işleme
+	if strings.ToLower(command) == "ping" {
+		log.Printf("QueryProcessor: Ping komutu algılandı, özel yanıt dönüyor")
+		return map[string]interface{}{
+			"status":  "success",
+			"message": "pong",
+		}
+	}
 
 	// Query başlangıç zamanını kaydet
 	startTime := time.Now()
@@ -330,7 +338,7 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 	// Alarm izleme sistemini başlat
 	agentID := "agent_" + hostname
 	client := pb.NewAgentServiceClient(r.grpcClient)
-	r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID)
+	r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform)
 	r.alarmMonitor.Start()
 
 	return nil
@@ -422,103 +430,31 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
 
-				// PostgreSQL log dosyaları için özel işleme
-				if strings.HasPrefix(query.Command, "list_postgres_logs") {
-					log.Printf("PostgreSQL log dosyaları sorgusu tespit edildi")
+				// Ping sorgusunu özel olarak işle
+				if strings.ToLower(query.Command) == "ping" {
+					log.Printf("Ping komutu algılandı, özel yanıt gönderiliyor")
 
-					// Sorgudan log path'i çıkar
-					logPath := ""
-					parts := strings.Split(query.Command, "|")
-					if len(parts) > 1 {
-						logPath = strings.TrimSpace(parts[1])
+					pingResult := map[string]interface{}{
+						"status":  "success",
+						"message": "pong",
 					}
 
-					// Log dosyalarını bul
-					logFiles, err := postgres.FindPostgresLogFiles(logPath)
-					if err != nil {
-						log.Printf("PostgreSQL log dosyaları bulunamadı: %v", err)
-						queryResult := map[string]interface{}{
-							"status":  "error",
-							"message": fmt.Sprintf("PostgreSQL log dosyaları bulunamadı: %v", err),
-						}
+					resultStruct, _ := structpb.NewStruct(pingResult)
+					anyResult, _ := anypb.New(resultStruct)
 
-						// Sonucu structpb'ye dönüştür
-						resultStruct, _ := structpb.NewStruct(queryResult)
-						anyResult, _ := anypb.New(resultStruct)
-
-						// Yanıtı gönder
-						response := &pb.AgentMessage{
-							Payload: &pb.AgentMessage_QueryResult{
-								QueryResult: &pb.QueryResult{
-									QueryId: query.QueryId,
-									Result:  anyResult,
-								},
-							},
-						}
-
-						if err := r.stream.Send(response); err != nil {
-							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
-						}
-
-						isProcessingQuery = false
-						continue
-					}
-
-					// Log dosyalarını detaylı logla
-					log.Printf("Bulunan PostgreSQL log dosyaları (%d adet):", len(logFiles))
-					for i, file := range logFiles {
-						log.Printf("  %d. %s (Boyut: %d, Son değiştirilme: %s)",
-							i+1, file.Path, file.Size, time.Unix(file.LastModified, 0).Format(time.RFC3339))
-					}
-
-					// PostgresLogListResponse'u proto mesajı olarak oluştur
-					response := &pb.PostgresLogListResponse{
-						LogFiles: logFiles,
-					}
-
-					// Proto mesajını Any'e dönüştür
-					anyResponse, err := anypb.New(response)
-					if err != nil {
-						log.Printf("PostgresLogListResponse Any tipine dönüştürülemedi: %v", err)
-						queryResult := map[string]interface{}{
-							"status":  "error",
-							"message": fmt.Sprintf("PostgresLogListResponse dönüştürülemedi: %v", err),
-						}
-
-						// Sonucu structpb'ye dönüştür
-						resultStruct, _ := structpb.NewStruct(queryResult)
-						anyResult, _ := anypb.New(resultStruct)
-
-						// Yanıtı gönder
-						queryResponse := &pb.AgentMessage{
-							Payload: &pb.AgentMessage_QueryResult{
-								QueryResult: &pb.QueryResult{
-									QueryId: query.QueryId,
-									Result:  anyResult,
-								},
-							},
-						}
-
-						if err := r.stream.Send(queryResponse); err != nil {
-							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
-						}
-
-						isProcessingQuery = false
-						continue
-					}
-
-					// Yanıtı gönder
-					queryResponse := &pb.AgentMessage{
+					response := &pb.AgentMessage{
 						Payload: &pb.AgentMessage_QueryResult{
 							QueryResult: &pb.QueryResult{
 								QueryId: query.QueryId,
-								Result:  anyResponse,
+								Result:  anyResult,
 							},
 						},
 					}
 
-					if err := r.stream.Send(queryResponse); err != nil {
-						log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+					if err := r.stream.Send(response); err != nil {
+						log.Printf("Ping cevabı gönderilemedi: %v", err)
+					} else {
+						log.Printf("Ping cevabı başarıyla gönderildi")
 					}
 
 					isProcessingQuery = false
@@ -545,11 +481,9 @@ func (r *Reporter) listenForCommands() {
 							"message": fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err),
 						}
 
-						// Sonucu structpb'ye dönüştür
 						resultStruct, _ := structpb.NewStruct(queryResult)
 						anyResult, _ := anypb.New(resultStruct)
 
-						// Yanıtı gönder
 						response := &pb.AgentMessage{
 							Payload: &pb.AgentMessage_QueryResult{
 								QueryResult: &pb.QueryResult{
@@ -576,11 +510,9 @@ func (r *Reporter) listenForCommands() {
 							"message": fmt.Sprintf("MongoDB log dosyaları bulunamadı: %v", err),
 						}
 
-						// Sonucu structpb'ye dönüştür
 						resultStruct, _ := structpb.NewStruct(queryResult)
 						anyResult, _ := anypb.New(resultStruct)
 
-						// Yanıtı gönder
 						response := &pb.AgentMessage{
 							Payload: &pb.AgentMessage_QueryResult{
 								QueryResult: &pb.QueryResult{
@@ -605,26 +537,84 @@ func (r *Reporter) listenForCommands() {
 							i+1, file.Path, file.Size, time.Unix(file.LastModified, 0).Format(time.RFC3339))
 					}
 
-					// MongoLogListResponse'u proto mesajı olarak oluştur
-					response := &pb.MongoLogListResponse{
-						LogFiles: logFiles,
+					// Log dosyalarını map'e dönüştür
+					logFilesData := make([]interface{}, 0, len(logFiles))
+					for _, file := range logFiles {
+						fileMap := map[string]interface{}{
+							"name":          file.Name,
+							"path":          file.Path,
+							"size":          file.Size,
+							"last_modified": file.LastModified,
+						}
+						logFilesData = append(logFilesData, fileMap)
 					}
 
-					// Proto mesajını Any'e dönüştür
-					anyResponse, err := anypb.New(response)
+					// Sonuç struct'ını oluştur
+					result := map[string]interface{}{
+						"status":     "success",
+						"log_files":  logFilesData,
+						"file_count": len(logFiles),
+					}
+
+					// structpb'ye dönüştür
+					resultStruct, err := structpb.NewStruct(result)
 					if err != nil {
-						log.Printf("MongoLogListResponse Any tipine dönüştürülemedi: %v", err)
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					// Yanıtı gönder
+					response := &pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyResult,
+							},
+						},
+					}
+
+					if err := r.stream.Send(response); err != nil {
+						log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+					} else {
+						log.Printf("MongoDB log dosyaları başarıyla gönderildi (%d dosya)", len(logFiles))
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
+				// PostgreSQL log dosyaları için özel işleme
+				if strings.HasPrefix(query.Command, "list_postgres_logs") {
+					log.Printf("PostgreSQL log dosyaları sorgusu tespit edildi")
+
+					// Sorgudan log path'i çıkar
+					logPath := ""
+					parts := strings.Split(query.Command, "|")
+					if len(parts) > 1 {
+						logPath = strings.TrimSpace(parts[1])
+					}
+
+					// Log dosyalarını bul
+					logFiles, err := postgres.FindPostgresLogFiles(logPath)
+					if err != nil {
+						log.Printf("PostgreSQL log dosyaları bulunamadı: %v", err)
 						queryResult := map[string]interface{}{
 							"status":  "error",
-							"message": fmt.Sprintf("MongoLogListResponse dönüştürülemedi: %v", err),
+							"message": fmt.Sprintf("PostgreSQL log dosyaları bulunamadı: %v", err),
 						}
 
-						// Sonucu structpb'ye dönüştür
 						resultStruct, _ := structpb.NewStruct(queryResult)
 						anyResult, _ := anypb.New(resultStruct)
 
-						// Yanıtı gönder
-						queryResponse := &pb.AgentMessage{
+						response := &pb.AgentMessage{
 							Payload: &pb.AgentMessage_QueryResult{
 								QueryResult: &pb.QueryResult{
 									QueryId: query.QueryId,
@@ -633,7 +623,7 @@ func (r *Reporter) listenForCommands() {
 							},
 						}
 
-						if err := r.stream.Send(queryResponse); err != nil {
+						if err := r.stream.Send(response); err != nil {
 							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
 						}
 
@@ -641,21 +631,207 @@ func (r *Reporter) listenForCommands() {
 						continue
 					}
 
+					// Log dosyalarını detaylı logla
+					log.Printf("Bulunan PostgreSQL log dosyaları (%d adet):", len(logFiles))
+					for i, file := range logFiles {
+						log.Printf("  %d. %s (Boyut: %d, Son değiştirilme: %s)",
+							i+1, file.Path, file.Size, time.Unix(file.LastModified, 0).Format(time.RFC3339))
+					}
+
+					// Log dosyalarını map'e dönüştür
+					logFilesData := make([]interface{}, 0, len(logFiles))
+					for _, file := range logFiles {
+						fileMap := map[string]interface{}{
+							"name":          file.Name,
+							"path":          file.Path,
+							"size":          file.Size,
+							"last_modified": file.LastModified,
+						}
+						logFilesData = append(logFilesData, fileMap)
+					}
+
+					// Sonuç struct'ını oluştur
+					result := map[string]interface{}{
+						"status":     "success",
+						"log_files":  logFilesData,
+						"file_count": len(logFiles),
+					}
+
+					// structpb'ye dönüştür
+					resultStruct, err := structpb.NewStruct(result)
+					if err != nil {
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
 					// Yanıtı gönder
-					queryResponse := &pb.AgentMessage{
+					response := &pb.AgentMessage{
 						Payload: &pb.AgentMessage_QueryResult{
 							QueryResult: &pb.QueryResult{
 								QueryId: query.QueryId,
-								Result:  anyResponse,
+								Result:  anyResult,
 							},
 						},
 					}
 
-					log.Printf("MongoLogListResponse proto mesajı Any tipine dönüştürüldü ve gönderiliyor...")
-					if err := r.stream.Send(queryResponse); err != nil {
+					if err := r.stream.Send(response); err != nil {
 						log.Printf("Sorgu cevabı gönderilemedi: %v", err)
 					} else {
-						log.Printf("MongoDB log dosyaları başarıyla gönderildi (ID: %s)", query.QueryId)
+						log.Printf("PostgreSQL log dosyaları başarıyla gönderildi (%d dosya)", len(logFiles))
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
+				// PostgreSQL log analizi sorgusu için özel işlem
+				if strings.HasPrefix(query.Command, "analyze_postgres_log") {
+					log.Printf("PostgreSQL log analizi sorgusu tespit edildi: %s", query.Command)
+
+					// Parse command parameters (log_file_path|slow_query_threshold_ms)
+					parts := strings.Split(query.Command, "|")
+					if len(parts) < 2 {
+						log.Printf("Geçersiz sorgu formatı: %s", query.Command)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz sorgu formatı, beklenen format: analyze_postgres_log|/path/to/logfile.log|1000",
+						}
+
+						resultStruct, _ := structpb.NewStruct(queryResult)
+						anyResult, _ := anypb.New(resultStruct)
+
+						response := &pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: &pb.QueryResult{
+									QueryId: query.QueryId,
+									Result:  anyResult,
+								},
+							},
+						}
+
+						if err := r.stream.Send(response); err != nil {
+							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+						}
+
+						isProcessingQuery = false
+						continue
+					}
+
+					// Extract log file path and threshold
+					logFilePath := strings.TrimSpace(parts[1])
+					slowQueryThresholdMs := int64(0)
+					if len(parts) > 2 {
+						threshold, err := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
+						if err == nil {
+							slowQueryThresholdMs = threshold
+						}
+					}
+
+					log.Printf("PostgreSQL log analizi başlatılıyor: Dosya=%s, Eşik=%d ms",
+						logFilePath, slowQueryThresholdMs)
+
+					// Analyze the log file
+					analyzeResponse, err := postgres.AnalyzePostgresLog(logFilePath, slowQueryThresholdMs)
+					if err != nil {
+						log.Printf("PostgreSQL log analizi başarısız: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("PostgreSQL log analizi başarısız: %v", err),
+						}
+
+						resultStruct, _ := structpb.NewStruct(queryResult)
+						anyResult, _ := anypb.New(resultStruct)
+
+						response := &pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: &pb.QueryResult{
+									QueryId: query.QueryId,
+									Result:  anyResult,
+								},
+							},
+						}
+
+						if err := r.stream.Send(response); err != nil {
+							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+						}
+
+						isProcessingQuery = false
+						continue
+					}
+
+					// Convert log entries to a map for structpb
+					logEntriesData := make([]interface{}, 0, len(analyzeResponse.LogEntries))
+					for _, entry := range analyzeResponse.LogEntries {
+						entryMap := map[string]interface{}{
+							"timestamp":              entry.Timestamp,
+							"log_level":              entry.LogLevel,
+							"user_name":              entry.UserName,
+							"database":               entry.Database,
+							"process_id":             entry.ProcessId,
+							"connection_from":        entry.ConnectionFrom,
+							"session_id":             entry.SessionId,
+							"session_line_num":       entry.SessionLineNum,
+							"command_tag":            entry.CommandTag,
+							"session_start_time":     entry.SessionStartTime,
+							"virtual_transaction_id": entry.VirtualTransactionId,
+							"transaction_id":         entry.TransactionId,
+							"error_severity":         entry.ErrorSeverity,
+							"sql_state_code":         entry.SqlStateCode,
+							"message":                entry.Message,
+							"detail":                 entry.Detail,
+							"hint":                   entry.Hint,
+							"internal_query":         entry.InternalQuery,
+							"duration_ms":            entry.DurationMs,
+						}
+						logEntriesData = append(logEntriesData, entryMap)
+					}
+
+					// Create the result struct
+					analysisResult := map[string]interface{}{
+						"status":      "success",
+						"log_entries": logEntriesData,
+						"count":       len(analyzeResponse.LogEntries),
+					}
+
+					// Convert to structpb
+					resultStruct, err := structpb.NewStruct(analysisResult)
+					if err != nil {
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					// Send the response
+					streamResponse := &pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyResult,
+							},
+						},
+					}
+
+					log.Printf("Stream üzerinden analiz sonuçları gönderiliyor...")
+					err = r.stream.Send(streamResponse)
+					if err != nil {
+						log.Printf("Stream yanıtı gönderilemedi: %v", err)
+					} else {
+						log.Printf("PostgreSQL log analizi sonuçları başarıyla gönderildi (%d girdi)", len(analyzeResponse.LogEntries))
 					}
 
 					isProcessingQuery = false
@@ -837,19 +1013,17 @@ func (r *Reporter) listenForCommands() {
 					log.Printf("pg_cachehitratio sorgusu tespit edildi, boyut sınırlaması uygulanıyor")
 				}
 
-				// Sorguyu işle
-				queryResult := processor.processQuery(query.Command)
-				log.Printf("Sorgu sonucu: %d adet veri", len(queryResult))
+				// Normal PostgreSQL sorgusu işleme
+				result := processor.processQuery(query.Command)
 
 				// Sonucu structpb'ye dönüştür
-				resultStruct, err := structpb.NewStruct(queryResult)
+				resultStruct, err := structpb.NewStruct(result)
 				if err != nil {
-					log.Printf("Sonuç struct'a dönüştürülemedi: %v", err)
+					log.Printf("Struct'a dönüştürme hatası: %v", err)
 					isProcessingQuery = false
 					continue
 				}
 
-				// structpb'yi Any'e dönüştür
 				anyResult, err := anypb.New(resultStruct)
 				if err != nil {
 					log.Printf("Any tipine dönüştürülemedi: %v", err)
@@ -857,36 +1031,7 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
-				// Yanıt boyutu kontrolü
-				payloadSize, err := proto.Marshal(anyResult)
-				payloadSizeEstimate := len(payloadSize)
-				log.Printf("Tahmini yanıt boyutu: %d bayt", payloadSizeEstimate)
-
-				// Boyut 3MB'dan büyükse uyarı ver ve yanıtı kısalt
-				if payloadSizeEstimate > 3*1024*1024 {
-					log.Printf("UYARI: Yanıt çok büyük (%d bayt), sadece durum mesajı gönderiliyor", payloadSizeEstimate)
-
-					// Sadece durum mesajı içeren basitleştirilmiş yanıt
-					simplifiedResult, _ := structpb.NewStruct(map[string]interface{}{
-						"status":         "truncated",
-						"message":        "Yanıt çok büyük, kısaltıldı",
-						"original_size":  payloadSizeEstimate,
-						"row_count":      queryResult["row_count"],
-						"data_truncated": true,
-					})
-
-					anyResult, _ = anypb.New(simplifiedResult)
-				}
-
-				// GC'yi çağır ve bellek durumunu izle
-				runtime.GC()
-				var memStats runtime.MemStats
-				runtime.ReadMemStats(&memStats)
-				log.Printf("Yanıt öncesi bellek durumu - Alloc: %v MB, Sys: %v MB",
-					memStats.Alloc/1024/1024,
-					memStats.Sys/1024/1024)
-
-				// Sorgu sonucunu gönder
+				// Yanıtı gönder
 				response := &pb.AgentMessage{
 					Payload: &pb.AgentMessage_QueryResult{
 						QueryResult: &pb.QueryResult{
@@ -896,32 +1041,12 @@ func (r *Reporter) listenForCommands() {
 					},
 				}
 
-				log.Printf("Gönderilen mesaj tipi: AgentMessage_QueryResult, sorgu ID: %s", query.QueryId)
 				if err := r.stream.Send(response); err != nil {
 					log.Printf("Sorgu cevabı gönderilemedi: %v", err)
-					if err := r.reconnect(); err != nil {
-						log.Printf("Yeniden bağlantı başarısız: %v", err)
-					}
-				} else {
-					log.Printf("Sorgu cevabı başarıyla gönderildi (ID: %s)", query.QueryId)
 				}
 
-				// Belleği temizle
-				queryResult = nil
-				resultStruct = nil
-				anyResult = nil
-				response = nil
-				runtime.GC()
-
-				// Yanıt sonrası bellek durumunu izle
-				runtime.ReadMemStats(&memStats)
-				log.Printf("Yanıt sonrası bellek durumu - Alloc: %v MB, Sys: %v MB, NumGC: %v",
-					memStats.Alloc/1024/1024,
-					memStats.Sys/1024/1024,
-					memStats.NumGC)
-
 				isProcessingQuery = false
-
+				continue
 			} else if metricsReq := in.GetMetricsRequest(); metricsReq != nil {
 				// Eğer şu anda sorgu işleme devam ediyorsa, uyarı ver
 				if isProcessingQuery {

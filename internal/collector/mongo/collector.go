@@ -45,6 +45,16 @@ type MongoInfo struct {
 	ReplicaLagSec  int64
 	FreeDisk       string
 	FdPercent      int32
+	Port           string // MongoDB port bilgisi
+}
+
+// MongoServiceStatus MongoDB servisinin durumunu ve detaylarını içeren yapı
+type MongoServiceStatus struct {
+	Status       string // RUNNING, FAIL!, DEGRADED
+	IsReplSet    bool   // Replica set mi?
+	CurrentState string // PRIMARY, SECONDARY, ARBITER, STANDALONE
+	LastState    string // Önceki durum
+	ErrorMessage string // Hata mesajı (varsa)
 }
 
 // OpenDB MongoDB bağlantısını açar
@@ -450,10 +460,9 @@ func (c *MongoCollector) getDiskInfo(path string) (map[string]interface{}, error
 func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
-
 	freeDisk, usagePercent := c.GetDiskUsage()
 
-	return &MongoInfo{
+	info := &MongoInfo{
 		ClusterName:    c.getConfigValue("Mongo.Cluster"),
 		IP:             ip,
 		Hostname:       hostname,
@@ -465,7 +474,13 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		ReplicaLagSec:  c.GetReplicationLagSec(),
 		FreeDisk:       freeDisk,
 		FdPercent:      int32(usagePercent),
+		Port:           c.cfg.Mongo.Port, // MongoDB port bilgisini config'den alıyoruz
 	}
+
+	log.Printf("DEBUG: MongoDB bilgileri hazırlandı - Port: %s, Status: %s, Version: %s",
+		info.Port, info.MongoStatus, info.MongoVersion)
+
+	return info
 }
 
 // getLocalIP yerel IP adresini döndürür
@@ -551,6 +566,7 @@ func (m *MongoInfo) ToProto() *pb.MongoInfo {
 		ReplicationLagSec: m.ReplicaLagSec,
 		FreeDisk:          m.FreeDisk,
 		FdPercent:         m.FdPercent,
+		Port:              m.Port,
 	}
 }
 
@@ -1084,7 +1100,7 @@ func findMongoConfigFile() string {
 	configPaths := []string{
 		"/etc/mongod.conf",
 		"/etc/mongodb.conf",
-		"/usr/local/etc/mongod.conf", // macOS Homebrew
+		"/usr/local/bin/mongod1.conf", // macOS Homebrew
 	}
 
 	for _, path := range configPaths {
@@ -1128,4 +1144,121 @@ func getLogPathFromConfig(configFile string) string {
 	}
 
 	return ""
+}
+
+// GetMongoServiceStatus MongoDB servisinin detaylı durumunu kontrol eder
+func (c *MongoCollector) GetMongoServiceStatus() *MongoServiceStatus {
+	status := &MongoServiceStatus{
+		Status:    "FAIL!",
+		IsReplSet: false,
+	}
+
+	// Önce process kontrolü yap
+	cmd := exec.Command("sh", "-c", "pgrep -x mongod")
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		status.ErrorMessage = "MongoDB process bulunamadı"
+		return status
+	}
+
+	// MongoDB'ye bağlan
+	client, err := c.OpenDB()
+	if err != nil {
+		status.ErrorMessage = fmt.Sprintf("MongoDB bağlantısı kurulamadı: %v", err)
+		return status
+	}
+	defer client.Disconnect(context.Background())
+
+	// serverStatus kontrolü
+	serverStatus, err := c.runAdminCommand(client, bson.D{{Key: "serverStatus", Value: 1}})
+	if err != nil {
+		status.ErrorMessage = fmt.Sprintf("serverStatus komutu başarısız: %v", err)
+		return status
+	}
+
+	// Servis durumunu serverStatus'ten kontrol et
+	if uptime, ok := serverStatus["uptime"].(int32); ok {
+		if uptime <= 0 {
+			status.Status = "DEGRADED"
+			status.ErrorMessage = "MongoDB uptime sıfır veya negatif"
+			return status
+		}
+	}
+
+	// Bağlantı sayısını kontrol et
+	if connections, ok := serverStatus["connections"].(bson.M); ok {
+		if current, ok := connections["current"].(int32); ok {
+			if current <= 0 {
+				status.Status = "DEGRADED"
+				status.ErrorMessage = "Aktif bağlantı yok"
+				return status
+			}
+		}
+	}
+
+	// replSetGetStatus kontrolü
+	replSetStatus, err := c.runAdminCommand(client, bson.D{{Key: "replSetGetStatus", Value: 1}})
+	if err != nil {
+		// replSetGetStatus hatası standalone sunucu olduğunu gösterebilir
+		status.Status = "RUNNING"
+		status.CurrentState = "STANDALONE"
+		return status
+	}
+
+	// Replica set durumunu işaretle
+	status.IsReplSet = true
+
+	// myState değerini kontrol et
+	if state, ok := replSetStatus["myState"].(int32); ok {
+		switch state {
+		case 1:
+			status.CurrentState = "PRIMARY"
+		case 2:
+			status.CurrentState = "SECONDARY"
+		case 7:
+			status.CurrentState = "ARBITER"
+		default:
+			status.CurrentState = fmt.Sprintf("STATE_%d", state)
+		}
+	}
+
+	// Servis durumunu belirle
+	status.Status = "RUNNING"
+	if status.IsReplSet && status.CurrentState == "" {
+		status.Status = "DEGRADED"
+		status.ErrorMessage = "Node state belirlenemedi"
+	}
+
+	return status
+}
+
+// CheckForFailover failover durumunu kontrol eder ve gerekirse alarm üretir
+func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServiceStatus) bool {
+	if prevStatus == nil || currentStatus == nil {
+		return false
+	}
+
+	// Failover durumlarını kontrol et
+	isFailover := false
+
+	// 1. PRIMARY -> SECONDARY geçiş (bu node primary iken secondary'ye düşmüş)
+	if prevStatus.CurrentState == "PRIMARY" && currentStatus.CurrentState == "SECONDARY" {
+		isFailover = true
+		log.Printf("ALARM: MongoDB node PRIMARY'den SECONDARY'ye düştü!")
+	}
+
+	// 2. SECONDARY -> PRIMARY geçiş (bu node secondary iken primary olmuş)
+	if prevStatus.CurrentState == "SECONDARY" && currentStatus.CurrentState == "PRIMARY" {
+		isFailover = true
+		log.Printf("ALARM: MongoDB node SECONDARY'den PRIMARY'ye yükseldi!")
+	}
+
+	// 3. Servis durumu değişiklikleri
+	if prevStatus.Status == "RUNNING" && currentStatus.Status != "RUNNING" {
+		isFailover = true
+		log.Printf("ALARM: MongoDB servis durumu değişti! Önceki: %s, Şimdiki: %s, Hata: %s",
+			prevStatus.Status, currentStatus.Status, currentStatus.ErrorMessage)
+	}
+
+	return isFailover
 }

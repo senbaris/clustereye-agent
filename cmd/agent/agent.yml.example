@@ -1,0 +1,18 @@
+key: YOUR-LICENSE-KEY
+name: Agent
+grpc:
+  server_address: 143.198.61.173:50051
+postgresql:
+  host: localhost
+  user: postgres
+  pass: your-password
+  port: 5432
+  cluster: your-cluster-name
+  location: your-location
+mongo:
+  host: localhost
+  user: admin
+  pass: your-password
+  port: 27017
+  replset: rs0
+  location: your-location 
