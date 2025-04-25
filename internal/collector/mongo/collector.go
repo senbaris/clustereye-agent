@@ -1309,6 +1309,13 @@ func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServic
 		return false
 	}
 
+	// Statik durumları karşılaştır (yalnızca durumlar değiştiyse alarm üret)
+	if prevStatus.CurrentState == currentStatus.CurrentState &&
+		prevStatus.Status == currentStatus.Status {
+		// Durum değişmediyse false döndür
+		return false
+	}
+
 	// Failover durumlarını kontrol et
 	isFailover := false
 

@@ -290,12 +290,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 	prevAlarm, exists := m.alarmCache[alarmKey]
 	m.alarmCacheLock.RUnlock()
 
-	// Önceki alarm varsa ve son 15 saniye içinde gönderilmişse, tekrar gönderme
+	// Önceki alarm varsa ve son 60 saniye içinde gönderilmişse, tekrar gönderme
 	if exists {
 		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 		if err == nil {
 			timeSinceLastAlarm := time.Since(prevTimestamp)
-			if timeSinceLastAlarm < 15*time.Second {
+			if timeSinceLastAlarm < 60*time.Second {
 				log.Printf("MongoDB servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
 				return
 			}
@@ -379,7 +379,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			prevTimestamp, err := time.Parse(time.RFC3339, prevFailoverAlarm.Timestamp)
 			if err == nil {
 				timeSinceLastAlarm := time.Since(prevTimestamp)
-				if timeSinceLastAlarm < 15*time.Second {
+				if timeSinceLastAlarm < 60*time.Second {
 					log.Printf("MongoDB failover durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
 					return
 				}
