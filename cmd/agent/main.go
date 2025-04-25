@@ -37,7 +37,7 @@ func main() {
 
 	// Versiyon flag'i kontrol et
 	if *versionFlag {
-		fmt.Println("ClusterEye Agent v1.0.0")
+		fmt.Println("ClusterEye Agent v1.0.9")
 		return
 	}
 
