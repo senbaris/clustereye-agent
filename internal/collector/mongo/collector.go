@@ -426,51 +426,105 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 
 // GetDiskUsage disk kullanım bilgilerini döndürür
 func (c *MongoCollector) GetDiskUsage() (string, int) {
-	// MongoDB veri dizini (genellikle /var/lib/mongodb veya /data/db)
-	dataDir := "/data/db" // Varsayılan MongoDB veri dizini
-
-	// MongoDB veri dizini bulunamadıysa, varsayılan değeri kullan
-	diskInfo, err := c.getDiskInfo(dataDir)
+	// df komutunu çalıştır
+	cmd := exec.Command("df", "-h")
+	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("Disk bilgileri alınamadı: %v", err)
 		return "N/A", 0
 	}
 
-	return diskInfo["free_disk"].(string), diskInfo["usage_percent"].(int)
-}
-
-// getDiskInfo belirtilen dizin için disk bilgilerini döndürür
-func (c *MongoCollector) getDiskInfo(path string) (map[string]interface{}, error) {
-	cmd := exec.Command("df", "-h", path)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
+	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
-		return nil, fmt.Errorf("beklenmeyen df çıktısı")
+		return "N/A", 0
 	}
 
-	fields := strings.Fields(lines[1])
-	if len(fields) < 5 {
-		return nil, fmt.Errorf("beklenmeyen df çıktı formatı")
+	var maxSize uint64 = 0
+	var selectedFree string
+	var selectedUsage int
+
+	// Her satırı işle (başlık satırını atla)
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+
+		filesystem := fields[0]
+		mountPoint := fields[5]
+
+		// Geçici dosya sistemlerini ve özel bölümleri atla
+		if strings.HasPrefix(filesystem, "tmpfs") ||
+			strings.HasPrefix(filesystem, "devtmpfs") ||
+			strings.HasPrefix(filesystem, "efivarfs") ||
+			strings.Contains(mountPoint, "/boot") ||
+			strings.Contains(mountPoint, "/run") ||
+			strings.Contains(mountPoint, "/dev") {
+			continue
+		}
+
+		// Boyut bilgisini parse et
+		size := fields[1]
+		free := fields[3]
+		usage := strings.TrimSuffix(fields[4], "%")
+
+		// Boyutu byte cinsine çevir
+		sizeInBytes, err := c.convertToBytes(size)
+		if err != nil {
+			continue
+		}
+
+		// En büyük diski veya root dizinini seç
+		if sizeInBytes > maxSize || mountPoint == "/" {
+			maxSize = sizeInBytes
+			selectedFree = free
+			selectedUsage, _ = strconv.Atoi(usage)
+		}
 	}
 
-	// Kullanım yüzdesini parse et (örn. "85%")
-	usageStr := fields[4]
-	usageStr = strings.TrimSuffix(usageStr, "%")
-	usageInt, err := strconv.Atoi(usageStr)
-	if err != nil {
-		return nil, err
+	if maxSize == 0 {
+		return "N/A", 0
 	}
 
-	return map[string]interface{}{
-		"total_size":    fields[1],
-		"used_size":     fields[2],
-		"free_disk":     fields[3],
-		"usage_percent": usageInt,
-	}, nil
+	return selectedFree, selectedUsage
+}
+
+// convertToBytes boyut string'ini (1K, 1M, 1G gibi) byte cinsine çevirir
+func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
+	size = strings.TrimSpace(size)
+	if len(size) == 0 {
+		return 0, fmt.Errorf("empty size")
+	}
+
+	// Sayısal kısmı ve birimi ayır
+	var num float64
+	var unit string
+	last := size[len(size)-1]
+	if last >= '0' && last <= '9' {
+		num, _ = strconv.ParseFloat(size, 64)
+		unit = "B"
+	} else {
+		num, _ = strconv.ParseFloat(size[:len(size)-1], 64)
+		unit = strings.ToUpper(size[len(size)-1:])
+	}
+
+	// Birimi byte cinsine çevir
+	multiplier := uint64(1)
+	switch unit {
+	case "K":
+		multiplier = 1024
+	case "M":
+		multiplier = 1024 * 1024
+	case "G":
+		multiplier = 1024 * 1024 * 1024
+	case "T":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	case "P":
+		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
+	}
+
+	return uint64(num * float64(multiplier)), nil
 }
 
 // GetMongoInfo MongoDB bilgilerini toplar

@@ -79,16 +79,16 @@ func (m *AlarmMonitor) monitorLoop() {
 
 // checkAlarms tüm alarm koşullarını kontrol eder
 func (m *AlarmMonitor) checkAlarms() {
-	switch m.platform {
-	case "postgres":
+	// Platform kontrolü yap
+	if m.platform == "mongo" {
+		// Sadece MongoDB servis durumunu ve failover durumunu kontrol et
+		m.checkMongoDBStatus()
+	} else if m.platform == "postgres" {
 		// PostgreSQL servis durumunu kontrol et
 		m.checkPostgreSQLServiceStatus()
 		// PgBouncer durumunu kontrol et
 		m.checkPgBouncerStatus()
-	case "mongo":
-		// MongoDB servis durumunu ve failover durumunu kontrol et
-		m.checkMongoDBStatus()
-	default:
+	} else {
 		log.Printf("Bilinmeyen platform: %s", m.platform)
 	}
 

@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Varsayılan değerler
-RELEASE_URL="https://github.com/senbaris/clustereye-agent/releases/download/v1.0.4"
+RELEASE_URL="https://github.com/senbaris/clustereye-agent/releases/download/v1.0.5"
 INSTALL_DIR="/opt/clustereye"
 SERVICE_NAME="clustereye-agent"
 

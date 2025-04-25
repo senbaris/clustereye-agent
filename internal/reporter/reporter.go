@@ -208,6 +208,7 @@ type Reporter struct {
 	isListening  bool
 	reportTicker *time.Ticker        // Periyodik raporlama için ticker
 	alarmMonitor *alarm.AlarmMonitor // Alarm izleme sistemi
+	platform     string              // Added to keep track of the platform
 }
 
 // NewReporter yeni bir Reporter örneği oluşturur
@@ -216,6 +217,7 @@ func NewReporter(cfg *config.AgentConfig) *Reporter {
 		cfg:         cfg,
 		stopCh:      make(chan struct{}),
 		isListening: false,
+		platform:    "", // Platform bilgisi AgentRegistration sırasında set edilecek
 	}
 }
 
@@ -284,6 +286,9 @@ func (r *Reporter) Report(data *pb.PostgresInfo) error {
 func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 	hostname, _ := os.Hostname()
 	ip := utils.GetLocalIP()
+
+	// Platform bilgisini kaydet
+	r.platform = platform
 
 	// Agent bilgilerini hazırla
 	agentInfo := &pb.AgentInfo{
@@ -372,16 +377,23 @@ func (r *Reporter) SendSystemMetrics(ctx context.Context, req *pb.SystemMetricsR
 func (r *Reporter) listenForCommands() {
 	log.Println("Komut dinleme döngüsü başlatıldı")
 
-	// Veritabanı bağlantısını aç
-	db, err := postgres.OpenDB()
-	if err != nil {
-		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
-		return
-	}
-	defer db.Close()
+	var db *sql.DB
+	var processor *QueryProcessor
 
-	// Sorgu işleyiciyi oluştur
-	processor := NewQueryProcessor(db)
+	// Sadece PostgreSQL platformu için veritabanı bağlantısı kur
+	if r.platform == "postgres" {
+		// Veritabanı bağlantısını aç
+		var err error
+		db, err = postgres.OpenDB()
+		if err != nil {
+			log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+			return
+		}
+		defer db.Close()
+
+		// Sorgu işleyiciyi oluştur
+		processor = NewQueryProcessor(db)
+	}
 
 	// Mesaj işleme durumu
 	isProcessingMetrics := false
