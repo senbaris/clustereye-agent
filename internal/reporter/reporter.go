@@ -1118,14 +1118,42 @@ func (r *Reporter) listenForCommands() {
 
 				// SendSystemMetrics RPC'sini çağır - bu çağrı artık sistemdeki lokal metodu kullanmıyor
 				// doğrudan sunucudaki uzak metodu çağırıyor. Bu yüzden metrics alanını kaldırdık.
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				response, err := client.SendSystemMetrics(ctx, request)
 				cancel()
 
 				if err != nil {
 					log.Printf("Sistem metrikleri gönderilemedi (RPC): %v", err)
-					if err := r.reconnect(); err != nil {
-						log.Printf("Yeniden bağlantı başarısız: %v", err)
+
+					// Hatanın nedeni bağlantı ile ilgili mi kontrol et
+					if strings.Contains(err.Error(), "connection") ||
+						strings.Contains(err.Error(), "transport") ||
+						strings.Contains(err.Error(), "Deadline") ||
+						strings.Contains(err.Error(), "context") {
+
+						log.Printf("Bağlantı hatası tespit edildi, yeniden bağlanılıyor...")
+						if err := r.reconnect(); err != nil {
+							log.Printf("Yeniden bağlantı başarısız: %v", err)
+						} else {
+							log.Printf("Yeniden bağlantı başarılı, metrik gönderimi tekrar denenecek")
+
+							// Kısa bir bekleme sonrası yeniden dene
+							time.Sleep(2 * time.Second)
+
+							// Yeni client oluştur
+							newClient := pb.NewAgentServiceClient(r.grpcClient)
+
+							// Yeni bir context ile tekrar dene
+							ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+							retryResponse, retryErr := newClient.SendSystemMetrics(ctx2, request)
+							cancel2()
+
+							if retryErr != nil {
+								log.Printf("Sistem metrikleri yeniden deneme sonrası gönderilemedi: %v", retryErr)
+							} else {
+								log.Printf("Sistem metrikleri yeniden deneme sonrası başarıyla gönderildi (RPC). Yanıt: %s", retryResponse.Status)
+							}
+						}
 					}
 				} else {
 					log.Printf("Sistem metrikleri başarıyla gönderildi (RPC). Yanıt: %s", response.Status)
@@ -1175,7 +1203,19 @@ func (r *Reporter) reconnect() error {
 
 	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
 	// Mevcut platform bilgisini kullanarak agent kaydını yenile
-	return r.AgentRegistration("reconnected", r.platform)
+	if err := r.AgentRegistration("reconnected", r.platform); err != nil {
+		return err
+	}
+
+	// Alarm monitörünün client'ını güncelle
+	if r.alarmMonitor != nil {
+		client := pb.NewAgentServiceClient(r.grpcClient)
+		r.alarmMonitor.UpdateClient(client)
+		log.Printf("Alarm monitörü client'ı yeniden bağlantı sonrası güncellendi")
+	}
+
+	log.Printf("Yeniden bağlantı tamamlandı. Platform: %s", r.platform)
+	return nil
 }
 
 // SendPostgresInfo PostgreSQL bilgilerini sunucuya gönderir

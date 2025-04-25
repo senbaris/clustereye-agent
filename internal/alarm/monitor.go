@@ -497,12 +497,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 
 // reportAlarm bir alarm olayını API'ye bildirir
 func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
-	maxRetries := 3
-	backoff := time.Second
+	maxRetries := 5            // Daha fazla deneme hakkı
+	backoff := 2 * time.Second // Daha uzun bekleme süresi
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Her denemede yeni bir context oluştur
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Her denemede yeni bir context oluştur (30 saniye zaman aşımı)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 		// İstek gönder
 		req := &pb.ReportAlarmRequest{
@@ -514,20 +514,22 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 		cancel() // Context'i hemen temizle
 
 		if err != nil {
-			if attempt < maxRetries-1 { // Son deneme değilse
-				// gRPC hatalarını kontrol et
-				if strings.Contains(err.Error(), "connection is closing") ||
-					strings.Contains(err.Error(), "transport is closing") ||
-					strings.Contains(err.Error(), "Canceled") {
+			// Daha kapsamlı hata kontrol mekanizması
+			isConnectionError := strings.Contains(err.Error(), "connection") ||
+				strings.Contains(err.Error(), "transport") ||
+				strings.Contains(err.Error(), "Canceled") ||
+				strings.Contains(err.Error(), "Deadline") ||
+				strings.Contains(err.Error(), "context")
 
-					log.Printf("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
-						attempt+1, maxRetries, err)
+			if attempt < maxRetries-1 && isConnectionError { // Son deneme değilse
+				log.Printf("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
+					attempt+1, maxRetries, err)
 
-					// Exponential backoff ile bekle
-					time.Sleep(backoff * time.Duration(attempt+1))
-					continue
-				}
+				// Exponential backoff ile bekle
+				time.Sleep(backoff * time.Duration(attempt+1))
+				continue
 			}
+
 			return fmt.Errorf("alarm gönderilemedi (deneme %d/%d): %v",
 				attempt+1, maxRetries, err)
 		}
@@ -539,4 +541,10 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 	}
 
 	return fmt.Errorf("alarm %d deneme sonrasında gönderilemedi", maxRetries)
+}
+
+// UpdateClient, yeni bir gRPC client ile alarm monitörünün client'ını günceller
+func (m *AlarmMonitor) UpdateClient(client pb.AgentServiceClient) {
+	m.client = client
+	log.Println("AlarmMonitor client'ı güncellendi")
 }
