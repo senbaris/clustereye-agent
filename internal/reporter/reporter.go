@@ -1104,62 +1104,28 @@ func (r *Reporter) listenForCommands() {
 				log.Printf("  kernel_version: %v (size: %d bytes)", metrics.KernelVersion, len(metrics.KernelVersion))
 				log.Printf("  uptime: %v (size: ~8 bytes)", metrics.Uptime)
 
-				// Stream API yerine SendSystemMetrics RPC metodunu kullan
-				log.Printf("Sistem metrikleri SendSystemMetrics RPC ile gönderiliyor... (Agent ID: %s)",
-					metricsReq.AgentId)
+				// Ayrı RPC çağrısı yerine mevcut stream üzerinden metrikleri gönder
+				log.Printf("Sistem metrikleri stream üzerinden gönderiliyor... (Agent ID: %s)", metricsReq.AgentId)
 
-				// AgentServiceClient oluştur
-				client := pb.NewAgentServiceClient(r.grpcClient)
-
-				// SystemMetricsRequest oluştur
-				request := &pb.SystemMetricsRequest{
-					AgentId: metricsReq.AgentId,
+				// AgentMessage_SystemMetrics olarak metrikleri gönder
+				message := &pb.AgentMessage{
+					Payload: &pb.AgentMessage_SystemMetrics{
+						SystemMetrics: metrics,
+					},
 				}
 
-				// SendSystemMetrics RPC'sini çağır - bu çağrı artık sistemdeki lokal metodu kullanmıyor
-				// doğrudan sunucudaki uzak metodu çağırıyor. Bu yüzden metrics alanını kaldırdık.
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				response, err := client.SendSystemMetrics(ctx, request)
-				cancel()
-
+				// Stream üzerinden gönder
+				err = r.stream.Send(message)
 				if err != nil {
-					log.Printf("Sistem metrikleri gönderilemedi (RPC): %v", err)
-
-					// Hatanın nedeni bağlantı ile ilgili mi kontrol et
-					if strings.Contains(err.Error(), "connection") ||
-						strings.Contains(err.Error(), "transport") ||
-						strings.Contains(err.Error(), "Deadline") ||
-						strings.Contains(err.Error(), "context") {
-
-						log.Printf("Bağlantı hatası tespit edildi, yeniden bağlanılıyor...")
-						if err := r.reconnect(); err != nil {
-							log.Printf("Yeniden bağlantı başarısız: %v", err)
-						} else {
-							log.Printf("Yeniden bağlantı başarılı, metrik gönderimi tekrar denenecek")
-
-							// Kısa bir bekleme sonrası yeniden dene
-							time.Sleep(2 * time.Second)
-
-							// Yeni client oluştur
-							newClient := pb.NewAgentServiceClient(r.grpcClient)
-
-							// Yeni bir context ile tekrar dene
-							ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
-							retryResponse, retryErr := newClient.SendSystemMetrics(ctx2, request)
-							cancel2()
-
-							if retryErr != nil {
-								log.Printf("Sistem metrikleri yeniden deneme sonrası gönderilemedi: %v", retryErr)
-							} else {
-								log.Printf("Sistem metrikleri yeniden deneme sonrası başarıyla gönderildi (RPC). Yanıt: %s", retryResponse.Status)
-							}
-						}
+					log.Printf("Sistem metrikleri stream üzerinden gönderilemedi: %v", err)
+					if err := r.reconnect(); err != nil {
+						log.Printf("Yeniden bağlantı başarısız: %v", err)
 					}
 				} else {
-					log.Printf("Sistem metrikleri başarıyla gönderildi (RPC). Yanıt: %s", response.Status)
+					log.Printf("Sistem metrikleri başarıyla stream üzerinden gönderildi")
 				}
 
-				// Belleği temizle - stream API kullanımını kaldır
+				// Belleği temizle
 				metrics = nil
 
 				// Debug için bellek kullanımını logla
