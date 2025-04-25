@@ -364,6 +364,22 @@ func (r *Reporter) SendSystemMetrics(ctx context.Context, req *pb.SystemMetricsR
 	// Sistem metriklerini topla
 	metrics := postgres.GetSystemMetrics()
 
+	// Metrik içeriğini logla
+	log.Printf("Gönderilen metrikler boyutları:")
+	log.Printf("  cpu_usage: %v (size: ~8 bytes)", metrics.CpuUsage)
+	log.Printf("  cpu_cores: %v (size: ~4 bytes)", metrics.CpuCores)
+	log.Printf("  memory_usage: %v (size: ~8 bytes)", metrics.MemoryUsage)
+	log.Printf("  total_memory: %v (size: ~8 bytes)", metrics.TotalMemory)
+	log.Printf("  free_memory: %v (size: ~8 bytes)", metrics.FreeMemory)
+	log.Printf("  load_average_1m: %v (size: ~8 bytes)", metrics.LoadAverage_1M)
+	log.Printf("  load_average_5m: %v (size: ~8 bytes)", metrics.LoadAverage_5M)
+	log.Printf("  load_average_15m: %v (size: ~8 bytes)", metrics.LoadAverage_15M)
+	log.Printf("  total_disk: %v (size: ~8 bytes)", metrics.TotalDisk)
+	log.Printf("  free_disk: %v (size: ~8 bytes)", metrics.FreeDisk)
+	log.Printf("  os_version: %v (size: %d bytes)", metrics.OsVersion, len(metrics.OsVersion))
+	log.Printf("  kernel_version: %v (size: %d bytes)", metrics.KernelVersion, len(metrics.KernelVersion))
+	log.Printf("  uptime: %v (size: ~8 bytes)", metrics.Uptime)
+
 	// Yanıtı oluştur
 	response := &pb.SystemMetricsResponse{
 		Status:  "success",
@@ -1069,10 +1085,10 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "metrics_request"
 				log.Printf("Yeni sistem metrikleri isteği geldi (Agent ID: %s)", metricsReq.AgentId)
 
-				// Sistem metriklerini topla
+				log.Printf("Sistem metrikleri toplanıyor...")
 				metrics := postgres.GetSystemMetrics()
 
-				// Debug için metrikleri logla - boyutları da logla
+				// Debug için metrikleri logla
 				log.Printf("Toplanan metrikler boyutları:")
 				log.Printf("  cpu_usage: %v (size: ~8 bytes)", metrics.CpuUsage)
 				log.Printf("  cpu_cores: %v (size: ~4 bytes)", metrics.CpuCores)
@@ -1088,34 +1104,35 @@ func (r *Reporter) listenForCommands() {
 				log.Printf("  kernel_version: %v (size: %d bytes)", metrics.KernelVersion, len(metrics.KernelVersion))
 				log.Printf("  uptime: %v (size: ~8 bytes)", metrics.Uptime)
 
-				// Metrikleri SADECE stream üzerinden gönder
-				// NOT: RPC çağrısını kaldırdık, çünkü döngüye neden oluyordu
-				log.Printf("Sistem metrikleri Stream API üzerinden gönderiliyor... (Agent ID: %s)",
+				// Stream API yerine SendSystemMetrics RPC metodunu kullan
+				log.Printf("Sistem metrikleri SendSystemMetrics RPC ile gönderiliyor... (Agent ID: %s)",
 					metricsReq.AgentId)
 
-				// AgentMessage oluştur
-				response := &pb.AgentMessage{
-					Payload: &pb.AgentMessage_SystemMetrics{
-						SystemMetrics: metrics,
-					},
+				// AgentServiceClient oluştur
+				client := pb.NewAgentServiceClient(r.grpcClient)
+
+				// SystemMetricsRequest oluştur
+				request := &pb.SystemMetricsRequest{
+					AgentId: metricsReq.AgentId,
 				}
 
-				// Stream üzerinden gönder
-				if err := r.stream.Send(response); err != nil {
-					log.Printf("Sistem metrikleri gönderilemedi: %v", err)
+				// SendSystemMetrics RPC'sini çağır - bu çağrı artık sistemdeki lokal metodu kullanmıyor
+				// doğrudan sunucudaki uzak metodu çağırıyor. Bu yüzden metrics alanını kaldırdık.
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				response, err := client.SendSystemMetrics(ctx, request)
+				cancel()
+
+				if err != nil {
+					log.Printf("Sistem metrikleri gönderilemedi (RPC): %v", err)
 					if err := r.reconnect(); err != nil {
 						log.Printf("Yeniden bağlantı başarısız: %v", err)
 					}
 				} else {
-					log.Printf("Sistem metrikleri başarıyla gönderildi (Stream API)")
+					log.Printf("Sistem metrikleri başarıyla gönderildi (RPC). Yanıt: %s", response.Status)
 				}
 
-				// Belleği temizle
+				// Belleği temizle - stream API kullanımını kaldır
 				metrics = nil
-				response = nil
-
-				// Go'ya GC çalıştırmasını öneriyoruz
-				runtime.GC()
 
 				// Debug için bellek kullanımını logla
 				var memStats runtime.MemStats
@@ -1157,7 +1174,8 @@ func (r *Reporter) reconnect() error {
 	}
 
 	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
-	return r.AgentRegistration("reconnected", "postgres")
+	// Mevcut platform bilgisini kullanarak agent kaydını yenile
+	return r.AgentRegistration("reconnected", r.platform)
 }
 
 // SendPostgresInfo PostgreSQL bilgilerini sunucuya gönderir
