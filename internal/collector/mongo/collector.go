@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,14 +90,30 @@ func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
 	return client, nil
 }
 
-// GetMongoStatus MongoDB servisinin durumunu kontrol eder
+// GetMongoStatus checks if MongoDB service is running by checking if the configured host:port is accessible
 func (c *MongoCollector) GetMongoStatus() string {
-	cmd := exec.Command("sh", "-c", "pgrep -x mongod")
-	out, err := cmd.Output()
-	if err != nil || len(out) == 0 {
-		log.Printf("MongoDB servisi çalışmıyor: %v", err)
+	// Get MongoDB connection details from config
+	host := c.cfg.Mongo.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := c.cfg.Mongo.Port
+	if port == "" {
+		port = "27017" // default MongoDB port
+	}
+
+	// Try to establish a TCP connection to check if the port is listening
+	address := fmt.Sprintf("%s:%s", host, port)
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		log.Printf("MongoDB at %s is not accessible: %v", address, err)
 		return "FAIL!"
 	}
+	if conn != nil {
+		conn.Close()
+	}
+
 	return "RUNNING"
 }
 

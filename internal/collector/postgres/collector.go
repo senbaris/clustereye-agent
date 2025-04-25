@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,14 +58,36 @@ func OpenDB() (*sql.DB, error) {
 }
 
 func GetPGServiceStatus() string {
-
-	out, err := exec.Command("sh", "-c", "ps -aux | grep postgres: | grep -v grep").Output()
-	if err != nil || len(out) == 0 {
-		fmt.Println(out, err)
+	// Konfigürasyonu yükle
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		log.Printf("Konfigürasyon yüklenemedi: %v", err)
 		return "FAIL!"
 	}
-	return "RUNNING"
 
+	// PostgreSQL host ve port bilgilerini al
+	host := cfg.PostgreSQL.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := cfg.PostgreSQL.Port
+	if port == "" {
+		port = "5432" // varsayılan PostgreSQL portu
+	}
+
+	// TCP bağlantısı ile port kontrolü yap
+	address := fmt.Sprintf("%s:%s", host, port)
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		log.Printf("PostgreSQL at %s is not accessible: %v", address, err)
+		return "FAIL!"
+	}
+	if conn != nil {
+		conn.Close()
+	}
+
+	return "RUNNING"
 }
 
 // GetPGVersion PostgreSQL versiyonunu döndürür
