@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +49,9 @@ type MongoInfo struct {
 	FreeDisk       string
 	FdPercent      int32
 	Port           string // MongoDB port bilgisi
+	TotalvCpu      int32  // Toplam vCPU sayısı
+	TotalMemory    int64  // Toplam RAM miktarı (byte cinsinden)
+	ConfigPath     string // MongoDB configuration file path
 }
 
 // MongoServiceStatus MongoDB servisinin durumunu ve detaylarını içeren yapı
@@ -539,11 +544,72 @@ func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
 	return uint64(num * float64(multiplier)), nil
 }
 
+// getTotalvCpu sistemdeki toplam vCPU sayısını döndürür
+func (c *MongoCollector) getTotalvCpu() int32 {
+	// UNIX/Linux sistemlerde nproc veya lscpu komutu kullanılabilir
+	cmd := exec.Command("sh", "-c", "nproc")
+	out, err := cmd.Output()
+	if err != nil {
+		// nproc çalışmadıysa, lscpu dene
+		cmd = exec.Command("sh", "-c", "lscpu | grep 'CPU(s):' | head -n 1 | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			log.Printf("vCPU sayısı alınamadı: %v", err)
+			return 0
+		}
+	}
+
+	// Çıktıyı int32'ye çevir
+	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
+	if err != nil {
+		log.Printf("vCPU sayısı parse edilemedi: %v", err)
+		return 0
+	}
+
+	return int32(cpuCount)
+}
+
+// getTotalMemory sistemdeki toplam RAM miktarını byte cinsinden döndürür
+func (c *MongoCollector) getTotalMemory() int64 {
+	// Linux sistemlerde /proc/meminfo dosyasından MemTotal değerini okuyabiliriz
+	cmd := exec.Command("sh", "-c", "grep MemTotal /proc/meminfo | awk '{print $2}'")
+	out, err := cmd.Output()
+	if err != nil {
+		// Alternatif olarak free komutu deneyelim
+		cmd = exec.Command("sh", "-c", "free -b | grep 'Mem:' | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			log.Printf("Toplam RAM miktarı alınamadı: %v", err)
+			return 0
+		}
+	}
+
+	// Çıktıyı int64'e çevir
+	// /proc/meminfo'dan alınan değer KB cinsindendir, byte'a çevirmek için 1024 ile çarp
+	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		log.Printf("Toplam RAM miktarı parse edilemedi: %v", err)
+		return 0
+	}
+
+	// grep MemTotal kullanıldıysa KB cinsinden, bunu byte'a çevir
+	if strings.Contains(cmd.String(), "MemTotal") {
+		memTotal *= 1024
+	}
+
+	return memTotal
+}
+
 // GetMongoInfo MongoDB bilgilerini toplar
 func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
 	freeDisk, usagePercent := c.GetDiskUsage()
+
+	// Yeni eklenen bilgileri topla
+	totalvCpu := c.getTotalvCpu()
+	totalMemory := c.getTotalMemory()
+	configPath := findMongoConfigFile()
 
 	info := &MongoInfo{
 		ClusterName:    c.getConfigValue("Mongo.Cluster"),
@@ -558,10 +624,13 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		FreeDisk:       freeDisk,
 		FdPercent:      int32(usagePercent),
 		Port:           c.cfg.Mongo.Port, // MongoDB port bilgisini config'den alıyoruz
+		TotalvCpu:      totalvCpu,
+		TotalMemory:    totalMemory,
+		ConfigPath:     configPath,
 	}
 
-	log.Printf("DEBUG: MongoDB bilgileri hazırlandı - Port: %s, Status: %s, Version: %s",
-		info.Port, info.MongoStatus, info.MongoVersion)
+	log.Printf("DEBUG: MongoDB bilgileri hazırlandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
+		info.Port, info.MongoStatus, info.MongoVersion, info.TotalvCpu, info.TotalMemory, info.ConfigPath)
 
 	return info
 }
@@ -650,6 +719,9 @@ func (m *MongoInfo) ToProto() *pb.MongoInfo {
 		FreeDisk:          m.FreeDisk,
 		FdPercent:         m.FdPercent,
 		Port:              m.Port,
+		TotalVcpu:         m.TotalvCpu,
+		TotalMemory:       m.TotalMemory,
+		ConfigPath:        m.ConfigPath,
 	}
 }
 
@@ -1179,19 +1251,141 @@ func isMongoDBArtifact(name string) bool {
 
 // findMongoConfigFile MongoDB konfigürasyon dosyasını bulmayı dener
 func findMongoConfigFile() string {
-	// MongoDB konfigürasyon dosyası için olası yerler
-	configPaths := []string{
-		"/etc/mongod.conf",
-		"/etc/mongodb.conf",
-		"/usr/local/bin/mongod1.conf", // macOS Homebrew
-	}
+	// 1. MongoDB süreç parametrelerinden konfigürasyon dosyasını bul
+	cmd := exec.Command("sh", "-c", "ps -ef | grep mongod | grep -v grep | grep -- '--config\\|--f\\|-f' || true")
+	out, err := cmd.Output()
+	if err == nil && len(out) > 0 {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
 
-	for _, path := range configPaths {
-		if _, err := os.Stat(path); err == nil {
-			return path
+			// --config veya -f veya --f parametresini ara
+			configParams := []string{"--config", "--f", "-f"}
+			for _, param := range configParams {
+				if idx := strings.Index(line, param); idx != -1 {
+					parts := strings.Fields(line[idx:])
+					if len(parts) > 1 && !strings.HasPrefix(parts[1], "-") {
+						configPath := parts[1]
+						// "=" işaretini ayır (--config=file.conf durumu için)
+						if strings.Contains(parts[0], "=") {
+							configParts := strings.Split(parts[0], "=")
+							if len(configParts) > 1 {
+								configPath = configParts[1]
+							}
+						}
+
+						// Dosyanın var olup olmadığını kontrol et
+						if _, err := os.Stat(configPath); err == nil {
+							log.Printf("MongoDB konfigürasyon dosyası süreç parametrelerinden bulundu: %s", configPath)
+							return configPath
+						}
+					}
+				}
+			}
 		}
 	}
 
+	// 2. Bilinen olası konfigürasyon dosyalarını kontrol et
+	commonConfigPaths := []string{
+		"/etc/mongod.conf",
+		"/etc/mongodb.conf",
+		"/usr/local/etc/mongod.conf",
+		"/usr/local/var/mongodb/mongod.conf",
+		"/opt/mongodb/conf/mongod.conf",
+		"/opt/homebrew/etc/mongod.conf", // macOS Homebrew Apple Silicon
+	}
+
+	// Sistemin türüne göre ek yollar ekle
+	if runtime.GOOS == "darwin" {
+		// macOS için Homebrew kurulumundaki olası yerler
+		commonConfigPaths = append(commonConfigPaths,
+			"/usr/local/etc/mongod.conf",
+			"/opt/homebrew/etc/mongod.conf",
+			"/usr/local/Cellar/mongodb/*/etc/mongod.conf",
+		)
+	} else if runtime.GOOS == "linux" {
+		// Linux dağıtımlarına özgü yollar
+		commonConfigPaths = append(commonConfigPaths,
+			"/etc/mongodb/mongod.conf",
+			"/etc/mongod/mongod.conf",
+			"/opt/mongodb/etc/mongod.conf",
+			"/var/lib/mongodb/mongod.conf",
+		)
+	}
+
+	// User home dizinini al
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		// User-specific konfigürasyon yolları
+		userConfigs := []string{
+			filepath.Join(homeDir, ".mongodb/mongod.conf"),
+			filepath.Join(homeDir, ".config/mongodb/mongod.conf"),
+			filepath.Join(homeDir, "mongodb/mongod.conf"),
+		}
+		commonConfigPaths = append(commonConfigPaths, userConfigs...)
+	}
+
+	// Bilinen yolları kontrol et
+	for _, path := range commonConfigPaths {
+		// Glob pattern desteği için
+		matches, err := filepath.Glob(path)
+		if err == nil && len(matches) > 0 {
+			for _, match := range matches {
+				if _, err := os.Stat(match); err == nil {
+					log.Printf("MongoDB konfigürasyon dosyası bilinen yoldan bulundu: %s", match)
+					return match
+				}
+			}
+		}
+	}
+
+	// 3. MongoDB veri dizinini bul ve orada konfigürasyon dosyalarını ara
+	dataDir := findMongoDBDataDir()
+	if dataDir != "" {
+		// Veri dizini ve üst dizininde config dosyalarını ara
+		configInDataDir := []string{
+			filepath.Join(dataDir, "mongod.conf"),
+			filepath.Join(dataDir, "mongodb.conf"),
+			filepath.Join(filepath.Dir(dataDir), "conf", "mongod.conf"),
+			filepath.Join(filepath.Dir(dataDir), "etc", "mongod.conf"),
+		}
+
+		for _, path := range configInDataDir {
+			if _, err := os.Stat(path); err == nil {
+				log.Printf("MongoDB konfigürasyon dosyası veri dizininde bulundu: %s", path)
+				return path
+			}
+		}
+	}
+
+	// 4. Son çare: `mongod --help` çıktısından varsayılan config dosyasını bul
+	cmd = exec.Command("mongod", "--help")
+	out, err = cmd.Output()
+	if err == nil {
+		// --help çıktısında varsayılan config dosyası yolunu ara
+		helpText := string(out)
+		scanner := bufio.NewScanner(strings.NewReader(helpText))
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Config dosyası hakkında bilgi içeren satırı ara
+			if strings.Contains(line, "config") && strings.Contains(line, "default") {
+				// Satırdaki dosya yollarını çıkar
+				re := regexp.MustCompile(`/\w+(?:/\w+)*\.conf`)
+				matches := re.FindAllString(line, -1)
+				for _, match := range matches {
+					if _, err := os.Stat(match); err == nil {
+						log.Printf("MongoDB konfigürasyon dosyası --help çıktısından bulundu: %s", match)
+						return match
+					}
+				}
+			}
+		}
+	}
+
+	// Hiçbir şey bulunamadı
+	log.Printf("MongoDB konfigürasyon dosyası bulunamadı")
 	return ""
 }
 

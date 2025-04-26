@@ -1186,6 +1186,7 @@ func (r *Reporter) reconnect() error {
 
 // SendPostgresInfo PostgreSQL bilgilerini sunucuya gönderir
 func (r *Reporter) SendPostgresInfo() error {
+	log.Printf("SendPostgresInfo metodu çağrıldı")
 	log.Println("PostgreSQL bilgileri toplanıyor...")
 
 	// Hostname ve IP bilgilerini al
@@ -1205,13 +1206,16 @@ func (r *Reporter) SendPostgresInfo() error {
 		Hostname:          hostname,
 		Ip:                ip,
 		PgServiceStatus:   postgres.GetPGServiceStatus(),
-		PgBouncerStatus:   postgres.GetPGBouncerStatus(),
+		PgBouncerStatus:   "N/A", // PgBouncer durumu artık kontrol edilmiyor
+		NodeStatus:        nodeStatus,
 		PgVersion:         postgres.GetPGVersion(),
+		ReplicationLagSec: int64(postgres.GetReplicationLagSec()),
 		FreeDisk:          freeDisk,
 		FdPercent:         int32(fdPercent),
-		NodeStatus:        nodeStatus,
-		ReplicationLagSec: int64(postgres.GetReplicationLagSec()),
 	}
+
+	// PostgreSQL bilgilerini logla
+	log.Printf("PostgreSQL bilgileri alındı: %v", pgInfo)
 
 	// Yeni SendPostgresInfo RPC'sini kullanarak verileri gönder
 	client := pb.NewAgentServiceClient(r.grpcClient)

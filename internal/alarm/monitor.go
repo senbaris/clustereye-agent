@@ -86,8 +86,6 @@ func (m *AlarmMonitor) checkAlarms() {
 	} else if m.platform == "postgres" {
 		// PostgreSQL servis durumunu kontrol et
 		m.checkPostgreSQLServiceStatus()
-		// PgBouncer durumunu kontrol et
-		m.checkPgBouncerStatus()
 	} else {
 		log.Printf("Bilinmeyen platform: %s", m.platform)
 	}
@@ -182,95 +180,6 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 				m.alarmCacheLock.Unlock()
 
 				log.Printf("PostgreSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
-			}
-		}
-	}
-}
-
-// checkPgBouncerStatus PgBouncer servis durumunu kontrol eder
-func (m *AlarmMonitor) checkPgBouncerStatus() {
-	status := postgres.GetPGBouncerStatus()
-	alarmKey := "pgbouncer_service_status"
-
-	// Rate limiting için zaman kontrolü ekle
-	m.alarmCacheLock.RLock()
-	prevAlarm, exists := m.alarmCache[alarmKey]
-	m.alarmCacheLock.RUnlock()
-
-	// Önceki alarm varsa ve son 15 saniye içinde gönderilmişse, tekrar gönderme
-	if exists {
-		// Önceki alarmın zamanını parse et
-		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
-		if err == nil {
-			timeSinceLastAlarm := time.Since(prevTimestamp)
-			// Son 15 saniye içinde gönderilmişse ve durum değişmemişse tekrar gönderme
-			if timeSinceLastAlarm < 15*time.Second &&
-				((status == "FAIL!" && prevAlarm.Status == "triggered") ||
-					(status == "RUNNING" && prevAlarm.Status == "resolved")) {
-				log.Printf("PgBouncer servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
-				return
-			}
-		}
-	}
-
-	if status == "FAIL!" {
-		// Önceki bir alarm varsa ve aynı durumda ise tekrar gönderme
-		if exists && prevAlarm.Status == "triggered" {
-			// Alarm zaten tetiklenmiş, tekrar gönderme (sadece log için)
-			log.Printf("PgBouncer servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
-			return
-		}
-
-		// Yeni alarm oluştur
-		alarmEvent := &pb.AlarmEvent{
-			Id:          uuid.New().String(),
-			AlarmId:     alarmKey,
-			AgentId:     m.agentID,
-			Status:      "triggered",
-			MetricName:  "pgbouncer_service_status",
-			MetricValue: status,
-			Message:     "PgBouncer service is having issues (FAIL!)",
-			Timestamp:   time.Now().Format(time.RFC3339),
-			Severity:    "critical",
-		}
-
-		// Alarmı gönder
-		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("PgBouncer servis alarmı gönderilemedi: %v", err)
-		} else {
-			// Başarıyla gönderildi, önbellekte sakla
-			m.alarmCacheLock.Lock()
-			m.alarmCache[alarmKey] = alarmEvent
-			m.alarmCacheLock.Unlock()
-
-			log.Printf("PgBouncer servis FAIL! alarmı gönderildi (ID: %s)", alarmEvent.Id)
-		}
-	} else if status == "RUNNING" {
-		// Önceki bir alarm varsa ve tetiklenmişse, çözüldü mesajı gönder
-		if exists && prevAlarm.Status == "triggered" {
-			// Çözüldü mesajı oluştur
-			resolvedEvent := &pb.AlarmEvent{
-				Id:          uuid.New().String(),
-				AlarmId:     alarmKey,
-				AgentId:     m.agentID,
-				Status:      "resolved",
-				MetricName:  "pgbouncer_service_status",
-				MetricValue: status,
-				Message:     "PgBouncer service is running again (RUNNING)",
-				Timestamp:   time.Now().Format(time.RFC3339),
-				Severity:    "info",
-			}
-
-			// Çözüldü mesajını gönder
-			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("PgBouncer servis çözüldü mesajı gönderilemedi: %v", err)
-			} else {
-				// Başarıyla gönderildi, önbellekte sakla
-				m.alarmCacheLock.Lock()
-				m.alarmCache[alarmKey] = resolvedEvent
-				m.alarmCacheLock.Unlock()
-
-				log.Printf("PgBouncer servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
 		}
 	}
