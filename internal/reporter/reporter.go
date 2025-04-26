@@ -720,6 +720,112 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
+				// PostgreSQL konfigürasyon sorgusu için özel işleme
+				if strings.HasPrefix(query.Command, "read_postgres_config") {
+					log.Printf("PostgreSQL config sorgusu tespit edildi: %s", query.Command)
+
+					// Komut parametresini parse et (configPath)
+					configPath := ""
+					parts := strings.Split(query.Command, "|")
+					if len(parts) > 1 {
+						configPath = strings.TrimSpace(parts[1])
+					}
+
+					log.Printf("PostgreSQL konfigürasyon dosyası okunuyor: %s", configPath)
+
+					// ConfigRequest oluştur
+					hostname, _ := os.Hostname()
+					agentID := "agent_" + hostname
+					configReq := &pb.PostgresConfigRequest{
+						AgentId:    agentID,
+						ConfigPath: configPath,
+					}
+
+					// ReadPostgresConfig fonksiyonunu çağır
+					configResp, err := r.ReadPostgresConfig(context.Background(), configReq)
+					if err != nil {
+						log.Printf("PostgreSQL konfigürasyon dosyası okunamadı: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("PostgreSQL konfigürasyon dosyası okunamadı: %v", err),
+						}
+
+						resultStruct, _ := structpb.NewStruct(queryResult)
+						anyResult, _ := anypb.New(resultStruct)
+
+						response := &pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: &pb.QueryResult{
+									QueryId: query.QueryId,
+									Result:  anyResult,
+								},
+							},
+						}
+
+						if err := r.stream.Send(response); err != nil {
+							log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+						}
+
+						isProcessingQuery = false
+						continue
+					}
+
+					// Konfigürasyon girdilerini map'e dönüştür
+					configEntries := make([]interface{}, 0, len(configResp.Configurations))
+					for _, entry := range configResp.Configurations {
+						entryMap := map[string]interface{}{
+							"parameter":   entry.Parameter,
+							"value":       entry.Value,
+							"description": entry.Description,
+							"is_default":  entry.IsDefault,
+							"category":    entry.Category,
+						}
+						configEntries = append(configEntries, entryMap)
+					}
+
+					// Sonuç struct'ını oluştur
+					result := map[string]interface{}{
+						"status":         "success",
+						"config_path":    configResp.ConfigPath,
+						"configurations": configEntries,
+						"count":          len(configResp.Configurations),
+					}
+
+					// structpb'ye dönüştür
+					resultStruct, err := structpb.NewStruct(result)
+					if err != nil {
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						isProcessingQuery = false
+						continue
+					}
+
+					// Yanıtı gönder
+					response := &pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyResult,
+							},
+						},
+					}
+
+					if err := r.stream.Send(response); err != nil {
+						log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+					} else {
+						log.Printf("PostgreSQL konfigürasyon bilgileri başarıyla gönderildi (%d parametre)", len(configResp.Configurations))
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
 				// PostgreSQL log analizi sorgusu için özel işlem
 				if strings.HasPrefix(query.Command, "analyze_postgres_log") {
 					log.Printf("PostgreSQL log analizi sorgusu tespit edildi: %s", query.Command)
@@ -1407,7 +1513,6 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 
 // AnalyzeMongoLog, MongoDB log dosyasını analiz eder ve önemli log girdilerini döndürür
 func (r *Reporter) AnalyzeMongoLog(req *pb.MongoLogAnalyzeRequest) (*pb.MongoLogAnalyzeResponse, error) {
-	log.Printf("====== REPORTER: MONGO LOG ANALİZİ BAŞLIYOR ======")
 	log.Printf("MongoDB log analizi: Dosya=%s, Eşik=%d ms", req.LogFilePath, req.SlowQueryThresholdMs)
 
 	// Import MongoDB collector
@@ -1428,5 +1533,61 @@ func (r *Reporter) AnalyzeMongoLog(req *pb.MongoLogAnalyzeRequest) (*pb.MongoLog
 	}
 
 	log.Printf("MongoDB log analizi tamamlandı. %d kayıt bulundu", len(response.LogEntries))
+	return response, nil
+}
+
+// ReadPostgresConfig PostgreSQL konfigürasyon dosyasını okur ve belirtilen parametrelerin değerlerini döndürür
+func (r *Reporter) ReadPostgresConfig(ctx context.Context, req *pb.PostgresConfigRequest) (*pb.PostgresConfigResponse, error) {
+	log.Printf("ReadPostgresConfig metodu çağrıldı. AgentID: %s, ConfigPath: %s", req.AgentId, req.ConfigPath)
+
+	// Konfigürasyon dosyası yolunu kontrol et
+	configPath := req.ConfigPath
+	if configPath == "" {
+		// Eğer konfigürasyon dosyası yolu belirtilmemişse, otomatik bul
+		var err error
+		configPath, err = postgres.FindPostgresConfigFile()
+		if err != nil {
+			log.Printf("PostgreSQL konfigürasyon dosyası bulunamadı: %v", err)
+			return &pb.PostgresConfigResponse{
+				Status:     "error",
+				ConfigPath: "",
+			}, fmt.Errorf("PostgreSQL konfigürasyon dosyası bulunamadı: %v", err)
+		}
+	}
+
+	log.Printf("PostgreSQL konfigürasyon dosyası okunuyor: %s", configPath)
+
+	// Dosyanın var olup olmadığını kontrol et
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Printf("Konfigürasyon dosyası bulunamadı: %s", configPath)
+		return &pb.PostgresConfigResponse{
+			Status:     "error",
+			ConfigPath: configPath,
+		}, fmt.Errorf("konfigürasyon dosyası bulunamadı: %s", configPath)
+	}
+
+	// Konfigürasyon dosyasını oku
+	configs, err := postgres.ReadPostgresConfig(configPath)
+	if err != nil {
+		log.Printf("Konfigürasyon dosyası okunamadı: %v", err)
+		return &pb.PostgresConfigResponse{
+			Status:     "error",
+			ConfigPath: configPath,
+		}, fmt.Errorf("konfigürasyon dosyası okunamadı: %v", err)
+	}
+
+	// Okunan değerleri logla
+	log.Printf("PostgreSQL konfigürasyon dosyası okundu: %s, %d adet parametre bulundu", configPath, len(configs))
+	for _, cfg := range configs {
+		log.Printf("PostgreSQL Konfigürasyonu: %s = %s (%s)", cfg.Parameter, cfg.Value, cfg.Category)
+	}
+
+	// Yanıtı oluştur
+	response := &pb.PostgresConfigResponse{
+		Status:         "success",
+		ConfigPath:     configPath,
+		Configurations: configs,
+	}
+
 	return response, nil
 }

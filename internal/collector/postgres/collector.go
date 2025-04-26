@@ -1096,3 +1096,125 @@ func getLogPathFromConfig(configFile string) string {
 
 	return ""
 }
+
+// ReadPostgresConfig belirtilen dosya yolundaki PostgreSQL konfigürasyon dosyasını okur ve
+// belirtilen parametrelerin değerlerini döndürür
+func ReadPostgresConfig(configPath string) ([]*pb.PostgresConfigEntry, error) {
+	// Konfigürasyon dosyasını oku
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("konfigürasyon dosyası okunamadı: %v", err)
+	}
+
+	// İzlenecek parametreler
+	targetParams := map[string]string{
+		"max_connections":                  "Maximum number of concurrent connections",
+		"shared_buffers":                   "Shared memory buffer size used by PostgreSQL",
+		"effective_cache_size":             "Amount of memory available for disk caching",
+		"maintenance_work_mem":             "Memory allocated for maintenance operations",
+		"checkpoint_completion_target":     "Target completion time for checkpoint operations",
+		"wal_buffers":                      "Memory allocated for WAL operations",
+		"default_statistics_target":        "Default statistics target for table columns",
+		"random_page_cost":                 "Cost estimate for random disk page access",
+		"effective_io_concurrency":         "Effective I/O concurrency for disk operations",
+		"work_mem":                         "Memory allocated for query operations",
+		"huge_pages":                       "Use of huge memory pages",
+		"min_wal_size":                     "Minimum size of WAL files",
+		"max_wal_size":                     "Maximum size of WAL files",
+		"max_worker_processes":             "Maximum number of background worker processes",
+		"max_parallel_workers_per_gather":  "Maximum parallel workers per Gather operation",
+		"max_parallel_workers":             "Maximum number of parallel workers",
+		"max_parallel_maintenance_workers": "Maximum parallel workers for maintenance operations",
+	}
+
+	// Kategoriler - parametreleri gruplandırmak için
+	paramCategories := map[string]string{
+		"max_connections":                  "Connection",
+		"shared_buffers":                   "Memory",
+		"effective_cache_size":             "Memory",
+		"maintenance_work_mem":             "Memory",
+		"checkpoint_completion_target":     "WAL",
+		"wal_buffers":                      "WAL",
+		"default_statistics_target":        "Query Planning",
+		"random_page_cost":                 "Query Planning",
+		"effective_io_concurrency":         "Query Planning",
+		"work_mem":                         "Memory",
+		"huge_pages":                       "Memory",
+		"min_wal_size":                     "WAL",
+		"max_wal_size":                     "WAL",
+		"max_worker_processes":             "Parallelism",
+		"max_parallel_workers_per_gather":  "Parallelism",
+		"max_parallel_workers":             "Parallelism",
+		"max_parallel_maintenance_workers": "Parallelism",
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var configs []*pb.PostgresConfigEntry
+
+	// Bulunan parametreleri izlemek için bir harita
+	foundParams := make(map[string]bool)
+
+	// Her satırı işle
+	for _, line := range lines {
+		isCommented := false
+
+		// Yorum satırı mı kontrol et
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			// Satır yorumlanmış, # işaretini kaldır
+			line = strings.TrimSpace(line[1:])
+			isCommented = true
+		}
+
+		// Boş satırları atla
+		if len(strings.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		// Parametre ve değeri ayır
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		param := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		// Parametre hedeflenen listede mi kontrol et
+		if desc, ok := targetParams[param]; ok {
+			// Bu parametreyi işaretleyelim
+			foundParams[param] = true
+
+			// Değeri düzenle - tırnak işaretleri veya son noktalı virgülü kaldır
+			value = strings.Trim(value, "'\"")
+			value = strings.TrimSuffix(value, ";")
+
+			// PostgresConfigEntry oluştur
+			category := paramCategories[param]
+			if category == "" {
+				category = "Other"
+			}
+
+			configEntry := &pb.PostgresConfigEntry{
+				Parameter:   param,
+				Value:       value,
+				Description: desc,
+				IsDefault:   isCommented, // Yorum satırı ise varsayılan değer olarak işaretleyelim
+				Category:    category,
+			}
+
+			configs = append(configs, configEntry)
+			log.Printf("Konfigürasyon parametresi bulundu: %s = %s (Yorumlanmış: %t)", param, value, isCommented)
+		}
+	}
+
+	// İstenen tüm parametreleri bulduk mu kontrol edelim
+	for param := range targetParams {
+		if !foundParams[param] {
+			log.Printf("UYARI: '%s' parametresi config dosyasında bulunamadı", param)
+		}
+	}
+
+	return configs, nil
+}
+
+// AnalyzePostgresLog PostgreSQL log dosyasını analiz eder

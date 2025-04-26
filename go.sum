@@ -24,6 +24,8 @@ github.com/sefaphlvn/clustereye-test v0.0.0-20250426093920-96bd0d4e3caa h1:6Izf/
 github.com/sefaphlvn/clustereye-test v0.0.0-20250426093920-96bd0d4e3caa/go.mod h1:2rxF1YQdvDhLhdNeE3N5oq6k/k7VqwhR7hRUr0t/hcQ=
 github.com/sefaphlvn/clustereye-test v0.0.0-20250426170647-e56f77bb5535 h1:qS4MeEDpRGEuR/Jl7M7+YPDVj2fVhs5HwABKSjJwTAU=
 github.com/sefaphlvn/clustereye-test v0.0.0-20250426170647-e56f77bb5535/go.mod h1:2rxF1YQdvDhLhdNeE3N5oq6k/k7VqwhR7hRUr0t/hcQ=
+github.com/sefaphlvn/clustereye-test v0.0.0-20250426174915-e40ef87eb524 h1:dlEsuxI3SXYs6dRWyMSpUojCVqCgLi5vy3rU86wJ9Dc=
+github.com/sefaphlvn/clustereye-test v0.0.0-20250426174915-e40ef87eb524/go.mod h1:2rxF1YQdvDhLhdNeE3N5oq6k/k7VqwhR7hRUr0t/hcQ=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
 github.com/xdg-go/pbkdf2 v1.0.0/go.mod h1:jrpuAogTd400dnrH08LKmI/xc1MbPOebTwRqcT5RDeI=
 github.com/xdg-go/scram v1.1.2 h1:FHX5I5B4i4hKRVRBCFRxq1iQRej7WO3hhBuJf+UUySY=
