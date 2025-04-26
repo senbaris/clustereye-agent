@@ -1199,6 +1199,15 @@ func (r *Reporter) SendPostgresInfo() error {
 	// Node durumunu al
 	nodeStatus := postgres.GetNodeStatus()
 
+	// Toplam vCPU sayısını al
+	totalvCpu := postgres.GetTotalvCpu()
+
+	// Toplam RAM miktarını al
+	totalMemory := postgres.GetTotalMemory()
+
+	// PostgreSQL konfigürasyon dosyasının yolunu al
+	configPath, _ := postgres.FindPostgresConfigFile()
+
 	// PostgreSQL bilgilerini oluştur
 	pgInfo := &pb.PostgresInfo{
 		ClusterName:       r.cfg.PostgreSQL.Cluster,
@@ -1212,6 +1221,9 @@ func (r *Reporter) SendPostgresInfo() error {
 		ReplicationLagSec: int64(postgres.GetReplicationLagSec()),
 		FreeDisk:          freeDisk,
 		FdPercent:         int32(fdPercent),
+		TotalVcpu:         totalvCpu,
+		TotalMemory:       totalMemory,
+		ConfigPath:        configPath,
 	}
 
 	// PostgreSQL bilgilerini logla

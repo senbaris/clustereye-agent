@@ -155,8 +155,8 @@ func convertSize(bytes uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// findPostgresConfigFile PostgreSQL konfigürasyon dosyasını bulur
-func findPostgresConfigFile() (string, error) {
+// FindPostgresConfigFile PostgreSQL konfigürasyon dosyasını bulur
+func FindPostgresConfigFile() (string, error) {
 	// Olası konfigürasyon dosyası konumları
 	possiblePaths := []string{
 		"/etc/postgresql/*/main/postgresql.conf",
@@ -182,7 +182,7 @@ func findPostgresConfigFile() (string, error) {
 
 // getDataDirectoryFromConfig postgresql.conf dosyasından data_directory parametresini okur
 func getDataDirectoryFromConfig() (string, error) {
-	configFile, err := findPostgresConfigFile()
+	configFile, err := FindPostgresConfigFile()
 	if err != nil {
 		return "", fmt.Errorf("konfigürasyon dosyası bulunamadı: %v", err)
 	}
@@ -358,6 +358,71 @@ func getCPUCores() (int32, error) {
 		return 0, err
 	}
 	return int32(cores), nil
+}
+
+// getTotalvCpu sistemdeki toplam vCPU sayısını döndürür
+func GetTotalvCpu() int32 {
+	// UNIX/Linux sistemlerde nproc veya lscpu komutu kullanılabilir
+	cmd := exec.Command("sh", "-c", "nproc")
+	out, err := cmd.Output()
+	if err != nil {
+		// nproc çalışmadıysa, lscpu dene
+		cmd = exec.Command("sh", "-c", "lscpu | grep 'CPU(s):' | head -n 1 | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			// Hata varsa, getCPUCores'u kullan
+			cores, err := getCPUCores()
+			if err != nil {
+				log.Printf("vCPU sayısı alınamadı: %v", err)
+				return 0
+			}
+			return cores
+		}
+	}
+
+	// Çıktıyı int32'ye çevir
+	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
+	if err != nil {
+		log.Printf("vCPU sayısı parse edilemedi: %v", err)
+		return 0
+	}
+
+	return int32(cpuCount)
+}
+
+// getTotalMemory sistemdeki toplam RAM miktarını byte cinsinden döndürür
+func GetTotalMemory() int64 {
+	// Linux sistemlerde /proc/meminfo dosyasından MemTotal değerini okuyabiliriz
+	cmd := exec.Command("sh", "-c", "grep MemTotal /proc/meminfo | awk '{print $2}'")
+	out, err := cmd.Output()
+	if err != nil {
+		// Alternatif olarak free komutu deneyelim
+		cmd = exec.Command("sh", "-c", "free -b | grep 'Mem:' | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			// MacOS için sysctl'yi deneyelim
+			cmd = exec.Command("sh", "-c", "sysctl -n hw.memsize")
+			out, err = cmd.Output()
+			if err != nil {
+				log.Printf("Toplam RAM miktarı alınamadı: %v", err)
+				return 0
+			}
+		}
+	}
+
+	// Çıktıyı int64'e çevir
+	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		log.Printf("Toplam RAM miktarı parse edilemedi: %v", err)
+		return 0
+	}
+
+	// grep MemTotal kullanıldıysa KB cinsinden, bunu byte'a çevir
+	if strings.Contains(cmd.String(), "MemTotal") {
+		memTotal *= 1024
+	}
+
+	return memTotal
 }
 
 // getLoadAverage sistem yükünü döndürür
@@ -702,7 +767,7 @@ func FindPostgresLogFiles(logPath string) ([]*pb.PostgresLogFile, error) {
 	// Eğer logPath belirtilmemişse, varsayılan olarak bilinen lokasyonları kontrol et
 	if logPath == "" {
 		// PostgreSQL konfigürasyon dosyasını bul
-		configFile, err := findPostgresConfigFile()
+		configFile, err := FindPostgresConfigFile()
 		if err == nil {
 			// Konfigürasyondan log path'i oku
 			if path := getLogPathFromConfig(configFile); path != "" {
