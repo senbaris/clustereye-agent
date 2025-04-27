@@ -18,6 +18,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/reporter"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -52,7 +53,15 @@ func main() {
 	}
 
 	// GRPC Bağlantısı kur
-	conn, err := grpc.Dial(cfg.GRPC.ServerAddress, grpc.WithInsecure())
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(32*1024*1024), // 32MB
+			grpc.MaxCallSendMsgSize(32*1024*1024), // 32MB
+		),
+	}
+
+	conn, err := grpc.Dial(cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
 		log.Fatalf("gRPC sunucusuna bağlanılamadı: %v", err)
 	}
@@ -60,6 +69,8 @@ func main() {
 
 	// gRPC client oluştur
 	client := pb.NewAgentServiceClient(conn)
+
+	// Stream bağlantısını başlat
 	stream, err := client.Connect(context.Background())
 	if err != nil {
 		log.Fatalf("Connect stream oluşturulamadı: %v", err)
