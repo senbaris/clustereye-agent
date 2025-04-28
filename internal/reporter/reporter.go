@@ -26,12 +26,16 @@ import (
 
 // QueryProcessor, sorgu işleme mantığını temsil eder
 type QueryProcessor struct {
-	db *sql.DB
+	db  *sql.DB
+	cfg *config.AgentConfig
 }
 
 // NewQueryProcessor, yeni bir sorgu işleyici oluşturur
-func NewQueryProcessor(db *sql.DB) *QueryProcessor {
-	return &QueryProcessor{db: db}
+func NewQueryProcessor(db *sql.DB, cfg *config.AgentConfig) *QueryProcessor {
+	return &QueryProcessor{
+		db:  db,
+		cfg: cfg,
+	}
 }
 
 // processQuery, gelen sorguyu işler ve sonucu döndürür
@@ -42,15 +46,92 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 		maxTotalDataSize = 1024 * 1024 // Maksimum toplam veri boyutu (1 MB)
 	)
 
+	// Debug için hangi veritabanında çalıştığımızı kontrol et
+	var currentDB string
+	p.db.QueryRow("SELECT current_database()").Scan(&currentDB)
+	log.Printf("[DEBUG] Mevcut veritabanı: %s, İstenen veritabanı: %s", currentDB, database)
+
 	// Veritabanını seç
-	if database != "" {
-		_, err := p.db.Exec(fmt.Sprintf("SET search_path TO %s", database))
+	if database != "" && database != currentDB {
+		log.Printf("[DEBUG] Veritabanı değişikliği gerekiyor: %s -> %s", currentDB, database)
+
+		// Mevcut bağlantıdan host bilgisini al
+		var currentHost string
+		err := p.db.QueryRow("SELECT inet_server_addr()").Scan(&currentHost)
 		if err != nil {
-			return map[string]interface{}{
-				"status":  "error",
-				"message": fmt.Sprintf("Veritabanı seçilemedi: %v", err),
+			currentHost = "localhost"
+			log.Printf("[DEBUG] Host bilgisi alınamadı, varsayılan olarak localhost kullanılacak")
+		}
+
+		// Mevcut bağlantıdan port bilgisini al
+		var currentPort string
+		err = p.db.QueryRow("SELECT inet_server_port()").Scan(&currentPort)
+		if err != nil {
+			currentPort = "5432"
+			log.Printf("[DEBUG] Port bilgisi alınamadı, varsayılan olarak 5432 kullanılacak")
+		}
+
+		// Config'den kullanıcı adı ve şifreyi al
+		user := p.cfg.PostgreSQL.User
+		pass := p.cfg.PostgreSQL.Pass
+
+		// Connection string'i oluştur
+		connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+			currentHost, currentPort, user, pass, database)
+
+		log.Printf("[DEBUG] Yeni connection string oluşturuldu (kullanıcı: %s, host: %s, port: %s, db: %s)",
+			user, currentHost, currentPort, database)
+
+		// Mevcut bağlantıyı kapat
+		if p.db != nil {
+			if err := p.db.Close(); err != nil {
+				log.Printf("[WARN] Mevcut bağlantı kapatılırken hata: %v", err)
 			}
 		}
+
+		// Yeni bağlantı aç
+		newDB, err := sql.Open("postgres", connStr)
+		if err != nil {
+			log.Printf("[ERROR] Yeni veritabanı bağlantısı açılamadı: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("Yeni veritabanı bağlantısı açılamadı: %v", err),
+			}
+		}
+
+		// Bağlantıyı test et
+		if err := newDB.Ping(); err != nil {
+			log.Printf("[ERROR] Yeni veritabanı bağlantısı test edilemedi: %v", err)
+			newDB.Close()
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("Yeni veritabanı bağlantısı test edilemedi: %v", err),
+			}
+		}
+
+		// Bağlantıyı güncelle
+		p.db = newDB
+
+		// Search path'i ayarla
+		_, err = p.db.Exec("SET search_path TO public, pg_catalog")
+		if err != nil {
+			log.Printf("[WARN] Search path ayarlanamadı: %v", err)
+		}
+
+		// Seçilen veritabanını doğrula
+		err = p.db.QueryRow("SELECT current_database()").Scan(&currentDB)
+		if err != nil {
+			log.Printf("[ERROR] Veritabanı kontrolü yapılamadı: %v", err)
+		} else {
+			log.Printf("[DEBUG] Şu anki veritabanı: %s", currentDB)
+		}
+	}
+
+	// İstatistik görünümlerine erişim kontrolü
+	var hasAccess bool
+	err := p.db.QueryRow("SELECT TRUE FROM pg_roles WHERE rolname = current_user AND rolsuper").Scan(&hasAccess)
+	if err != nil || !hasAccess {
+		log.Printf("İstatistik görünümlerine erişim için superuser yetkisi gerekiyor: %v", err)
 	}
 
 	// "ping" komutu için özel işleme
@@ -65,9 +146,96 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 	// Query başlangıç zamanını kaydet
 	startTime := time.Now()
 
+	// Özel sorgu kontrolü - unused indexes
+	if strings.Contains(command, "unused_indexes") || strings.Contains(command, "stats_child.idx_scan = 0") {
+		log.Printf("[DEBUG] Unused indexes sorgusu tespit edildi, özel sorgu kullanılacak")
+
+		// Debug için önce tüm indexleri listele
+		debugRows, err := p.db.Query(`
+			SELECT 
+				n.nspname as schemaname,
+				t.relname as table_name,
+				i.relname as index_name,
+				s.idx_scan,
+				pg_relation_size(i.oid) as index_size,
+				idx.indisunique,
+				EXISTS (
+					SELECT 1 
+					FROM pg_catalog.pg_constraint cc 
+					WHERE cc.conindid = i.oid
+				) as is_constraint,
+				array_to_string(idx.indkey, ',') as index_cols
+			FROM pg_class i
+			JOIN pg_index idx ON idx.indexrelid = i.oid
+			JOIN pg_class t ON t.oid = idx.indrelid
+			JOIN pg_namespace n ON n.oid = i.relnamespace
+			LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.oid
+			WHERE i.relkind = 'i'
+			AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+			ORDER BY n.nspname, t.relname;
+		`)
+		if err != nil {
+			log.Printf("[DEBUG] Tüm indexler listelenirken hata: %v", err)
+		} else {
+			defer debugRows.Close()
+			log.Printf("[DEBUG] Veritabanındaki tüm indexler:")
+			for debugRows.Next() {
+				var schema, table, index string
+				var idxScan *int
+				var size int64
+				var isUnique, isConstraint bool
+				var indexCols string
+				if err := debugRows.Scan(&schema, &table, &index, &idxScan, &size, &isUnique, &isConstraint, &indexCols); err == nil {
+					scanCount := 0
+					if idxScan != nil {
+						scanCount = *idxScan
+					}
+					log.Printf("[DEBUG] Index: %s.%s.%s, Scan Count: %d, Size: %d, Unique: %v, Constraint: %v, Cols: %s",
+						schema, table, index, scanCount, size, isUnique, isConstraint, indexCols)
+				} else {
+					log.Printf("[ERROR] Index satırı okunurken hata: %v", err)
+				}
+			}
+		}
+
+		// Ana sorguyu çalıştır
+		command = `
+		SELECT 
+			'regular index' as indextype,
+			n.nspname as schemaname,
+			t.relname as tablename,
+			i.relname as indexname,
+			pg_catalog.pg_get_indexdef(i.oid) as idx_columns,
+			COALESCE(s.idx_scan, 0) as idx_scan_count,
+			pg_size_pretty(pg_relation_size(i.oid)) as index_size,
+			pg_relation_size(i.oid) as index_size_bytes
+		FROM pg_class i
+		JOIN pg_index idx ON idx.indexrelid = i.oid
+		JOIN pg_class t ON t.oid = idx.indrelid
+		JOIN pg_namespace n ON n.oid = i.relnamespace
+		LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.oid
+		WHERE i.relkind = 'i'
+		AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+		AND NOT idx.indisunique
+		AND NOT EXISTS (
+			SELECT 1 
+			FROM pg_catalog.pg_constraint cc 
+			WHERE cc.conindid = i.oid
+		)
+		AND NOT EXISTS (
+			SELECT 1 
+			FROM pg_inherits pi 
+			WHERE pi.inhrelid = t.oid
+		)
+		AND COALESCE(s.idx_scan, 0) = 0
+		ORDER BY n.nspname, t.relname, pg_relation_size(i.oid) DESC;`
+	}
+
 	// Sorguyu çalıştır
+	log.Printf("[DEBUG] Çalıştırılan sorgu: %s", command)
 	rows, err := p.db.Query(command)
 	if err != nil {
+		log.Printf("[ERROR] Sorgu çalıştırma hatası: %v", err)
 		return map[string]interface{}{
 			"status":  "error",
 			"message": err.Error(),
@@ -78,11 +246,13 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 	// Sütun isimlerini al
 	columns, err := rows.Columns()
 	if err != nil {
+		log.Printf("[ERROR] Sütun bilgileri alınamadı: %v", err)
 		return map[string]interface{}{
 			"status":  "error",
 			"message": err.Error(),
 		}
 	}
+	log.Printf("[DEBUG] Sorgu sonucu sütunlar: %v", columns)
 
 	// Sorgu açıklaması için ID al
 	var queryDesc string
@@ -115,6 +285,7 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 
 		// Satırı oku
 		if err := rows.Scan(valuePtrs...); err != nil {
+			log.Printf("[ERROR] Satır okuma hatası: %v", err)
 			return map[string]interface{}{
 				"status":  "error",
 				"message": err.Error(),
@@ -143,6 +314,7 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 				rowMap[col] = strVal
 				rowSize += len(strVal)
 			case nil:
+				log.Printf("[DEBUG] NULL değer: %s", col)
 				rowMap[col] = ""
 			default:
 				// Diğer tipleri string'e çevir
@@ -157,6 +329,8 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 			}
 		}
 
+		log.Printf("[DEBUG] Satır: %d, İçerik: %v", rowCount, rowMap)
+
 		// Toplam veri boyutunu kontrol et
 		totalDataSize += rowSize
 		if totalDataSize > maxTotalDataSize {
@@ -169,6 +343,7 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 
 	// Sonuçları kontrol et
 	if err := rows.Err(); err != nil {
+		log.Printf("[ERROR] Satır işlemede hata: %v", err)
 		return map[string]interface{}{
 			"status":  "error",
 			"message": err.Error(),
@@ -179,6 +354,18 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 	duration := time.Since(startTime).Milliseconds()
 	log.Printf("Sorgu işleme tamamlandı: %d satır, %d bayt, %d ms",
 		rowCount, totalDataSize, duration)
+
+	// Sonuç satırlarının sayısını kontrol et
+	if len(results) == 0 {
+		log.Printf("[INFO] Sorgu sonuç döndürmedi (empty result set)")
+		// Boş sonuç durumunda bile bilgi döndür
+		return map[string]interface{}{
+			"status":        "success",
+			"message":       "Sorgu başarıyla çalıştı ama sonuç bulunamadı",
+			"rows_returned": 0,
+			"duration_ms":   duration,
+		}
+	}
 
 	// Tek satır sonuç varsa düz map olarak döndür
 	if len(results) == 1 {
@@ -419,7 +606,7 @@ func (r *Reporter) listenForCommands() {
 		defer db.Close()
 
 		// Sorgu işleyiciyi oluştur
-		processor = NewQueryProcessor(db)
+		processor = NewQueryProcessor(db, r.cfg)
 	}
 
 	// Mesaj işleme durumu
