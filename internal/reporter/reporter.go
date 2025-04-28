@@ -35,12 +35,23 @@ func NewQueryProcessor(db *sql.DB) *QueryProcessor {
 }
 
 // processQuery, gelen sorguyu işler ve sonucu döndürür
-func (p *QueryProcessor) processQuery(command string) map[string]interface{} {
+func (p *QueryProcessor) processQuery(command string, database string) map[string]interface{} {
 	const (
 		maxRows          = 100         // Maksimum satır sayısı
 		maxValueLen      = 1000        // Maksimum değer uzunluğu
 		maxTotalDataSize = 1024 * 1024 // Maksimum toplam veri boyutu (1 MB)
 	)
+
+	// Veritabanını seç
+	if database != "" {
+		_, err := p.db.Exec(fmt.Sprintf("SET search_path TO %s", database))
+		if err != nil {
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("Veritabanı seçilemedi: %v", err),
+			}
+		}
+	}
 
 	// "ping" komutu için özel işleme
 	if strings.ToLower(command) == "ping" {
@@ -1148,7 +1159,7 @@ func (r *Reporter) listenForCommands() {
 				}
 
 				// Normal PostgreSQL sorgusu işleme
-				result := processor.processQuery(query.Command)
+				result := processor.processQuery(query.Command, query.Database)
 
 				// Sonucu structpb'ye dönüştür
 				resultStruct, err := structpb.NewStruct(result)
