@@ -2,6 +2,7 @@ package alarm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -443,10 +444,14 @@ func (m *AlarmMonitor) checkSlowQueries() {
 
 	// pg_stat_activity'den uzun süren sorguları al
 	query := fmt.Sprintf(`
-		SELECT pid, usename, datname, query, EXTRACT(EPOCH FROM now() - query_start) * 1000 as duration_ms
+		SELECT pid, usename, 
+		       COALESCE(datname, '') as datname, 
+		       COALESCE(query, '') as query, 
+		       EXTRACT(EPOCH FROM now() - query_start) * 1000 as duration_ms
 		FROM pg_stat_activity
 		WHERE state = 'active'
 		AND query NOT ILIKE '%%pg_stat_activity%%'
+		AND query NOT ILIKE '%%START_REPLICATION SLOT%%'
 		AND query_start < now() - interval '%d milliseconds'
 	`, m.thresholds.SlowQueryThresholdMs)
 
@@ -469,7 +474,7 @@ func (m *AlarmMonitor) checkSlowQueries() {
 	for rows.Next() {
 		var (
 			pid        int
-			username   string
+			username   sql.NullString
 			database   string
 			queryText  string
 			durationMs float64
@@ -488,8 +493,14 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			queryText = queryText[:197] + "..."
 		}
 
+		// NULL username kontrolü
+		usernameStr := "unknown"
+		if username.Valid {
+			usernameStr = username.String
+		}
+
 		slowQueries = append(slowQueries, fmt.Sprintf("PID=%d, User=%s, DB=%s, Duration=%.2fms, Query=%s",
-			pid, username, database, durationMs, queryText))
+			pid, usernameStr, database, durationMs, queryText))
 	}
 
 	if len(slowQueries) > 0 {
