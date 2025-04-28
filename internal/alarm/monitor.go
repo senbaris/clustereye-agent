@@ -24,12 +24,13 @@ type AlarmMonitor struct {
 	alarmCacheLock sync.RWMutex
 	checkInterval  time.Duration
 	config         *config.AgentConfig
-	platform       string // "postgres" veya "mongo"
+	platform       string                // "postgres" veya "mongo"
+	thresholds     *pb.ThresholdSettings // Threshold değerleri
 }
 
 // NewAlarmMonitor yeni bir alarm monitörü oluşturur
 func NewAlarmMonitor(client pb.AgentServiceClient, agentID string, cfg *config.AgentConfig, platform string) *AlarmMonitor {
-	return &AlarmMonitor{
+	monitor := &AlarmMonitor{
 		client:        client,
 		agentID:       agentID,
 		stopCh:        make(chan struct{}),
@@ -38,6 +39,36 @@ func NewAlarmMonitor(client pb.AgentServiceClient, agentID string, cfg *config.A
 		config:        cfg,
 		platform:      platform,
 	}
+
+	// İlk threshold değerlerini al
+	monitor.updateThresholds()
+
+	return monitor
+}
+
+// updateThresholds API'den threshold değerlerini alır
+func (m *AlarmMonitor) updateThresholds() {
+	req := &pb.GetThresholdSettingsRequest{
+		AgentId: m.agentID,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := m.client.GetThresholdSettings(ctx, req)
+	if err != nil {
+		log.Printf("Threshold değerleri alınamadı: %v", err)
+		return
+	}
+
+	m.thresholds = resp.Settings
+	log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d",
+		m.thresholds.CpuThreshold,
+		m.thresholds.MemoryThreshold,
+		m.thresholds.DiskThreshold,
+		m.thresholds.SlowQueryThresholdMs,
+		m.thresholds.ConnectionThreshold,
+		m.thresholds.ReplicationLagThreshold)
 }
 
 // Start alarm kontrol işlemini başlatır
@@ -60,10 +91,9 @@ func (m *AlarmMonitor) SetCheckInterval(interval time.Duration) {
 // monitorLoop periyodik olarak sistemdeki alarm durumlarını kontrol eder
 func (m *AlarmMonitor) monitorLoop() {
 	ticker := time.NewTicker(m.checkInterval)
+	thresholdUpdateTicker := time.NewTicker(5 * time.Minute) // Her 5 dakikada bir threshold değerlerini güncelle
 	defer ticker.Stop()
-
-	// Bir de daha sık checkalarm yapan bir denetim daha var o yüzden burada yapmamıza gerek yok
-	// m.checkAlarms()
+	defer thresholdUpdateTicker.Stop()
 
 	// Periyodik kontrole başla
 	for {
@@ -71,6 +101,9 @@ func (m *AlarmMonitor) monitorLoop() {
 		case <-ticker.C:
 			log.Printf("Periyodik alarm kontrolü yapılıyor (interval: %v)", m.checkInterval)
 			m.checkAlarms()
+		case <-thresholdUpdateTicker.C:
+			log.Printf("Threshold değerleri güncelleniyor...")
+			m.updateThresholds()
 		case <-m.stopCh:
 			return
 		}
@@ -86,14 +119,11 @@ func (m *AlarmMonitor) checkAlarms() {
 	} else if m.platform == "postgres" {
 		// PostgreSQL servis durumunu kontrol et
 		m.checkPostgreSQLServiceStatus()
+		// Uzun süren sorguları kontrol et
+		m.checkSlowQueries()
 	} else {
 		log.Printf("Bilinmeyen platform: %s", m.platform)
 	}
-
-	// Diğer alarm kontrolleri burada eklenebilir
-	// m.checkMemoryUsage()
-	// m.checkDiskUsage()
-	// m.checkCPUUsage()
 }
 
 // checkPostgreSQLServiceStatus PostgreSQL servis durumunu kontrol eder
@@ -402,6 +432,115 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			m.alarmCacheLock.Unlock()
 		}
 	}
+}
+
+// checkSlowQueries uzun süren sorguları kontrol eder ve alarm gönderir
+func (m *AlarmMonitor) checkSlowQueries() {
+	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
+		log.Printf("Slow query threshold değeri ayarlanmamış")
+		return
+	}
+
+	// pg_stat_activity'den uzun süren sorguları al
+	query := fmt.Sprintf(`
+		SELECT pid, usename, datname, query, EXTRACT(EPOCH FROM now() - query_start) * 1000 as duration_ms
+		FROM pg_stat_activity
+		WHERE state = 'active'
+		AND query NOT ILIKE '%%pg_stat_activity%%'
+		AND query_start < now() - interval '%d milliseconds'
+	`, m.thresholds.SlowQueryThresholdMs)
+
+	db, err := postgres.OpenDB()
+	if err != nil {
+		log.Printf("Veritabanı bağlantısı açılamadı: %v", err)
+		return
+	}
+	defer db.Close()
+
+	rows, err := db.Query(query)
+	if err != nil {
+		log.Printf("Uzun süren sorgular alınamadı: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var slowQueries []string
+	var maxDuration float64
+	for rows.Next() {
+		var (
+			pid        int
+			username   string
+			database   string
+			queryText  string
+			durationMs float64
+		)
+		if err := rows.Scan(&pid, &username, &database, &queryText, &durationMs); err != nil {
+			log.Printf("Sorgu bilgileri okunamadı: %v", err)
+			continue
+		}
+
+		if durationMs > maxDuration {
+			maxDuration = durationMs
+		}
+
+		// Sorgu metnini kısalt
+		if len(queryText) > 200 {
+			queryText = queryText[:197] + "..."
+		}
+
+		slowQueries = append(slowQueries, fmt.Sprintf("PID=%d, User=%s, DB=%s, Duration=%.2fms, Query=%s",
+			pid, username, database, durationMs, queryText))
+	}
+
+	if len(slowQueries) > 0 {
+		alarmKey := "postgresql_slow_queries"
+
+		// Rate limiting kontrolü
+		m.alarmCacheLock.RLock()
+		prevAlarm, exists := m.alarmCache[alarmKey]
+		m.alarmCacheLock.RUnlock()
+
+		if exists {
+			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+			if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
+				log.Printf("Slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
+				return
+			}
+		}
+
+		message := fmt.Sprintf("Found %d slow queries exceeding %dms threshold. Max duration: %.2fms\n%s",
+			len(slowQueries), m.thresholds.SlowQueryThresholdMs, maxDuration,
+			strings.Join(slowQueries[:min(3, len(slowQueries))], "\n"))
+
+		alarmEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "triggered",
+			MetricName:  "postgresql_slow_queries",
+			MetricValue: fmt.Sprintf("%.2f", maxDuration),
+			Message:     message,
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "warning",
+		}
+
+		if err := m.reportAlarm(alarmEvent); err != nil {
+			log.Printf("Slow query alarmı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = alarmEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("Slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
+		}
+	}
+}
+
+// min iki sayıdan küçük olanı döndürür
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // reportAlarm bir alarm olayını API'ye bildirir
