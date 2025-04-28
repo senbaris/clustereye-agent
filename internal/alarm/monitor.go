@@ -5,6 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +18,11 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"github.com/senbaris/clustereye-agent/internal/config"
+)
+
+const (
+	// Agent versiyonu
+	AgentVersion = "1.0.22" // Bu değeri CI/CD sürecinde otomatik güncelleyebilirsiniz
 )
 
 // AlarmMonitor alarm durumlarını izleyen ve raporlayan birim
@@ -49,32 +58,57 @@ func NewAlarmMonitor(client pb.AgentServiceClient, agentID string, cfg *config.A
 
 // updateThresholds API'den threshold değerlerini alır
 func (m *AlarmMonitor) updateThresholds() {
-	req := &pb.GetThresholdSettingsRequest{
-		AgentId: m.agentID,
-	}
+	maxRetries := 5
+	backoff := time.Second * 2 // başlangıç bekleme süresi
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req := &pb.GetThresholdSettingsRequest{
+			AgentId: m.agentID,
+		}
 
-	resp, err := m.client.GetThresholdSettings(ctx, req)
-	if err != nil {
-		log.Printf("Threshold değerleri alınamadı: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := m.client.GetThresholdSettings(ctx, req)
+		cancel()
+
+		if err != nil {
+			// Bağlantı hatalarını kontrol et
+			isConnectionError := strings.Contains(err.Error(), "connection") ||
+				strings.Contains(err.Error(), "transport") ||
+				strings.Contains(err.Error(), "Canceled") ||
+				strings.Contains(err.Error(), "Deadline") ||
+				strings.Contains(err.Error(), "context")
+
+			if attempt < maxRetries-1 && isConnectionError {
+				waitTime := backoff * time.Duration(attempt+1) // exponential backoff
+				log.Printf("Threshold değerleri alınamadı (deneme %d/%d): %v. %v sonra tekrar denenecek...",
+					attempt+1, maxRetries, err, waitTime)
+				time.Sleep(waitTime)
+				continue
+			}
+
+			log.Printf("Threshold değerleri alınamadı (son deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+			return
+		}
+
+		m.thresholds = resp.Settings
+		log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d",
+			m.thresholds.CpuThreshold,
+			m.thresholds.MemoryThreshold,
+			m.thresholds.DiskThreshold,
+			m.thresholds.SlowQueryThresholdMs,
+			m.thresholds.ConnectionThreshold,
+			m.thresholds.ReplicationLagThreshold)
 		return
 	}
 
-	m.thresholds = resp.Settings
-	log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d",
-		m.thresholds.CpuThreshold,
-		m.thresholds.MemoryThreshold,
-		m.thresholds.DiskThreshold,
-		m.thresholds.SlowQueryThresholdMs,
-		m.thresholds.ConnectionThreshold,
-		m.thresholds.ReplicationLagThreshold)
+	log.Printf("Threshold değerleri %d deneme sonrasında alınamadı", maxRetries)
 }
 
 // Start alarm kontrol işlemini başlatır
 func (m *AlarmMonitor) Start() {
 	go m.monitorLoop()
+	go m.reportAgentVersion() // Version raporlama işlemini başlat
 	log.Println("Alarm monitörü başlatıldı")
 }
 
@@ -122,6 +156,12 @@ func (m *AlarmMonitor) checkAlarms() {
 		m.checkPostgreSQLServiceStatus()
 		// Uzun süren sorguları kontrol et
 		m.checkSlowQueries()
+		// CPU kullanımını kontrol et
+		m.checkCPUUsage()
+		// Memory kullanımını kontrol et
+		m.checkMemoryUsage()
+		// Disk kullanımını kontrol et
+		m.checkDiskUsage()
 	} else {
 		log.Printf("Bilinmeyen platform: %s", m.platform)
 	}
@@ -546,6 +586,307 @@ func (m *AlarmMonitor) checkSlowQueries() {
 	}
 }
 
+// checkCPUUsage CPU kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
+func (m *AlarmMonitor) checkCPUUsage() {
+	if m.thresholds == nil || m.thresholds.CpuThreshold == 0 {
+		log.Printf("CPU threshold değeri ayarlanmamış")
+		return
+	}
+
+	cpuUsage, err := getCPUUsage()
+	if err != nil {
+		log.Printf("CPU kullanımı alınamadı: %v", err)
+		return
+	}
+
+	alarmKey := "system_cpu_usage"
+
+	// Rate limiting kontrolü
+	m.alarmCacheLock.RLock()
+	prevAlarm, exists := m.alarmCache[alarmKey]
+	m.alarmCacheLock.RUnlock()
+
+	// Önceki alarm varsa ve son 5 dakika içinde gönderilmişse, tekrar gönderme
+	if exists {
+		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+		if err == nil {
+			timeSinceLastAlarm := time.Since(prevTimestamp)
+			if timeSinceLastAlarm < 5*time.Minute {
+				// Eğer önceki alarm "triggered" ve CPU hala yüksekse veya
+				// önceki alarm "resolved" ve CPU hala normalse, yeni alarm gönderme
+				prevTriggered := prevAlarm.Status == "triggered"
+				currentHigh := cpuUsage >= m.thresholds.CpuThreshold
+				if prevTriggered == currentHigh {
+					return
+				}
+			}
+		}
+	}
+
+	// CPU threshold'u aşıldı mı kontrol et
+	if cpuUsage >= m.thresholds.CpuThreshold {
+		// Eğer önceki alarm varsa ve zaten triggered durumundaysa, tekrar gönderme
+		if exists && prevAlarm.Status == "triggered" {
+			return
+		}
+
+		// Yeni alarm oluştur
+		alarmEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "triggered",
+			MetricName:  "system_cpu_usage",
+			MetricValue: fmt.Sprintf("%.2f", cpuUsage),
+			Message:     fmt.Sprintf("High CPU usage detected: %.2f%% (threshold: %.2f%%)", cpuUsage, m.thresholds.CpuThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "warning",
+		}
+
+		if err := m.reportAlarm(alarmEvent); err != nil {
+			log.Printf("CPU usage alarmı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = alarmEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("CPU usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+		}
+	} else if exists && prevAlarm.Status == "triggered" {
+		// CPU kullanımı normale döndü, resolved mesajı gönder
+		resolvedEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "resolved",
+			MetricName:  "system_cpu_usage",
+			MetricValue: fmt.Sprintf("%.2f", cpuUsage),
+			Message:     fmt.Sprintf("CPU usage returned to normal: %.2f%% (threshold: %.2f%%)", cpuUsage, m.thresholds.CpuThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "info",
+		}
+
+		if err := m.reportAlarm(resolvedEvent); err != nil {
+			log.Printf("CPU usage resolved mesajı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = resolvedEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("CPU usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+		}
+	}
+}
+
+// checkMemoryUsage memory kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
+func (m *AlarmMonitor) checkMemoryUsage() {
+	if m.thresholds == nil || m.thresholds.MemoryThreshold == 0 {
+		log.Printf("Memory threshold değeri ayarlanmamış")
+		return
+	}
+
+	// Memory kullanımını al
+	cmd := exec.Command("sh", "-c", "free | grep Mem | awk '{print ($3/$2) * 100}'")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Memory kullanımı alınamadı: %v", err)
+		return
+	}
+
+	memStr := strings.TrimSpace(string(output))
+	memUsage, err := strconv.ParseFloat(memStr, 64)
+	if err != nil {
+		log.Printf("Memory kullanımı parse edilemedi: %v", err)
+		return
+	}
+
+	alarmKey := "system_memory_usage"
+
+	// Rate limiting kontrolü
+	m.alarmCacheLock.RLock()
+	prevAlarm, exists := m.alarmCache[alarmKey]
+	m.alarmCacheLock.RUnlock()
+
+	// Önceki alarm varsa ve son 5 dakika içinde gönderilmişse, tekrar gönderme
+	if exists {
+		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+		if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
+			prevTriggered := prevAlarm.Status == "triggered"
+			currentHigh := memUsage >= m.thresholds.MemoryThreshold
+			if prevTriggered == currentHigh {
+				return
+			}
+		}
+	}
+
+	if memUsage >= m.thresholds.MemoryThreshold {
+		// Yeni alarm oluştur
+		alarmEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "triggered",
+			MetricName:  "system_memory_usage",
+			MetricValue: fmt.Sprintf("%.2f", memUsage),
+			Message:     fmt.Sprintf("High memory usage detected: %.2f%% (threshold: %.2f%%)", memUsage, m.thresholds.MemoryThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "warning",
+		}
+
+		if err := m.reportAlarm(alarmEvent); err != nil {
+			log.Printf("Memory usage alarmı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = alarmEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("Memory usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+		}
+	} else if exists && prevAlarm.Status == "triggered" {
+		// Memory kullanımı normale döndü
+		resolvedEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "resolved",
+			MetricName:  "system_memory_usage",
+			MetricValue: fmt.Sprintf("%.2f", memUsage),
+			Message:     fmt.Sprintf("Memory usage returned to normal: %.2f%% (threshold: %.2f%%)", memUsage, m.thresholds.MemoryThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "info",
+		}
+
+		if err := m.reportAlarm(resolvedEvent); err != nil {
+			log.Printf("Memory usage resolved mesajı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = resolvedEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("Memory usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+		}
+	}
+}
+
+// checkDiskUsage disk kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
+func (m *AlarmMonitor) checkDiskUsage() {
+	if m.thresholds == nil || m.thresholds.DiskThreshold == 0 {
+		log.Printf("Disk threshold değeri ayarlanmamış")
+		return
+	}
+
+	// PostgreSQL data dizinini bul
+	dataDir := "/var/lib/postgresql" // varsayılan dizin
+	configFile, err := postgres.FindPostgresConfigFile()
+	if err == nil {
+		// Konfigürasyon dosyasından data dizinini al
+		content, err := os.ReadFile(configFile)
+		if err == nil {
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "data_directory") {
+					parts := strings.Split(line, "'")
+					if len(parts) >= 2 {
+						dataDir = strings.TrimSpace(parts[1])
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Disk kullanımını kontrol et
+	cmd := exec.Command("df", "-h", dataDir)
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Disk kullanımı alınamadı: %v", err)
+		return
+	}
+
+	// df çıktısını parse et (son satırı al)
+	lines := strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		log.Printf("Disk kullanım bilgisi parse edilemedi")
+		return
+	}
+
+	// Son satırı al ve kullanım yüzdesini çıkar
+	fields := strings.Fields(lines[1])
+	if len(fields) < 5 {
+		log.Printf("Disk kullanım alanları parse edilemedi")
+		return
+	}
+
+	// Yüzde işaretini kaldır
+	usageStr := strings.TrimSuffix(fields[4], "%")
+	diskUsage, err := strconv.ParseFloat(usageStr, 64)
+	if err != nil {
+		log.Printf("Disk kullanımı parse edilemedi: %v", err)
+		return
+	}
+
+	alarmKey := "system_disk_usage"
+
+	// Rate limiting kontrolü
+	m.alarmCacheLock.RLock()
+	prevAlarm, exists := m.alarmCache[alarmKey]
+	m.alarmCacheLock.RUnlock()
+
+	// Önceki alarm varsa ve son 5 dakika içinde gönderilmişse, tekrar gönderme
+	if exists {
+		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+		if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
+			prevTriggered := prevAlarm.Status == "triggered"
+			currentHigh := diskUsage >= m.thresholds.DiskThreshold
+			if prevTriggered == currentHigh {
+				return
+			}
+		}
+	}
+
+	if diskUsage >= m.thresholds.DiskThreshold {
+		// Yeni alarm oluştur
+		alarmEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "triggered",
+			MetricName:  "system_disk_usage",
+			MetricValue: fmt.Sprintf("%.2f", diskUsage),
+			Message:     fmt.Sprintf("High disk usage detected on %s: %.2f%% (threshold: %.2f%%)", dataDir, diskUsage, m.thresholds.DiskThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "warning",
+		}
+
+		if err := m.reportAlarm(alarmEvent); err != nil {
+			log.Printf("Disk usage alarmı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = alarmEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("Disk usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+		}
+	} else if exists && prevAlarm.Status == "triggered" {
+		// Disk kullanımı normale döndü
+		resolvedEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "resolved",
+			MetricName:  "system_disk_usage",
+			MetricValue: fmt.Sprintf("%.2f", diskUsage),
+			Message:     fmt.Sprintf("Disk usage returned to normal on %s: %.2f%% (threshold: %.2f%%)", dataDir, diskUsage, m.thresholds.DiskThreshold),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "info",
+		}
+
+		if err := m.reportAlarm(resolvedEvent); err != nil {
+			log.Printf("Disk usage resolved mesajı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = resolvedEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("Disk usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+		}
+	}
+}
+
 // min iki sayıdan küçük olanı döndürür
 func min(a, b int) int {
 	if a < b {
@@ -606,4 +947,135 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 func (m *AlarmMonitor) UpdateClient(client pb.AgentServiceClient) {
 	m.client = client
 	log.Println("AlarmMonitor client'ı güncellendi")
+}
+
+// getCPUUsage sistem CPU kullanımını yüzde olarak döndürür
+func getCPUUsage() (float64, error) {
+	// Linux için /proc/stat kullan
+	if _, err := os.Stat("/proc/stat"); err == nil {
+		// Linux sistemi
+		cmd := exec.Command("sh", "-c", "top -bn1 | grep '%Cpu' | awk '{print $2}'")
+		output, err := cmd.Output()
+		if err != nil {
+			return 0, fmt.Errorf("CPU kullanımı alınamadı: %v", err)
+		}
+		cpuStr := strings.TrimSpace(string(output))
+		cpuUsage, err := strconv.ParseFloat(cpuStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("CPU kullanımı parse edilemedi: %v", err)
+		}
+		return cpuUsage, nil
+	}
+
+	// macOS için (fallback)
+	cmd := exec.Command("sh", "-c", "top -l 1 | grep -E '^CPU' | awk '{print $3}' | tr -d '%'")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("CPU kullanımı alınamadı: %v", err)
+	}
+	cpuStr := strings.TrimSpace(string(output))
+	cpuUsage, err := strconv.ParseFloat(cpuStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("CPU kullanımı parse edilemedi: %v", err)
+	}
+	return cpuUsage, nil
+}
+
+// reportAgentVersion agent'ın versiyon bilgilerini periyodik olarak raporlar
+func (m *AlarmMonitor) reportAgentVersion() {
+	// Her 1 saatte bir versiyon bilgisini gönder
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	// İlk çalıştırmada hemen gönder
+	m.sendVersionInfo()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.sendVersionInfo()
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+// sendVersionInfo agent'ın versiyon ve platform bilgilerini server'a gönderir
+func (m *AlarmMonitor) sendVersionInfo() {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
+	versionInfo := &pb.AgentVersionInfo{
+		Version:      AgentVersion,
+		Platform:     runtime.GOOS,
+		Architecture: runtime.GOARCH,
+		Hostname:     hostname,
+		OsVersion:    getOSVersion(),
+		GoVersion:    runtime.Version(),
+	}
+
+	maxRetries := 3
+	backoff := time.Second * 2
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		req := &pb.ReportVersionRequest{
+			AgentId:     m.agentID,
+			VersionInfo: versionInfo,
+		}
+
+		resp, err := m.client.ReportVersion(ctx, req)
+		cancel()
+
+		if err != nil {
+			isConnectionError := strings.Contains(err.Error(), "connection") ||
+				strings.Contains(err.Error(), "transport") ||
+				strings.Contains(err.Error(), "Canceled") ||
+				strings.Contains(err.Error(), "Deadline") ||
+				strings.Contains(err.Error(), "context")
+
+			if attempt < maxRetries-1 && isConnectionError {
+				waitTime := backoff * time.Duration(attempt+1)
+				log.Printf("Versiyon bilgisi gönderilemedi (deneme %d/%d): %v. %v sonra tekrar denenecek...",
+					attempt+1, maxRetries, err, waitTime)
+				time.Sleep(waitTime)
+				continue
+			}
+
+			log.Printf("Versiyon bilgisi gönderilemedi (son deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+			return
+		}
+
+		log.Printf("Versiyon bilgisi başarıyla gönderildi: %s", resp.Status)
+		return
+	}
+}
+
+// getOSVersion işletim sistemi versiyonunu döndürür
+func getOSVersion() string {
+	if runtime.GOOS == "linux" {
+		// Linux için /etc/os-release dosyasını oku
+		content, err := os.ReadFile("/etc/os-release")
+		if err == nil {
+			lines := strings.Split(string(content), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "VERSION_ID=") {
+					return strings.Trim(strings.TrimPrefix(line, "VERSION_ID="), "\"")
+				}
+			}
+		}
+		return "unknown"
+	}
+
+	// Diğer sistemler için uname kullan
+	cmd := exec.Command("uname", "-r")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
 }
