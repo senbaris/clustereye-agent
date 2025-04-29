@@ -287,7 +287,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			Status:      "triggered",
 			MetricName:  "mongodb_service_status",
 			MetricValue: currentStatus.Status,
-			Message:     fmt.Sprintf("MongoDB service is having issues: %s (%s)", currentStatus.Status, currentStatus.ErrorMessage),
+			Message:     fmt.Sprintf("MongoDB service is having issues: %s ", currentStatus.Status),
 			Timestamp:   time.Now().Format(time.RFC3339),
 			Severity:    "critical",
 		}
