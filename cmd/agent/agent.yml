@@ -1,7 +1,7 @@
 key: xxxx-xxxx-xxxx-xxxx
 name: Agent
 grpc:
-  server_address: 143.198.61.173:50051
+  server_address: 192.168.64.2:50051
 postgresql:
   host: 192.168.64.2
   user: postgres
