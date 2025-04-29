@@ -265,25 +265,20 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 	currentStatus := mongoCollector.GetMongoServiceStatus()
 	alarmKey := "mongodb_service_status"
 
-	// Rate limiting için zaman kontrolü
+	// Önceki alarmı kontrol et
 	m.alarmCacheLock.RLock()
 	prevAlarm, exists := m.alarmCache[alarmKey]
 	m.alarmCacheLock.RUnlock()
 
-	// Önceki alarm varsa ve son 60 saniye içinde gönderilmişse, tekrar gönderme
-	if exists {
-		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
-		if err == nil {
-			timeSinceLastAlarm := time.Since(prevTimestamp)
-			if timeSinceLastAlarm < 60*time.Second {
-				log.Printf("MongoDB servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
-				return
-			}
-		}
-	}
-
 	// Servis durumu alarmı
 	if currentStatus.Status != "RUNNING" {
+		// Eğer önceki alarm varsa ve hala aynı durum devam ediyorsa, yeni alarm gönderme
+		if exists && prevAlarm.Status == "triggered" {
+			log.Printf("MongoDB servis durumu hala %s. Önceki alarm aktif (ID: %s)",
+				currentStatus.Status, prevAlarm.Id)
+			return
+		}
+
 		// Yeni alarm oluştur
 		alarmEvent := &pb.AlarmEvent{
 			Id:          uuid.New().String(),
@@ -330,7 +325,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 		}
 	}
 
-	// Failover durumu kontrolü
+	// Failover durumu kontrolü için benzer mantığı uygulayalım
 	failoverKey := "mongodb_failover"
 	m.alarmCacheLock.RLock()
 	prevFailoverAlarm, failoverExists := m.alarmCache[failoverKey]
@@ -354,20 +349,14 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			IsReplSet:    true,
 		}
 
-		// Rate limiting kontrolü
+		// Eğer önceki alarm varsa ve durum değişmemişse, yeni alarm gönderme
 		if prevFailoverAlarm.Status == "triggered" {
-			prevTimestamp, err := time.Parse(time.RFC3339, prevFailoverAlarm.Timestamp)
-			if err == nil {
-				timeSinceLastAlarm := time.Since(prevTimestamp)
-				if timeSinceLastAlarm < 60*time.Second {
-					log.Printf("MongoDB failover durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
-					return
-				}
+			if (prevStatus.CurrentState == "PRIMARY" && currentStatus.CurrentState == "SECONDARY") ||
+				(prevStatus.CurrentState == "SECONDARY" && currentStatus.CurrentState == "PRIMARY") {
+				log.Printf("MongoDB failover durumu değişmedi. Önceki alarm aktif (ID: %s)", prevFailoverAlarm.Id)
+				return
 			}
 		}
-
-		log.Printf("DEBUG: Önceki MongoDB durumu: Status=%s, State=%s",
-			prevStatus.Status, prevStatus.CurrentState)
 	} else {
 		// İlk çalıştırma için özel durum - mevcut durumu kaydet
 		initialStateEvent := &pb.AlarmEvent{
@@ -387,25 +376,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 		m.alarmCache[failoverKey] = initialStateEvent
 		m.alarmCacheLock.Unlock()
 
-		log.Printf("DEBUG: MongoDB başlangıç durumu kaydedildi: %s", currentStatus.CurrentState)
-		return // İlk çalıştırmada daha fazla kontrol yapma
+		log.Printf("MongoDB başlangıç durumu kaydedildi: %s", currentStatus.CurrentState)
+		return
 	}
-
-	log.Printf("DEBUG: Mevcut MongoDB durumu: Status=%s, State=%s, IsReplSet=%v",
-		currentStatus.Status, currentStatus.CurrentState, currentStatus.IsReplSet)
 
 	// Failover kontrolü
 	if mongoCollector.CheckForFailover(prevStatus, currentStatus) {
-		// Eğer önceki alarm hala "triggered" durumunda ve aynı durum devam ediyorsa, yeni alarm gönderme
-		if failoverExists && prevFailoverAlarm.Status == "triggered" {
-			// Önceki ve şimdiki durumları karşılaştır
-			if (prevStatus.CurrentState == "PRIMARY" && currentStatus.CurrentState == "SECONDARY") ||
-				(prevStatus.CurrentState == "SECONDARY" && currentStatus.CurrentState == "PRIMARY") {
-				log.Printf("MongoDB failover durumu zaten raporlandı ve durum değişmedi. Alarm ID: %s", prevFailoverAlarm.Id)
-				return
-			}
-		}
-
 		// Failover alarmı oluştur
 		failoverEvent := &pb.AlarmEvent{
 			Id:          uuid.New().String(),
@@ -429,48 +405,29 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			m.alarmCacheLock.Unlock()
 			log.Printf("MongoDB failover alarmı gönderildi (ID: %s)", failoverEvent.Id)
 		}
-	} else {
+	} else if failoverExists && prevFailoverAlarm.Status == "triggered" {
 		// Durum normale döndüyse (örneğin: SECONDARY -> PRIMARY -> SECONDARY tamamlandı)
-		if failoverExists && prevFailoverAlarm.Status == "triggered" {
-			// Çözüldü mesajı oluştur
-			resolvedEvent := &pb.AlarmEvent{
-				Id:          uuid.New().String(),
-				AlarmId:     failoverKey,
-				AgentId:     m.agentID,
-				Status:      "resolved",
-				MetricName:  "mongodb_failover",
-				MetricValue: currentStatus.Status,
-				Message:     fmt.Sprintf("MongoDB failover has done. Current state: %s", currentStatus.CurrentState),
-				Timestamp:   time.Now().Format(time.RFC3339),
-				Severity:    "info",
-			}
+		// Çözüldü mesajı oluştur
+		resolvedEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     failoverKey,
+			AgentId:     m.agentID,
+			Status:      "resolved",
+			MetricName:  "mongodb_failover",
+			MetricValue: currentStatus.Status,
+			Message:     fmt.Sprintf("MongoDB failover has done. Current state: %s", currentStatus.CurrentState),
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "info",
+		}
 
-			// Çözüldü mesajını gönder
-			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("MongoDB failover çözüldü mesajı gönderilemedi: %v", err)
-			} else {
-				m.alarmCacheLock.Lock()
-				m.alarmCache[failoverKey] = resolvedEvent
-				m.alarmCacheLock.Unlock()
-				log.Printf("MongoDB failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
-			}
+		// Çözüldü mesajını gönder
+		if err := m.reportAlarm(resolvedEvent); err != nil {
+			log.Printf("MongoDB failover çözüldü mesajı gönderilemedi: %v", err)
 		} else {
-			// Normal durum güncellemesi
-			updateEvent := &pb.AlarmEvent{
-				Id:          uuid.New().String(),
-				AlarmId:     failoverKey,
-				AgentId:     m.agentID,
-				Status:      "update",
-				MetricName:  "mongodb_failover",
-				MetricValue: currentStatus.Status,
-				Message:     fmt.Sprintf("MongoDB current state: %s", currentStatus.CurrentState),
-				Timestamp:   time.Now().Format(time.RFC3339),
-				Severity:    "info",
-			}
-
 			m.alarmCacheLock.Lock()
-			m.alarmCache[failoverKey] = updateEvent
+			m.alarmCache[failoverKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
+			log.Printf("MongoDB failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
