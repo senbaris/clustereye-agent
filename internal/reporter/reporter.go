@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1788,4 +1789,156 @@ func (r *Reporter) ReadPostgresConfig(ctx context.Context, req *pb.PostgresConfi
 	}
 
 	return response, nil
+}
+
+// PromoteMongoToPrimary MongoDB node'unu primary'ye yükseltir
+func (r *Reporter) PromoteMongoToPrimary(ctx context.Context, req *pb.MongoPromotePrimaryRequest) (*pb.MongoPromotePrimaryResponse, error) {
+	log.Printf("MongoDB Primary Promotion işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, Port: %d, ReplicaSet: %s",
+		req.JobId, req.AgentId, req.NodeHostname, req.Port, req.ReplicaSet)
+
+	// MongoDB kolektörünü import et
+	mongoCollector, err := r.importMongoCollector()
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.MongoPromotePrimaryResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED, // FAILED - değer proto dosyasından alınmalı
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Primary promotion işlemini başlat
+	result, err := mongoCollector.PromoteToPrimary(req.NodeHostname, int(req.Port), req.ReplicaSet)
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB primary promotion başarısız: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.MongoPromotePrimaryResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED, // FAILED - değer proto dosyasından alınmalı
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	log.Printf("MongoDB Primary Promotion işlemi başarılı: %s", result)
+	return &pb.MongoPromotePrimaryResponse{
+		JobId:  req.JobId,
+		Status: pb.JobStatus_JOB_STATUS_COMPLETED, // COMPLETED - değer proto dosyasından alınmalı
+		Result: result,
+	}, nil
+}
+
+// PromotePostgresToMaster PostgreSQL standby node'unu master'a yükseltir
+func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.PostgresPromoteMasterRequest) (*pb.PostgresPromoteMasterResponse, error) {
+	log.Printf("PostgreSQL Master Promotion işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, DataDirectory: %s",
+		req.JobId, req.AgentId, req.NodeHostname, req.DataDirectory)
+
+	// Data Directory kontrolü
+	dataDir := req.DataDirectory
+	if dataDir == "" {
+		// Eğer data directory verilmemişse, konfigürasyon dosyasından bulmaya çalış
+		configFile, err := postgres.FindPostgresConfigFile()
+		if err == nil {
+			content, err := os.ReadFile(configFile)
+			if err == nil {
+				lines := strings.Split(string(content), "\n")
+				for _, line := range lines {
+					if strings.Contains(line, "data_directory") {
+						parts := strings.Split(line, "'")
+						if len(parts) >= 2 {
+							dataDir = strings.TrimSpace(parts[1])
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// Yine bulunamadıysa varsayılan değeri kullan
+		if dataDir == "" {
+			dataDir = "/var/lib/postgresql/data"
+			log.Printf("Data directory bulunamadı, varsayılan değer kullanılıyor: %s", dataDir)
+		}
+	}
+
+	// Promotion işlemi için trigger dosyası yolunu belirle
+	triggerFilePath := filepath.Join(dataDir, "promote.trigger")
+	standbySignalPath := filepath.Join(dataDir, "standby.signal")
+	recoverySignalPath := filepath.Join(dataDir, "recovery.signal")
+
+	// Standby sinyali dosyasının varlığını kontrol et
+	isStandby := false
+	if _, err := os.Stat(standbySignalPath); err == nil {
+		isStandby = true
+	} else if _, err := os.Stat(recoverySignalPath); err == nil {
+		isStandby = true
+	}
+
+	if !isStandby {
+		errMsg := "Bu node zaten master/primary durumunda, promotion gerekmez"
+		log.Printf("UYARI: %s", errMsg)
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       1, // FAILED - değer proto dosyasından alınmalı
+			ErrorMessage: errMsg,
+			Result:       "Node zaten primary/master durumunda",
+		}, nil
+	}
+
+	// Trigger dosyasını oluştur
+	log.Printf("Promotion trigger dosyası oluşturuluyor: %s", triggerFilePath)
+	file, err := os.Create(triggerFilePath)
+	if err != nil {
+		errMsg := fmt.Sprintf("Promotion trigger dosyası oluşturulamadı: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       1, // FAILED - değer proto dosyasından alınmalı
+			ErrorMessage: errMsg,
+		}, nil
+	}
+	file.Close()
+
+	// PostgreSQL'in dosyayı farketmesi için biraz bekle
+	log.Println("PostgreSQL'in promotion trigger dosyasını farketmesi bekleniyor...")
+	time.Sleep(5 * time.Second)
+
+	// Promocyonun gerçekleşip gerçekleşmediğini kontrol et
+	checkCount := 0
+	maxChecks := 12 // 60 saniye toplam (5s * 12)
+	promoted := false
+
+	for checkCount < maxChecks {
+		// Standby sinyal dosyası hala var mı kontrol et
+		_, standbyExists := os.Stat(standbySignalPath)
+		_, recoveryExists := os.Stat(recoverySignalPath)
+
+		if standbyExists != nil && recoveryExists != nil {
+			// Standby sinyalleri kaldırılmış, promotion başarılı
+			promoted = true
+			break
+		}
+
+		log.Printf("Promotion hala tamamlanmadı, 5 saniye daha bekleniyor... (%d/%d)", checkCount+1, maxChecks)
+		time.Sleep(5 * time.Second)
+		checkCount++
+	}
+
+	if !promoted {
+		errMsg := "PostgreSQL promotion zaman aşımına uğradı"
+		log.Printf("HATA: %s", errMsg)
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED, // FAILED - değer proto dosyasından alındı
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Promotion başarılı
+	log.Printf("PostgreSQL node başarıyla master'a yükseltildi")
+	return &pb.PostgresPromoteMasterResponse{
+		JobId:  req.JobId,
+		Status: pb.JobStatus_JOB_STATUS_COMPLETED, // COMPLETED - değer proto dosyasından alındı
+		Result: "PostgreSQL node başarıyla master'a yükseltildi",
+	}, nil
 }

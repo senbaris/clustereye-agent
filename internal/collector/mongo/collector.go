@@ -1434,7 +1434,7 @@ func (c *MongoCollector) GetMongoServiceStatus() *MongoServiceStatus {
 	cmd := exec.Command("sh", "-c", "pgrep -x mongod")
 	out, err := cmd.Output()
 	if err != nil || len(out) == 0 {
-		status.ErrorMessage = "MongoDB process bulunamadı"
+		status.ErrorMessage = "MongoDB process could not be found!"
 		return status
 	}
 
@@ -1545,4 +1545,79 @@ func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServic
 	}
 
 	return isFailover
+}
+
+// PromoteToPrimary MongoDB standby node'unu primary'ye yükseltir
+func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet string) (string, error) {
+	log.Printf("MongoDB node promotion başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
+		hostname, port, replicaSet)
+
+	// MongoDB bağlantı URI'sini oluştur
+	connectionString := fmt.Sprintf("mongodb://%s:%s@%s:%d/admin",
+		c.cfg.Mongo.User, c.cfg.Mongo.Pass, hostname, port)
+
+	// Auth bilgileri boşsa, kimlik doğrulama olmadan bağlan
+	if !c.cfg.Mongo.Auth {
+		connectionString = fmt.Sprintf("mongodb://%s:%d/admin", hostname, port)
+	}
+
+	// MongoDB shell komutu oluştur
+	command := fmt.Sprintf(`mongosh "%s" --eval "rs.stepDown(60, 10)"`, connectionString)
+	log.Printf("MongoDB RS stepDown komutu çalıştırılıyor")
+
+	// Komutu çalıştır
+	cmd := exec.Command("bash", "-c", command)
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		log.Printf("MongoDB stepDown komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
+		// Bazı hatalar normal olabilir, özellikle current node primary değilse
+		if strings.Contains(outputStr, "not primary") {
+			// Bu düğüm zaten primary değilse, force election deneyebiliriz
+			log.Printf("Node zaten primary değil, force election deneniyor...")
+
+			// Replica set durumunu kontrol et
+			statusCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
+			_, statusErr := exec.Command("bash", "-c", statusCmd).CombinedOutput()
+			if statusErr != nil {
+				log.Printf("Replica set durumu kontrol edilirken hata: %v", statusErr)
+				return "", fmt.Errorf("replica set durumu kontrol edilirken hata: %v", statusErr)
+			}
+
+			// Force election dene
+			forceCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.reconfig(rs.config(), {force: true})"`, connectionString)
+			forceOutput, forceErr := exec.Command("bash", "-c", forceCmd).CombinedOutput()
+			if forceErr != nil {
+				log.Printf("Force election deneme başarısız: %v\nÇıktı: %s", forceErr, string(forceOutput))
+				return "", fmt.Errorf("primary promotion başarısız: %v", forceErr)
+			}
+
+			return fmt.Sprintf("Force election başarılı: %s", strings.TrimSpace(string(forceOutput))), nil
+		}
+
+		return "", fmt.Errorf("primary promotion başarısız: %v", err)
+	}
+
+	log.Printf("MongoDB stepDown komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
+
+	// Check status after promotion (10 second delay)
+	log.Printf("Node'un yeni durumunu kontrol etmek için bekleniyor...")
+	time.Sleep(10 * time.Second)
+
+	// Check node status after promotion
+	checkCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
+	cmd = exec.Command("bash", "-c", checkCmd)
+	checkOutput, checkErr := cmd.CombinedOutput()
+
+	if checkErr != nil {
+		log.Printf("Promotion sonrası durum kontrolü başarısız: %v", checkErr)
+		return fmt.Sprintf("MongoDB node promotion tamamlandı, ancak durum kontrolü başarısız: %s",
+			strings.TrimSpace(outputStr)), nil
+	}
+
+	checkOutputStr := string(checkOutput)
+	return fmt.Sprintf("MongoDB node promotion başarılı. Çıktı: %s\nYeni Durum: %s",
+		strings.TrimSpace(outputStr),
+		strings.TrimSpace(checkOutputStr)), nil
 }
