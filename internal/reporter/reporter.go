@@ -748,6 +748,60 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
+				// MongoDB db.hello() komutu için özel işleme
+				if r.platform == "mongo" && (strings.HasPrefix(query.Command, "db.hello()") || strings.HasPrefix(query.Command, "db.hello(") || strings.HasPrefix(query.Command, "rs.status()")) {
+					log.Printf("MongoDB node durumu sorgusu tespit edildi: %s", query.Command)
+
+					// MongoDB kolektörünü import et
+					mongoCollector, err := r.importMongoCollector()
+					if err != nil {
+						log.Printf("MongoDB kolektörü import edilemedi: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// MongoDB durumunu al
+					nodeStatus := mongoCollector.GetNodeStatus()
+					replicaSet := mongoCollector.GetReplicaSetName()
+					mongoStatus := mongoCollector.GetMongoStatus()
+					mongoVersion := mongoCollector.GetMongoVersion()
+
+					// Tam MongoDB servis durumunu al
+					serviceStatus := mongoCollector.GetMongoServiceStatus()
+					stateDescription := "Unknown"
+					if serviceStatus != nil {
+						stateDescription = serviceStatus.CurrentState
+						if stateDescription == "" {
+							stateDescription = "STANDALONE"
+						}
+					}
+
+					// Hostname bilgisini al
+					hostname, _ := os.Hostname()
+
+					// Yanıt oluştur
+					responseData := map[string]interface{}{
+						"status":        "success",
+						"node_status":   nodeStatus,
+						"replica_set":   replicaSet,
+						"mongo_status":  mongoStatus,
+						"mongo_version": mongoVersion,
+						"hostname":      hostname,
+						"state":         stateDescription,
+						"message":       fmt.Sprintf("MongoDB node durumu: %s, replica set: %s", stateDescription, replicaSet),
+					}
+
+					sendQueryResult(r.stream, query.QueryId, responseData)
+					isProcessingQuery = false
+					continue
+				}
+
 				// Ping sorgusunu özel olarak işle
 				if strings.ToLower(query.Command) == "ping" {
 					log.Printf("Ping komutu algılandı, özel yanıt gönderiliyor")
