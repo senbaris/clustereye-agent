@@ -1828,6 +1828,50 @@ func (r *Reporter) PromoteMongoToPrimary(ctx context.Context, req *pb.MongoPromo
 	}, nil
 }
 
+// FreezeMongoSecondary MongoDB secondary node'larında rs.freeze() komutunu çalıştırır
+func (r *Reporter) FreezeMongoSecondary(ctx context.Context, req *pb.MongoFreezeSecondaryRequest) (*pb.MongoFreezeSecondaryResponse, error) {
+	log.Printf("MongoDB Freeze Secondary işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, Port: %d, ReplicaSet: %s, Seconds: %d",
+		req.JobId, req.AgentId, req.NodeHostname, req.Port, req.ReplicaSet, req.Seconds)
+
+	// Seconds değeri 0 ise varsayılan olarak 60 kullan
+	seconds := int(req.Seconds)
+	if seconds <= 0 {
+		seconds = 60
+		log.Printf("Seconds değeri 0 veya negatif, varsayılan değer kullanılıyor: %d", seconds)
+	}
+
+	// MongoDB kolektörünü import et
+	mongoCollector, err := r.importMongoCollector()
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.MongoFreezeSecondaryResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Freeze işlemini başlat
+	result, err := mongoCollector.FreezeMongoSecondary(req.NodeHostname, int(req.Port), req.ReplicaSet, seconds)
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB freeze secondary başarısız: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.MongoFreezeSecondaryResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	log.Printf("MongoDB Freeze Secondary işlemi başarılı: %s", result)
+	return &pb.MongoFreezeSecondaryResponse{
+		JobId:  req.JobId,
+		Status: pb.JobStatus_JOB_STATUS_COMPLETED,
+		Result: result,
+	}, nil
+}
+
 // PromotePostgresToMaster PostgreSQL standby node'unu master'a yükseltir
 func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.PostgresPromoteMasterRequest) (*pb.PostgresPromoteMasterResponse, error) {
 	log.Printf("PostgreSQL Master Promotion işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, DataDirectory: %s",

@@ -1549,7 +1549,7 @@ func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServic
 
 // PromoteToPrimary MongoDB standby node'unu primary'ye yükseltir
 func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet string) (string, error) {
-	log.Printf("MongoDB node promotion başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
+	log.Printf("MongoDB node stepDown başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
 		hostname, port, replicaSet)
 
 	// MongoDB bağlantı URI'sini oluştur
@@ -1572,52 +1572,80 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 
 	if err != nil {
 		log.Printf("MongoDB stepDown komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
-		// Bazı hatalar normal olabilir, özellikle current node primary değilse
+		// Node primary değilse hata döner
 		if strings.Contains(outputStr, "not primary") {
-			// Bu düğüm zaten primary değilse, force election deneyebiliriz
-			log.Printf("Node zaten primary değil, force election deneniyor...")
-
-			// Replica set durumunu kontrol et
-			statusCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
-			_, statusErr := exec.Command("bash", "-c", statusCmd).CombinedOutput()
-			if statusErr != nil {
-				log.Printf("Replica set durumu kontrol edilirken hata: %v", statusErr)
-				return "", fmt.Errorf("replica set durumu kontrol edilirken hata: %v", statusErr)
-			}
-
-			// Force election dene
-			forceCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.reconfig(rs.config(), {force: true})"`, connectionString)
-			forceOutput, forceErr := exec.Command("bash", "-c", forceCmd).CombinedOutput()
-			if forceErr != nil {
-				log.Printf("Force election deneme başarısız: %v\nÇıktı: %s", forceErr, string(forceOutput))
-				return "", fmt.Errorf("primary promotion başarısız: %v", forceErr)
-			}
-
-			return fmt.Sprintf("Force election başarılı: %s", strings.TrimSpace(string(forceOutput))), nil
+			return "", fmt.Errorf("bu node primary değil, stepDown işlemi yapılamaz: %v", err)
 		}
-
-		return "", fmt.Errorf("primary promotion başarısız: %v", err)
+		return "", fmt.Errorf("stepDown başarısız: %v", err)
 	}
 
 	log.Printf("MongoDB stepDown komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
 
-	// Check status after promotion (10 second delay)
+	// Check status after stepDown (10 second delay)
 	log.Printf("Node'un yeni durumunu kontrol etmek için bekleniyor...")
 	time.Sleep(10 * time.Second)
 
-	// Check node status after promotion
+	// Check node status after stepDown
 	checkCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
 	cmd = exec.Command("bash", "-c", checkCmd)
 	checkOutput, checkErr := cmd.CombinedOutput()
 
 	if checkErr != nil {
-		log.Printf("Promotion sonrası durum kontrolü başarısız: %v", checkErr)
-		return fmt.Sprintf("MongoDB node promotion tamamlandı, ancak durum kontrolü başarısız: %s",
+		log.Printf("StepDown sonrası durum kontrolü başarısız: %v", checkErr)
+		return fmt.Sprintf("MongoDB node stepDown tamamlandı, ancak durum kontrolü başarısız: %s",
 			strings.TrimSpace(outputStr)), nil
 	}
 
 	checkOutputStr := string(checkOutput)
-	return fmt.Sprintf("MongoDB node promotion başarılı. Çıktı: %s\nYeni Durum: %s",
+	return fmt.Sprintf("MongoDB node stepDown başarılı. Çıktı: %s\nYeni Durum: %s",
+		strings.TrimSpace(outputStr),
+		strings.TrimSpace(checkOutputStr)), nil
+}
+
+// FreezeMongoSecondary MongoDB secondary node'larında rs.freeze() komutunu çalıştırır
+func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replicaSet string, seconds int) (string, error) {
+	log.Printf("MongoDB node freeze başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s, Seconds: %d",
+		hostname, port, replicaSet, seconds)
+
+	// MongoDB bağlantı URI'sini oluştur
+	connectionString := fmt.Sprintf("mongodb://%s:%s@%s:%d/admin",
+		c.cfg.Mongo.User, c.cfg.Mongo.Pass, hostname, port)
+
+	// Auth bilgileri boşsa, kimlik doğrulama olmadan bağlan
+	if !c.cfg.Mongo.Auth {
+		connectionString = fmt.Sprintf("mongodb://%s:%d/admin", hostname, port)
+	}
+
+	// MongoDB shell komutu oluştur
+	command := fmt.Sprintf(`mongosh "%s" --eval "rs.freeze(%d)"`, connectionString, seconds)
+	log.Printf("MongoDB RS freeze komutu çalıştırılıyor: %d saniye", seconds)
+
+	// Komutu çalıştır
+	cmd := exec.Command("bash", "-c", command)
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		log.Printf("MongoDB freeze komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
+		return "", fmt.Errorf("freeze işlemi başarısız: %v", err)
+	}
+
+	log.Printf("MongoDB freeze komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
+
+	// Check node status after freeze
+	checkCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
+	cmd = exec.Command("bash", "-c", checkCmd)
+	checkOutput, checkErr := cmd.CombinedOutput()
+
+	if checkErr != nil {
+		log.Printf("Freeze sonrası durum kontrolü başarısız: %v", checkErr)
+		return fmt.Sprintf("MongoDB node freeze tamamlandı, ancak durum kontrolü başarısız: %s",
+			strings.TrimSpace(outputStr)), nil
+	}
+
+	checkOutputStr := string(checkOutput)
+	return fmt.Sprintf("MongoDB node freeze başarılı (%d saniye). Çıktı: %s\nYeni Durum: %s",
+		seconds,
 		strings.TrimSpace(outputStr),
 		strings.TrimSpace(checkOutputStr)), nil
 }
