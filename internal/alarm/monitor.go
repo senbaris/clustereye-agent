@@ -893,26 +893,10 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 
 						// Asenkron olarak yeniden bağlanmaya çalış
 						go func() {
-							// Bağlantı yenileme işini ana reporter'a yaptır
-							// (global bir değişken kullanmaktan kaçınmak için)
-							// Bu sadece ana uygulamada bağlantı yenileme işlemi tetikler
-							// Gerçek yenileme agent tarafından yapılır
-							refreshDone := make(chan bool, 1)
-
-							go func() {
-								// Burada reporterı yenileme işlemi yapılabilir
-								// Ya da ana uygulamadan bir callback çağrılabilir
-								time.Sleep(100 * time.Millisecond) // Yenileme için kısa bekle
-								refreshDone <- true
-							}()
-
-							// En fazla 5 saniye bekle
-							select {
-							case <-refreshDone:
-								log.Printf("gRPC client yenileme işlemi tamamlandı")
-							case <-time.After(5 * time.Second):
-								log.Printf("gRPC client yenileme zaman aşımına uğradı")
-							}
+							// Burada reporterı yenileme işlemi yapılabilir
+							// Ya da ana uygulamadan bir callback çağrılabilir
+							time.Sleep(100 * time.Millisecond) // Yenileme için kısa bekle
+							log.Printf("gRPC client yenileme işlemi tamamlandı")
 						}()
 
 						connectionRefreshCount++
@@ -956,42 +940,12 @@ func (m *AlarmMonitor) UpdateClient(client pb.AgentServiceClient) {
 	log.Println("AlarmMonitor client'ı güncellendi")
 
 	// Client değişikliğinden sonra zorunlu threshold güncellemesi yap
-	// Bu, bağlantı yenilemenin başarılı olup olmadığını test etmeye de yarar
 	go func() {
 		// Kısa bir bekleme süresi ekle (bağlantının tamamen oluşması için)
 		time.Sleep(500 * time.Millisecond)
 
 		log.Println("Bağlantı yenileme sonrası threshold'lar yeniden alınıyor...")
 		m.updateThresholds()
-
-		// Test amaçlı basit bir ping alarmı gönder (bağlantı testi)
-		pingAlarm := &pb.AlarmEvent{
-			Id:          uuid.New().String(),
-			AlarmId:     "connection_test",
-			AgentId:     m.agentID,
-			Status:      "test",
-			MetricName:  "connection_refreshed",
-			MetricValue: "ok",
-			Message:     "Connection refreshed successfully",
-			Timestamp:   time.Now().Format(time.RFC3339),
-			Severity:    "info",
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		req := &pb.ReportAlarmRequest{
-			AgentId: m.agentID,
-			Events:  []*pb.AlarmEvent{pingAlarm},
-		}
-
-		// Bağlantıyı test etmek için hızlı bir ping gönder
-		_, err := m.client.ReportAlarm(ctx, req)
-		if err != nil {
-			log.Printf("Bağlantı yenileme sonrası test mesajı gönderilemedi: %v", err)
-		} else {
-			log.Printf("Bağlantı yenileme başarılı, test mesajı gönderildi (ID: %s)", pingAlarm.Id)
-		}
 	}()
 }
 

@@ -450,9 +450,9 @@ func (r *Reporter) Connect() error {
 
 		// Keep-alive seçenekleri
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second, // 10 saniyede bir ping
-			Timeout:             5 * time.Second,  // 5 saniye ping timeout
-			PermitWithoutStream: true,             // Stream yokken de keep-alive
+			Time:                60 * time.Second, // 60 saniyede bir ping (daha önce 10 saniyeydi, arttırdık)
+			Timeout:             10 * time.Second, // 10 saniye ping timeout
+			PermitWithoutStream: false,            // Stream yokken ping gönderme (daha önce true'ydu)
 		}),
 	}
 
@@ -736,6 +736,10 @@ func (r *Reporter) listenForCommands() {
 			log.Println("Komut dinleme durduruldu")
 			return
 		default:
+			// Her iterasyonda kısa bir bekleme süresi ekleyelim
+			// Bu şekilde sürekli polling yapmayı önleriz
+			time.Sleep(200 * time.Millisecond)
+
 			// Önceki mesaj işleme tamamlandıysa durum bilgisini temizle
 			if !isProcessingMetrics && !isProcessingQuery {
 				lastMessageType = "none"
@@ -759,7 +763,24 @@ func (r *Reporter) listenForCommands() {
 			if err != nil {
 				connectionErrorCount++
 
-				if err == io.EOF {
+				// Özel ENHANCE_YOUR_CALM hatası tespiti
+				if strings.Contains(err.Error(), "ENHANCE_YOUR_CALM") || strings.Contains(err.Error(), "too_many_pings") {
+					log.Printf("Sunucu ping frekansından dolayı bağlantıyı kapattı (ENHANCE_YOUR_CALM). Bekleyip yeniden bağlanılacak...")
+
+					// ENHANCE_YOUR_CALM hatası durumunda 10 saniye bekle
+					time.Sleep(10 * time.Second)
+
+					// ENHANCE_YOUR_CALM durumunda hemen yeniden bağlan
+					if err := r.reconnect(); err != nil {
+						log.Printf("ENHANCE_YOUR_CALM sonrası yeniden bağlantı başarısız: %v. 30 saniye sonra tekrar denenecek.", err)
+						time.Sleep(30 * time.Second) // Uzun bir bekleme süresi
+					} else {
+						log.Printf("ENHANCE_YOUR_CALM sonrası yeniden bağlantı başarılı!")
+						connectionErrorCount = 0 // Sayacı sıfırla
+					}
+
+					continue
+				} else if err == io.EOF {
 					log.Printf("Sunucu bağlantıyı kapattı (EOF). Yeniden bağlanmayı deneyeceğim...")
 					// EOF durumunda doğrudan yeniden bağlan
 					if err := r.reconnect(); err != nil {
@@ -812,6 +833,8 @@ func (r *Reporter) listenForCommands() {
 				messageType = "metrics_request"
 			}
 			log.Printf("Sunucudan mesaj alındı - Tip: %s (Son mesaj tipi: %s)", messageType, lastMessageType)
+
+			// NOT: Burada bir sleep konulmuştu, fakat döngünün başında genel bir sleep zaten eklendi
 
 			if query := msg.GetQuery(); query != nil {
 				// Eğer şu anda metrik işleme devam ediyorsa, uyarı ver
