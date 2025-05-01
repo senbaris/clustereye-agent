@@ -17,6 +17,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -425,21 +426,52 @@ func NewReporter(cfg *config.AgentConfig) *Reporter {
 func (r *Reporter) Connect() error {
 	// GRPC bağlantısı oluştur
 	log.Printf("ClusterEye sunucusuna bağlanıyor: %s", r.cfg.GRPC.ServerAddress)
-	conn, err := grpc.Dial(
-		r.cfg.GRPC.ServerAddress,
+
+	// gRPC bağlantı seçeneklerini yapılandır
+	opts := []grpc.DialOption{
+		// TLS olmadan bağlantı için
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+
+		// Bağlantı zaman aşımını artır (30 saniye)
+		grpc.WithTimeout(30 * time.Second),
+
+		// Otomatik yeniden bağlantı etkinleştir
+		grpc.WithDisableServiceConfig(),
+
+		// Bağlantı backoff parametrelerini ayarla
+		grpc.WithBackoffMaxDelay(20 * time.Second),
+
+		// Sıkıştırma etkinleştir (opsiyonel)
+		grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")),
+
+		// Keep-alive seçenekleri
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second, // 10 saniyede bir ping
+			Timeout:             5 * time.Second,  // 5 saniye ping timeout
+			PermitWithoutStream: true,             // Stream yokken de keep-alive
+		}),
+	}
+
+	// gRPC bağlantısını oluştur
+	conn, err := grpc.Dial(r.cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
-		return err
+		return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
 	}
 
 	r.grpcClient = conn
 
 	// gRPC client oluştur
 	client := pb.NewAgentServiceClient(conn)
-	stream, err := client.Connect(context.Background())
+
+	// Bağlantı için zaman aşımı olan bir context oluştur
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Stream bağlantısını başlat
+	stream, err := client.Connect(ctx)
 	if err != nil {
-		return err
+		r.grpcClient.Close() // Bağlantıyı temizle
+		return fmt.Errorf("stream bağlantısı kurulamadı: %v", err)
 	}
 
 	r.stream = stream
@@ -1733,15 +1765,44 @@ func (r *Reporter) reconnect() error {
 		r.grpcClient.Close()
 	}
 
-	// Yeni bağlantı kur
-	if err := r.Connect(); err != nil {
-		return err
+	// Yeniden bağlantı için bir kaç deneme yapalım
+	maxRetries := 5
+	retryDelay := 2 * time.Second
+
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		log.Printf("gRPC sunucusuna yeniden bağlanılıyor (deneme %d/%d)...", i+1, maxRetries)
+
+		// Yeni bağlantı kur
+		err = r.Connect()
+		if err == nil {
+			break // Bağlantı başarılı
+		}
+
+		log.Printf("Yeniden bağlantı başarısız (%d/%d): %v, %v saniye sonra tekrar denenecek",
+			i+1, maxRetries, err, retryDelay.Seconds())
+
+		if i < maxRetries-1 {
+			time.Sleep(retryDelay)
+			// Her denemede bekleme süresini artır (exponential backoff)
+			retryDelay = time.Duration(float64(retryDelay) * 1.5)
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("maksimum yeniden bağlantı denemesi aşıldı: %v", err)
 	}
 
 	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
 	// Mevcut platform bilgisini kullanarak agent kaydını yenile
 	if err := r.AgentRegistration("reconnected", r.platform); err != nil {
-		return err
+		log.Printf("Agent yeniden kaydı başarısız: %v. Tekrar deneniyor...", err)
+
+		// Agent kaydı için bir deneme daha yap
+		time.Sleep(2 * time.Second)
+		if err := r.AgentRegistration("reconnected", r.platform); err != nil {
+			return fmt.Errorf("agent yeniden kaydı başarısız: %v", err)
+		}
 	}
 
 	// Alarm monitörünün client'ını güncelle
