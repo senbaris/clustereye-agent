@@ -748,6 +748,103 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
+				// MongoDB rs.stepDown() komutu için özel işleme
+				if r.platform == "mongo" && strings.HasPrefix(query.Command, "rs.stepDown") {
+					log.Printf("MongoDB stepDown komutu tespit edildi: %s", query.Command)
+
+					// Hostname ve port bilgisini config'den al
+					hostname := r.cfg.Mongo.Host
+					if hostname == "" {
+						hostname = "localhost"
+					}
+
+					port, err := strconv.Atoi(r.cfg.Mongo.Port)
+					if err != nil {
+						port = 27017 // varsayılan MongoDB portu
+					}
+
+					// MongoDB kolektörünü import et
+					mongoCollector, err := r.importMongoCollector()
+					if err != nil {
+						log.Printf("MongoDB kolektörü import edilemedi: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// ReplicaSet bilgisini al
+					replicaSet := mongoCollector.GetReplicaSetName()
+					if replicaSet == "" {
+						replicaSet = "rs0" // varsayılan replica set adı
+					}
+
+					// MongoDB servis durumunu kontrol et - sadece primary node'da stepDown çalışır
+					serviceStatus := mongoCollector.GetMongoServiceStatus()
+					if serviceStatus == nil || serviceStatus.CurrentState != "PRIMARY" {
+						log.Printf("UYARI: StepDown komutu sadece PRIMARY node'da çalışır, mevcut node durumu: %s",
+							serviceStatus.CurrentState)
+						queryResult := map[string]interface{}{
+							"status": "error",
+							"message": fmt.Sprintf("StepDown komutu sadece PRIMARY node'da çalışır, mevcut node durumu: %s",
+								serviceStatus.CurrentState),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// Bir hostname ve agentId oluştur
+					hostname, _ = os.Hostname()
+					agentID := "agent_" + hostname
+
+					// PromoteMongoToPrimary işlemini başlat (aslında node'u stepDown yapar)
+					promoteReq := &pb.MongoPromotePrimaryRequest{
+						JobId:        query.QueryId,
+						AgentId:      agentID,
+						NodeHostname: hostname,
+						Port:         int32(port),
+						ReplicaSet:   replicaSet,
+						NodeStatus:   serviceStatus.CurrentState,
+					}
+
+					// PromoteMongoToPrimary çağrısı rs.stepDown() işlemini gerçekleştirir
+					promoteResp, err := r.PromoteMongoToPrimary(context.Background(), promoteReq)
+					if err != nil {
+						log.Printf("MongoDB stepDown işlemi başarısız: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB stepDown işlemi başarısız: %v", err),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// İşlem sonuçlarını dön
+					var statusStr string
+					if promoteResp.Status == pb.JobStatus_JOB_STATUS_COMPLETED {
+						statusStr = "success"
+					} else {
+						statusStr = "error"
+					}
+
+					queryResult := map[string]interface{}{
+						"status":  statusStr,
+						"message": promoteResp.Result,
+					}
+
+					sendQueryResult(r.stream, query.QueryId, queryResult)
+					isProcessingQuery = false
+					continue
+				}
+
 				// MongoDB db.hello() komutu için özel işleme
 				if r.platform == "mongo" && (strings.HasPrefix(query.Command, "db.hello()") || strings.HasPrefix(query.Command, "db.hello(") || strings.HasPrefix(query.Command, "rs.status()")) {
 					log.Printf("MongoDB node durumu sorgusu tespit edildi: %s", query.Command)
