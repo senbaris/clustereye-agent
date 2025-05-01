@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -657,6 +658,96 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
 
+				// MongoDB rs.freeze() komutu için özel işleme
+				if r.platform == "mongo" && strings.HasPrefix(query.Command, "rs.freeze") {
+					log.Printf("MongoDB rs.freeze komutu tespit edildi: %s", query.Command)
+
+					// Hostname ve port bilgisini config'den al
+					hostname := r.cfg.Mongo.Host
+					if hostname == "" {
+						hostname = "localhost"
+					}
+
+					port, err := strconv.Atoi(r.cfg.Mongo.Port)
+					if err != nil {
+						port = 27017 // varsayılan MongoDB portu
+					}
+
+					// ReplicaSet bilgisini al
+					mongoCollector, err := r.importMongoCollector()
+					if err != nil {
+						log.Printf("MongoDB kolektörü import edilemedi: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB kolektörü import edilemedi: %v", err),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					replicaSet := mongoCollector.GetReplicaSetName()
+					if replicaSet == "" {
+						replicaSet = "rs0" // varsayılan replica set adı
+					}
+
+					// Seconds değerini komuttan çıkar
+					seconds := 60 // varsayılan değer
+					pattern := regexp.MustCompile(`rs\.freeze\((\d+)\)`)
+					matches := pattern.FindStringSubmatch(query.Command)
+					if len(matches) > 1 {
+						secs, err := strconv.Atoi(matches[1])
+						if err == nil {
+							seconds = secs
+						}
+					}
+
+					// Bir hostname ve agentId oluştur
+					hostname, _ = os.Hostname()
+					agentID := "agent_" + hostname
+
+					// FreezeMongoSecondary işlemini başlat
+					freezeReq := &pb.MongoFreezeSecondaryRequest{
+						JobId:        query.QueryId,
+						AgentId:      agentID,
+						NodeHostname: hostname,
+						Port:         int32(port),
+						ReplicaSet:   replicaSet,
+						Seconds:      int32(seconds),
+					}
+
+					freezeResp, err := r.FreezeMongoSecondary(context.Background(), freezeReq)
+					if err != nil {
+						log.Printf("MongoDB freeze işlemi başarısız: %v", err)
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("MongoDB freeze işlemi başarısız: %v", err),
+						}
+
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// İşlem sonuçlarını dön
+					var statusStr string
+					if freezeResp.Status == pb.JobStatus_JOB_STATUS_COMPLETED {
+						statusStr = "success"
+					} else {
+						statusStr = "error"
+					}
+
+					queryResult := map[string]interface{}{
+						"status":  statusStr,
+						"message": freezeResp.Result,
+					}
+
+					sendQueryResult(r.stream, query.QueryId, queryResult)
+					isProcessingQuery = false
+					continue
+				}
+
 				// Ping sorgusunu özel olarak işle
 				if strings.ToLower(query.Command) == "ping" {
 					log.Printf("Ping komutu algılandı, özel yanıt gönderiliyor")
@@ -666,24 +757,7 @@ func (r *Reporter) listenForCommands() {
 						"message": "pong",
 					}
 
-					resultStruct, _ := structpb.NewStruct(pingResult)
-					anyResult, _ := anypb.New(resultStruct)
-
-					response := &pb.AgentMessage{
-						Payload: &pb.AgentMessage_QueryResult{
-							QueryResult: &pb.QueryResult{
-								QueryId: query.QueryId,
-								Result:  anyResult,
-							},
-						},
-					}
-
-					if err := r.stream.Send(response); err != nil {
-						log.Printf("Ping cevabı gönderilemedi: %v", err)
-					} else {
-						log.Printf("Ping cevabı başarıyla gönderildi")
-					}
-
+					sendQueryResult(r.stream, query.QueryId, pingResult)
 					isProcessingQuery = false
 					continue
 				}
@@ -1346,36 +1420,47 @@ func (r *Reporter) listenForCommands() {
 					log.Printf("pg_cachehitratio sorgusu tespit edildi, boyut sınırlaması uygulanıyor")
 				}
 
-				// Normal PostgreSQL sorgusu işleme
-				result := processor.processQuery(query.Command, query.Database)
+				// Normal PostgreSQL sorgusu işleme (yalnızca postgres platform için)
+				if r.platform == "postgres" && processor != nil {
+					result := processor.processQuery(query.Command, query.Database)
 
-				// Sonucu structpb'ye dönüştür
-				resultStruct, err := structpb.NewStruct(result)
-				if err != nil {
-					log.Printf("Struct'a dönüştürme hatası: %v", err)
-					isProcessingQuery = false
-					continue
-				}
+					// Sonucu structpb'ye dönüştür
+					resultStruct, err := structpb.NewStruct(result)
+					if err != nil {
+						log.Printf("Struct'a dönüştürme hatası: %v", err)
+						isProcessingQuery = false
+						continue
+					}
 
-				anyResult, err := anypb.New(resultStruct)
-				if err != nil {
-					log.Printf("Any tipine dönüştürülemedi: %v", err)
-					isProcessingQuery = false
-					continue
-				}
+					anyResult, err := anypb.New(resultStruct)
+					if err != nil {
+						log.Printf("Any tipine dönüştürülemedi: %v", err)
+						isProcessingQuery = false
+						continue
+					}
 
-				// Yanıtı gönder
-				response := &pb.AgentMessage{
-					Payload: &pb.AgentMessage_QueryResult{
-						QueryResult: &pb.QueryResult{
-							QueryId: query.QueryId,
-							Result:  anyResult,
+					// Yanıtı gönder
+					response := &pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyResult,
+							},
 						},
-					},
-				}
+					}
 
-				if err := r.stream.Send(response); err != nil {
-					log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+					if err := r.stream.Send(response); err != nil {
+						log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+					}
+				} else if r.platform == "mongo" {
+					// MongoDB platform için sorguysa ve diğer durumlarda işlenmediyse hata bildir
+					log.Printf("MongoDB platformunda geçersiz sorgu: %s", query.Command)
+					queryResult := map[string]interface{}{
+						"status":  "error",
+						"message": "Bu komut MongoDB platformunda desteklenmiyor",
+					}
+
+					sendQueryResult(r.stream, query.QueryId, queryResult)
 				}
 
 				isProcessingQuery = false
@@ -1449,6 +1534,36 @@ func (r *Reporter) listenForCommands() {
 				log.Printf("Bilinmeyen mesaj tipi alındı")
 			}
 		}
+	}
+}
+
+// sendQueryResult yardımcı fonksiyonu, map sonucunu gRPC yanıtına dönüştürüp gönderir
+func sendQueryResult(stream pb.AgentService_ConnectClient, queryId string, result map[string]interface{}) {
+	resultStruct, err := structpb.NewStruct(result)
+	if err != nil {
+		log.Printf("Struct'a dönüştürme hatası: %v", err)
+		return
+	}
+
+	anyResult, err := anypb.New(resultStruct)
+	if err != nil {
+		log.Printf("Any tipine dönüştürülemedi: %v", err)
+		return
+	}
+
+	response := &pb.AgentMessage{
+		Payload: &pb.AgentMessage_QueryResult{
+			QueryResult: &pb.QueryResult{
+				QueryId: queryId,
+				Result:  anyResult,
+			},
+		},
+	}
+
+	if err := stream.Send(response); err != nil {
+		log.Printf("Sorgu cevabı gönderilemedi: %v", err)
+	} else {
+		log.Printf("Sorgu cevabı başarıyla gönderildi")
 	}
 }
 
