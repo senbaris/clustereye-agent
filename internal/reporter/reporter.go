@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/alarm"
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/pkg/utils"
+	"google.golang.org/grpc/backoff"
 )
 
 // QueryProcessor, sorgu işleme mantığını temsil eder
@@ -432,17 +434,19 @@ func (r *Reporter) Connect() error {
 		// TLS olmadan bağlantı için
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 
-		// Bağlantı zaman aşımını artır (30 saniye)
-		grpc.WithTimeout(30 * time.Second),
+		// Bağlantı parametrelerini ayarla
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  1.0 * time.Second,
+				Multiplier: 1.5,
+				Jitter:     0.2,
+				MaxDelay:   20 * time.Second,
+			},
+			MinConnectTimeout: 10 * time.Second,
+		}),
 
 		// Otomatik yeniden bağlantı etkinleştir
 		grpc.WithDisableServiceConfig(),
-
-		// Bağlantı backoff parametrelerini ayarla
-		grpc.WithBackoffMaxDelay(20 * time.Second),
-
-		// Sıkıştırma etkinleştir (opsiyonel)
-		grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")),
 
 		// Keep-alive seçenekleri
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -452,8 +456,12 @@ func (r *Reporter) Connect() error {
 		}),
 	}
 
+	// Bağlantı için context oluştur
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dialCancel()
+
 	// gRPC bağlantısını oluştur
-	conn, err := grpc.Dial(r.cfg.GRPC.ServerAddress, opts...)
+	conn, err := grpc.DialContext(dialCtx, r.cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
 		return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
 	}
@@ -463,12 +471,12 @@ func (r *Reporter) Connect() error {
 	// gRPC client oluştur
 	client := pb.NewAgentServiceClient(conn)
 
-	// Bağlantı için zaman aşımı olan bir context oluştur
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	// ÖNEMLİ: Stream bağlantısı için iptal EDİLMEYEN bir context kullan
+	// defer cancel() çağrılıyordu ve fonksiyon çıkışında stream iptal ediliyordu!
+	streamCtx := context.Background()
 
 	// Stream bağlantısını başlat
-	stream, err := client.Connect(ctx)
+	stream, err := client.Connect(streamCtx)
 	if err != nil {
 		r.grpcClient.Close() // Bağlantıyı temizle
 		return fmt.Errorf("stream bağlantısı kurulamadı: %v", err)
@@ -535,50 +543,101 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 		PostgresPass: r.cfg.PostgreSQL.Pass,
 	}
 
-	// Stream üzerinden agent bilgilerini gönder
-	agentMessage := &pb.AgentMessage{
-		Payload: &pb.AgentMessage_AgentInfo{
-			AgentInfo: agentInfo,
-		},
-	}
+	// Stream üzerinden agent bilgilerini göndermeyi birkaç kez deneyelim
+	maxRetries := 3
+	var lastErr error
 
-	err := r.stream.Send(agentMessage)
-	if err != nil {
-		return fmt.Errorf("agent bilgileri gönderilemedi: %v", err)
-	}
-
-	log.Printf("Agent bilgileri stream üzerinden gönderildi (Platform: %s)", platform)
-
-	// Kayıt işlemi tamamlandıktan sonra komut dinlemeyi başlat
-	if !r.isListening {
-		go r.listenForCommands()
-		r.isListening = true
-		log.Println("Sunucudan komut dinleme başlatıldı")
-	}
-
-	// Periyodik raporlamayı başlat
-	r.StartPeriodicReporting(30*time.Second, platform)
-
-	// Platform seçimine göre ilk bilgileri gönder
-	if platform == "postgres" {
-		// İlk PostgreSQL bilgilerini gönder
-		if err := r.SendPostgresInfo(); err != nil {
-			log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Stream sorunu varsa, yeniden bağlantı kur
+		if attempt > 0 {
+			log.Printf("Stream bağlantısı yenileniyor (deneme %d/%d)...", attempt+1, maxRetries)
+			if err := r.reconnect(); err != nil {
+				log.Printf("Stream yeniden bağlantı hatası: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
 		}
-	} else if platform == "mongo" {
-		// İlk MongoDB bilgilerini gönder
-		if err := r.SendMongoInfo(); err != nil {
-			log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
+
+		// Agent Message oluştur
+		agentMessage := &pb.AgentMessage{
+			Payload: &pb.AgentMessage_AgentInfo{
+				AgentInfo: agentInfo,
+			},
 		}
+
+		// Kısa bir timeout ile mesajı gönder
+		sendDone := make(chan error, 1)
+		go func() {
+			// Mesaj gönderirken herhangi bir context iptalinden etkilenmemesi için
+			// doğrudan gönder
+			sendDone <- r.stream.Send(agentMessage)
+		}()
+
+		// En fazla 5 saniye bekle
+		var err error
+		select {
+		case err = <-sendDone:
+			// Mesaj gönderimi tamamlandı
+		case <-time.After(5 * time.Second):
+			err = fmt.Errorf("agent bilgileri gönderimi zaman aşımına uğradı")
+			// Bu timeout durumunda stream hala açık olabilir, zorla kapatma
+			log.Printf("Zaman aşımı nedeniyle stream yenileniyor...")
+			// Burada stream'i kapatmaya çalışmak yerine, yeni bir stream oluştur
+			time.Sleep(1 * time.Second)
+		}
+
+		if err != nil {
+			lastErr = fmt.Errorf("agent bilgileri gönderilemedi: %v", err)
+			log.Printf("Agent bilgisi gönderimi başarısız (deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			// EOF veya bağlantı hatası olup olmadığını kontrol et
+			if err == io.EOF || strings.Contains(err.Error(), "transport") ||
+				strings.Contains(err.Error(), "connection") {
+				log.Printf("Bağlantı hatası tespit edildi, yeniden bağlanılacak...")
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+
+		log.Printf("Agent bilgileri stream üzerinden gönderildi (Platform: %s)", platform)
+
+		// Kayıt işlemi tamamlandıktan sonra komut dinlemeyi başlat
+		if !r.isListening {
+			go r.listenForCommands()
+			r.isListening = true
+			log.Println("Sunucudan komut dinleme başlatıldı")
+		}
+
+		// Periyodik raporlamayı başlat
+		r.StartPeriodicReporting(30*time.Second, platform)
+
+		// Platform seçimine göre ilk bilgileri gönder
+		if platform == "postgres" {
+			// İlk PostgreSQL bilgilerini gönder
+			if err := r.SendPostgresInfo(); err != nil {
+				log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
+			}
+		} else if platform == "mongo" {
+			// İlk MongoDB bilgilerini gönder
+			if err := r.SendMongoInfo(); err != nil {
+				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
+			}
+		}
+
+		// Alarm izleme sistemini başlat
+		agentID := "agent_" + hostname
+		client := pb.NewAgentServiceClient(r.grpcClient)
+		r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform)
+		r.alarmMonitor.Start()
+
+		return nil // Başarılı
 	}
 
-	// Alarm izleme sistemini başlat
-	agentID := "agent_" + hostname
-	client := pb.NewAgentServiceClient(r.grpcClient)
-	r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform)
-	r.alarmMonitor.Start()
-
-	return nil
+	return fmt.Errorf("agent bilgileri gönderilemedi: %v", lastErr)
 }
 
 // getAuthStatus belirli platform için auth durumunu döndürür
@@ -648,6 +707,29 @@ func (r *Reporter) listenForCommands() {
 	isProcessingQuery := false
 	lastMessageType := "none"
 
+	// Bağlantı hata sayacı - üst üste hata olduğunda yeniden bağlantı kurma
+	connectionErrorCount := 0
+	maxConnectionErrors := 3
+
+	// Panic recovery - eğer beklenmeyen bir hata olursa, process'i çökertme
+	defer func() {
+		if panicVal := recover(); panicVal != nil {
+			log.Printf("Komut dinleme işlemi panic nedeniyle durduruldu: %v", panicVal)
+
+			// Yeniden bağlanmayı dene
+			time.Sleep(3 * time.Second) // Kısa bir bekleme
+			if err := r.reconnect(); err != nil {
+				log.Printf("Yeniden bağlantı başarısız: %v", err)
+				return
+			}
+
+			// Yeniden dinlemeyi başlat
+			log.Println("Dinleme işlemi yeniden başlatılıyor...")
+			time.Sleep(1 * time.Second)
+			go r.listenForCommands()
+		}
+	}()
+
 	for {
 		select {
 		case <-r.stopCh:
@@ -659,28 +741,79 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "none"
 			}
 
-			log.Printf("Sunucudan mesaj bekleniyor... (Son mesaj tipi: %s)", lastMessageType)
-			in, err := r.stream.Recv()
-			if err != nil {
-				log.Printf("Cloud API bağlantısı kapandı: %v", err)
-				time.Sleep(5 * time.Second)
+			// Stream bağlantısı var mı kontrol et
+			if r.stream == nil {
+				log.Println("Stream bağlantısı yok, yeniden bağlanılıyor...")
 				if err := r.reconnect(); err != nil {
-					log.Printf("Yeniden bağlantı başarısız: %v", err)
-					time.Sleep(10 * time.Second)
+					log.Printf("Yeniden bağlantı başarısız: %v. 5 saniye sonra tekrar denenecek.", err)
+					time.Sleep(5 * time.Second)
+					continue
 				}
+			}
+
+			// Sunucudan mesaj bekle
+			log.Printf("Sunucudan mesaj bekleniyor... (Son mesaj tipi: %s)", lastMessageType)
+
+			// Stream'den mesaj al
+			msg, err := r.stream.Recv()
+			if err != nil {
+				connectionErrorCount++
+
+				if err == io.EOF {
+					log.Printf("Sunucu bağlantıyı kapattı (EOF). Yeniden bağlanmayı deneyeceğim...")
+					// EOF durumunda doğrudan yeniden bağlan
+					if err := r.reconnect(); err != nil {
+						log.Printf("EOF sonrası yeniden bağlantı başarısız: %v. 5 saniye sonra tekrar denenecek.", err)
+						time.Sleep(5 * time.Second)
+					} else {
+						log.Printf("EOF sonrası yeniden bağlantı başarılı!")
+						connectionErrorCount = 0 // Sayacı sıfırla
+					}
+				} else if strings.Contains(err.Error(), "transport is closing") || strings.Contains(err.Error(), "connection is closing") {
+					log.Printf("Sunucu bağlantıyı kapatıyor: %v. Yeniden bağlanmayı deneyeceğim...", err)
+					// Bağlantı kapanma durumunda doğrudan yeniden bağlan
+					time.Sleep(2 * time.Second) // Kısa bir bekleme
+					if err := r.reconnect(); err != nil {
+						log.Printf("Bağlantı kapanma sonrası yeniden bağlantı başarısız: %v. 5 saniye sonra tekrar denenecek.", err)
+						time.Sleep(5 * time.Second)
+					} else {
+						log.Printf("Bağlantı kapanma sonrası yeniden bağlantı başarılı!")
+						connectionErrorCount = 0 // Sayacı sıfırla
+					}
+				} else {
+					log.Printf("Sunucudan mesaj alınırken hata: %v", err)
+				}
+
+				// Üst üste bağlantı hataları olursa yeniden bağlan
+				if connectionErrorCount >= maxConnectionErrors {
+					log.Printf("Üst üste %d bağlantı hatası. Yeniden bağlanmayı deniyorum...", connectionErrorCount)
+					// 5 saniye bekle ve yeniden bağlanmayı dene
+					time.Sleep(5 * time.Second)
+					if err := r.reconnect(); err != nil {
+						log.Printf("Yeniden bağlantı başarısız: %v. 10 saniye sonra tekrar denenecek.", err)
+						time.Sleep(10 * time.Second)
+					} else {
+						connectionErrorCount = 0 // Sayacı sıfırla
+					}
+				}
+
+				time.Sleep(1 * time.Second) // Kısa bir bekleme
 				continue
 			}
 
+			// Bağlantı hata sayacını sıfırla - başarılı bir mesaj aldık
+			connectionErrorCount = 0
+
 			// Gelen mesajın tipini logla
 			messageType := "unknown"
-			if query := in.GetQuery(); query != nil {
+			if query := msg.GetQuery(); query != nil {
 				messageType = "query"
-			} else if metricsReq := in.GetMetricsRequest(); metricsReq != nil {
+			} else if metricsReq := msg.GetMetricsRequest(); metricsReq != nil {
 				messageType = "metrics_request"
 			}
 			log.Printf("Sunucudan mesaj alındı - Tip: %s (Son mesaj tipi: %s)", messageType, lastMessageType)
 
-			if query := in.GetQuery(); query != nil {
+			if query := msg.GetQuery(); query != nil {
 				// Eğer şu anda metrik işleme devam ediyorsa, uyarı ver
 				if isProcessingMetrics {
 					log.Printf("UYARI: Metrik işleme devam ederken sorgu alındı")
@@ -1648,7 +1781,7 @@ func (r *Reporter) listenForCommands() {
 
 				isProcessingQuery = false
 				continue
-			} else if metricsReq := in.GetMetricsRequest(); metricsReq != nil {
+			} else if metricsReq := msg.GetMetricsRequest(); metricsReq != nil {
 				// Eğer şu anda sorgu işleme devam ediyorsa, uyarı ver
 				if isProcessingQuery {
 					log.Printf("UYARI: Sorgu işleme devam ederken metrik isteği alındı")
