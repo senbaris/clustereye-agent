@@ -2469,3 +2469,133 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		Result: "PostgreSQL node başarıyla master'a yükseltildi",
 	}, nil
 }
+
+// ExplainQuery PostgreSQL sorgu planını alır ve döndürür
+func (r *Reporter) ExplainQuery(ctx context.Context, req *pb.ExplainQueryRequest) (*pb.ExplainQueryResponse, error) {
+	log.Printf("PostgreSQL sorgu planı isteği alındı. AgentID: %s, Veritabanı: %s", req.AgentId, req.Database)
+
+	// Veritabanı bağlantısını aç
+	db, err := postgres.OpenDB()
+	if err != nil {
+		errMsg := fmt.Sprintf("Veritabanı bağlantısı açılamadı: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+	defer db.Close()
+
+	// İstenen veritabanına geçiş yap (eğer belirtilmişse)
+	if req.Database != "" {
+		// Mevcut bağlantı bilgilerini al
+		var currentDB string
+		err := db.QueryRow("SELECT current_database()").Scan(&currentDB)
+		if err != nil {
+			log.Printf("UYARI: Mevcut veritabanı bilgisi alınamadı: %v", err)
+		}
+
+		if req.Database != currentDB {
+			log.Printf("Veritabanı değiştiriliyor: %s -> %s", currentDB, req.Database)
+
+			// Bağlantı bilgilerini al
+			var currentHost string
+			db.QueryRow("SELECT inet_server_addr()").Scan(&currentHost)
+			if currentHost == "" {
+				currentHost = "localhost"
+			}
+
+			var currentPort string
+			db.QueryRow("SELECT inet_server_port()").Scan(&currentPort)
+			if currentPort == "" {
+				currentPort = "5432"
+			}
+
+			// Mevcut bağlantıyı kapat
+			db.Close()
+
+			// Yeni veritabanına bağlan
+			connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+				currentHost, currentPort, r.cfg.PostgreSQL.User, r.cfg.PostgreSQL.Pass, req.Database)
+
+			newDB, err := sql.Open("postgres", connStr)
+			if err != nil {
+				errMsg := fmt.Sprintf("Veritabanı bağlantısı açılamadı: %v", err)
+				log.Printf("HATA: %s", errMsg)
+				return &pb.ExplainQueryResponse{
+					Status:       "error",
+					ErrorMessage: errMsg,
+				}, nil
+			}
+
+			// Bağlantıyı test et
+			if err := newDB.Ping(); err != nil {
+				errMsg := fmt.Sprintf("Veritabanı bağlantısı test edilemedi: %v", err)
+				log.Printf("HATA: %s", errMsg)
+				newDB.Close()
+				return &pb.ExplainQueryResponse{
+					Status:       "error",
+					ErrorMessage: errMsg,
+				}, nil
+			}
+
+			// Bağlantıyı güncelle
+			db = newDB
+		}
+	}
+
+	// Sorguyu doğrudan çalıştır - server tarafından sarmalanmış olarak gelecek
+	log.Printf("Sorgu çalıştırılıyor: %s", req.Query)
+
+	// Sorguyu çalıştır
+	rows, err := db.Query(req.Query)
+	if err != nil {
+		errMsg := fmt.Sprintf("Sorgu planı alınamadı: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+	defer rows.Close()
+
+	// Sonuçları topla
+	var planLines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			errMsg := fmt.Sprintf("Sonuç satırı okunamadı: %v", err)
+			log.Printf("UYARI: %s", errMsg)
+			continue
+		}
+		planLines = append(planLines, line)
+	}
+
+	// Satır okumada hata olup olmadığını kontrol et
+	if err := rows.Err(); err != nil {
+		errMsg := fmt.Sprintf("Sorgu planı sonuçları okunurken hata: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Sonuç satırları yoksa, boş bir plan döndür
+	if len(planLines) == 0 {
+		log.Printf("Sorgu planı alındı, ancak sonuç yok")
+		return &pb.ExplainQueryResponse{
+			Status: "success",
+			Plan:   "Sorgu planı sonucu bulunamadı.",
+		}, nil
+	}
+
+	// Tüm plan satırlarını birleştir
+	plan := strings.Join(planLines, "\n")
+	log.Printf("Sorgu planı başarıyla alındı (%d satır)", len(planLines))
+
+	return &pb.ExplainQueryResponse{
+		Status: "success",
+		Plan:   plan,
+	}, nil
+}

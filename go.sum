@@ -38,6 +38,10 @@ github.com/sefaphlvn/clustereye-test v1.0.5-0.20250430104136-404364333a64 h1:mIN
 github.com/sefaphlvn/clustereye-test v1.0.5-0.20250430104136-404364333a64/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
 github.com/sefaphlvn/clustereye-test v1.0.5-0.20250501075701-1b1fc8b64b9e h1:6WzjxMGEcqgkjVDHc1WBR8n5U4+JrbKC423lEOlcfNg=
 github.com/sefaphlvn/clustereye-test v1.0.5-0.20250501075701-1b1fc8b64b9e/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.5 h1:AvRP1FiYlRWRguuEMs/PeCCJD3eK+wya7VY15PMJEAg=
+github.com/sefaphlvn/clustereye-test v1.0.5/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.6 h1:wPgbi31fMJcspKZKL38FKq1oEh2M7yFYKIFVZ8e1tJA=
+github.com/sefaphlvn/clustereye-test v1.0.6/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
 github.com/xdg-go/pbkdf2 v1.0.0/go.mod h1:jrpuAogTd400dnrH08LKmI/xc1MbPOebTwRqcT5RDeI=
 github.com/xdg-go/scram v1.1.2 h1:FHX5I5B4i4hKRVRBCFRxq1iQRej7WO3hhBuJf+UUySY=

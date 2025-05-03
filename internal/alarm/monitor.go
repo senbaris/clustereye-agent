@@ -468,6 +468,8 @@ func (m *AlarmMonitor) checkSlowQueries() {
 
 	var slowQueries []string
 	var maxDuration float64
+	var primaryDatabase string // En uzun süren sorgunun veritabanını tutacak
+
 	for rows.Next() {
 		var (
 			pid        int
@@ -481,8 +483,10 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			continue
 		}
 
+		// En uzun süren sorguyu ve veritabanını takip et
 		if durationMs > maxDuration {
 			maxDuration = durationMs
+			primaryDatabase = database
 		}
 
 		// NULL username kontrolü
@@ -525,6 +529,7 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			Message:     message,
 			Timestamp:   time.Now().Format(time.RFC3339),
 			Severity:    "warning",
+			Database:    primaryDatabase, // En uzun süren sorgunun veritabanı
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {

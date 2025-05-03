@@ -5,7 +5,7 @@ go 1.24.1
 require (
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.10.9
-	github.com/sefaphlvn/clustereye-test v1.0.5-0.20250501075701-1b1fc8b64b9e
+	github.com/sefaphlvn/clustereye-test v1.0.6
 	go.mongodb.org/mongo-driver v1.17.3
 	google.golang.org/grpc v1.72.0
 	google.golang.org/protobuf v1.36.6
