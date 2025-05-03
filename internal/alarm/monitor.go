@@ -485,11 +485,6 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			maxDuration = durationMs
 		}
 
-		// Sorgu metnini kısalt
-		if len(queryText) > 200 {
-			queryText = queryText[:197] + "..."
-		}
-
 		// NULL username kontrolü
 		usernameStr := "unknown"
 		if username.Valid {
