@@ -339,45 +339,80 @@ func getCPUUsage() (float64, error) {
 		// İlk ölçüm
 		cpu1, err := readCPUStat()
 		if err != nil {
+			log.Printf("İlk CPU ölçümü hatası: %v", err)
 			return 0, err
 		}
+		log.Printf("İlk CPU ölçümü - Total: %d, Idle: %d", cpu1.total, cpu1.idle)
 
-		// 100ms bekle
-		time.Sleep(100 * time.Millisecond)
+		// 200ms bekle (100ms yerine daha uzun bir süre)
+		time.Sleep(200 * time.Millisecond)
 
 		// İkinci ölçüm
 		cpu2, err := readCPUStat()
 		if err != nil {
+			log.Printf("İkinci CPU ölçümü hatası: %v", err)
 			return 0, err
 		}
+		log.Printf("İkinci CPU ölçümü - Total: %d, Idle: %d", cpu2.total, cpu2.idle)
 
 		// CPU kullanımını hesapla
 		totalDiff := cpu2.total - cpu1.total
+		idleDiff := cpu2.idle - cpu1.idle
+
+		log.Printf("CPU hesaplama - Total diff: %d, Idle diff: %d", totalDiff, idleDiff)
+
 		if totalDiff == 0 {
-			return 0, nil
+			log.Printf("UYARI: Total diff 0, alternatif yönteme geçiliyor")
+			goto AlternativeMethod
 		}
 
-		idleDiff := cpu2.idle - cpu1.idle
 		cpuUsage := 100 * (1 - float64(idleDiff)/float64(totalDiff))
+
+		// Geçerlilik kontrolü
+		if cpuUsage < 0 || cpuUsage > 100 {
+			log.Printf("UYARI: Geçersiz CPU kullanımı (%f), alternatif yönteme geçiliyor", cpuUsage)
+			goto AlternativeMethod
+		}
+
+		log.Printf("Hesaplanan CPU kullanımı: %f", cpuUsage)
 		return cpuUsage, nil
 	}
 
+AlternativeMethod:
 	// Alternatif yöntem - top kullan
-	cmd := exec.Command("sh", "-c", "top -bn1 | grep '%Cpu' | awk '{print $2}'")
+	cmd := exec.Command("sh", "-c", "top -bn2 -d 0.2 | grep '^%Cpu' | tail -1 | awk '{print 100-$8}'")
 	out, err := cmd.Output()
 	if err != nil {
-		// Son çare olarak ps komutunu kullan
-		cmd = exec.Command("sh", "-c", "ps -A -o %cpu | awk '{s+=$1} END {print s}'")
+		log.Printf("Top komutu hatası: %v, mpstat deneniyor", err)
+		// mpstat dene
+		cmd = exec.Command("sh", "-c", "mpstat 1 1 | tail -1 | awk '{print 100-$NF}'")
 		out, err = cmd.Output()
 		if err != nil {
-			return 0, err
+			log.Printf("mpstat komutu hatası: %v, ps deneniyor", err)
+			// Son çare olarak ps komutunu kullan
+			cmd = exec.Command("sh", "-c", "ps -A -o %cpu | awk '{s+=$1} END {print s}'")
+			out, err = cmd.Output()
+			if err != nil {
+				log.Printf("ps komutu hatası: %v", err)
+				return 0, err
+			}
 		}
 	}
 
 	cpuPercent, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 	if err != nil {
+		log.Printf("CPU yüzdesi parse hatası: %v", err)
 		return 0, err
 	}
+
+	// Geçerlilik kontrolü
+	if cpuPercent < 0 {
+		cpuPercent = 0
+	} else if cpuPercent > 100 {
+		cpuPercent = 100
+	}
+
+	log.Printf("Alternatif yöntem CPU kullanımı: %f", cpuPercent)
 	return cpuPercent, nil
 }
 
@@ -398,20 +433,30 @@ func readCPUStat() (*cpuStat, error) {
 		if len(fields) > 0 && fields[0] == "cpu" {
 			// CPU times: user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
 			var total uint64
-			numbers := make([]uint64, len(fields)-1)
+			var idle uint64
 
+			// En az 5 alan olmalı (cpu, user, nice, system, idle)
+			if len(fields) < 5 {
+				return nil, fmt.Errorf("yetersiz CPU stat alanı")
+			}
+
+			// user + nice + system + idle + iowait + irq + softirq + steal
 			for i := 1; i < len(fields); i++ {
 				num, err := strconv.ParseUint(fields[i], 10, 64)
 				if err != nil {
-					return nil, err
+					log.Printf("CPU stat parse hatası [%d]: %v", i, err)
+					continue
 				}
-				numbers[i-1] = num
 				total += num
+				// idle ve iowait toplamı (4. ve 5. alanlar)
+				if i == 4 || (i == 5 && len(fields) > 5) {
+					idle += num
+				}
 			}
 
-			// idle is the 4th field (index 3)
+			log.Printf("CPU stat okundu - Total: %d, Idle: %d", total, idle)
 			return &cpuStat{
-				idle:  numbers[3],
+				idle:  idle,
 				total: total,
 			}, nil
 		}
