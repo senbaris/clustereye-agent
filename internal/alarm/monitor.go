@@ -3,6 +3,7 @@ package alarm
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -149,8 +150,10 @@ func (m *AlarmMonitor) monitorLoop() {
 func (m *AlarmMonitor) checkAlarms() {
 	// Platform kontrolü yap
 	if m.platform == "mongo" {
-		// Sadece MongoDB servis durumunu ve failover durumunu kontrol et
+		// MongoDB servis durumunu ve failover durumunu kontrol et
 		m.checkMongoDBStatus()
+		// MongoDB yavaş sorgularını kontrol et
+		m.checkMongoSlowQueries()
 	} else if m.platform == "postgres" {
 		// PostgreSQL servis durumunu kontrol et
 		m.checkPostgreSQLServiceStatus()
@@ -428,6 +431,143 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 			m.alarmCache[failoverKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
 			log.Printf("MongoDB failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+		}
+	}
+}
+
+// checkMongoSlowQueries MongoDB'deki yavaş sorguları kontrol eder ve alarm gönderir
+func (m *AlarmMonitor) checkMongoSlowQueries() {
+	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
+		log.Printf("Slow query threshold değeri ayarlanmamış")
+		return
+	}
+
+	// MongoDB kolektörünü oluştur
+	mongoCollector := mongo.NewMongoCollector(m.config)
+	client, err := mongoCollector.GetClient()
+	if err != nil {
+		log.Printf("MongoDB bağlantısı açılamadı: %v", err)
+		return
+	}
+	defer client.Disconnect(context.Background())
+
+	// Yavaş sorguları saklamak için slice
+	slowQueries := []string{}
+	maxDuration := float64(0)
+	primaryDatabase := ""
+
+	// Tüm veritabanlarını kontrol et
+	databases, err := client.ListDatabaseNames(context.Background(), map[string]interface{}{})
+	if err != nil {
+		log.Printf("Veritabanları listelenemedi: %v", err)
+		return
+	}
+
+	for _, dbName := range databases {
+		// Admin ve config veritabanlarını atla
+		if dbName == "admin" || dbName == "config" || dbName == "local" {
+			continue
+		}
+
+		db := client.Database(dbName)
+
+		// Aktif operasyonları kontrol et
+		var currentOps map[string]interface{}
+		err = db.RunCommand(context.Background(), map[string]interface{}{
+			"currentOp": true,
+			"active":    true,
+		}).Decode(&currentOps)
+		if err != nil {
+			log.Printf("Aktif operasyonlar alınamadı (%s): %v", dbName, err)
+			continue
+		}
+
+		if inprog, ok := currentOps["inprog"].([]interface{}); ok {
+			for _, op := range inprog {
+				if opMap, ok := op.(map[string]interface{}); ok {
+					// Operasyon süresini kontrol et (secs_running)
+					if secs, ok := opMap["secs_running"].(float64); ok {
+						millis := secs * 1000
+						if millis >= float64(m.thresholds.SlowQueryThresholdMs) {
+							if millis > maxDuration {
+								maxDuration = millis
+								primaryDatabase = dbName
+							}
+
+							// Operasyon detaylarını al
+							ns := opMap["ns"].(string)
+							opType := opMap["op"].(string)
+							query := "N/A"
+							if q, ok := opMap["query"].(map[string]interface{}); ok {
+								queryBytes, _ := json.Marshal(q)
+								query = string(queryBytes)
+							} else if q, ok := opMap["command"].(map[string]interface{}); ok {
+								queryBytes, _ := json.Marshal(q)
+								query = string(queryBytes)
+							}
+
+							// Client bilgilerini al
+							clientInfo := "N/A"
+							if client, ok := opMap["client"].(string); ok {
+								clientInfo = client
+							}
+
+							// Operasyon ID'sini al
+							opId := "N/A"
+							if id, ok := opMap["opid"].(int64); ok {
+								opId = fmt.Sprintf("%d", id)
+							}
+
+							queryInfo := fmt.Sprintf("DB=%s, Collection=%s, Operation=%s, Duration=%.2fms, OpId=%s, Client=%s, Query=%s",
+								dbName, ns, opType, millis, opId, clientInfo, query)
+							slowQueries = append(slowQueries, queryInfo)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(slowQueries) > 0 {
+		alarmKey := "mongodb_slow_queries"
+
+		// Rate limiting kontrolü
+		m.alarmCacheLock.RLock()
+		prevAlarm, exists := m.alarmCache[alarmKey]
+		m.alarmCacheLock.RUnlock()
+
+		if exists {
+			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+			if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
+				log.Printf("MongoDB slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
+				return
+			}
+		}
+
+		message := fmt.Sprintf("Found %d active slow operations in MongoDB exceeding %dms threshold. Max duration: %.2fms\n%s",
+			len(slowQueries), m.thresholds.SlowQueryThresholdMs, maxDuration,
+			strings.Join(slowQueries, "\n"))
+
+		alarmEvent := &pb.AlarmEvent{
+			Id:          uuid.New().String(),
+			AlarmId:     alarmKey,
+			AgentId:     m.agentID,
+			Status:      "triggered",
+			MetricName:  "mongodb_slow_queries",
+			MetricValue: fmt.Sprintf("%.2f", maxDuration),
+			Message:     message,
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Severity:    "warning",
+			Database:    primaryDatabase,
+		}
+
+		if err := m.reportAlarm(alarmEvent); err != nil {
+			log.Printf("MongoDB slow query alarmı gönderilemedi: %v", err)
+		} else {
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = alarmEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("MongoDB slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	}
 }

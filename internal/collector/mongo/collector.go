@@ -1649,3 +1649,38 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 		strings.TrimSpace(outputStr),
 		strings.TrimSpace(checkOutputStr)), nil
 }
+
+// GetClient returns a new MongoDB client instance
+func (c *MongoCollector) GetClient() (*mongo.Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// MongoDB bağlantı URI'sini oluştur
+	uri := fmt.Sprintf("mongodb://%s:%s@%s:%s",
+		c.cfg.Mongo.User,
+		c.cfg.Mongo.Pass,
+		c.cfg.Mongo.Host,
+		c.cfg.Mongo.Port)
+
+	if c.cfg.Mongo.Replset != "" {
+		uri += fmt.Sprintf("/?replicaSet=%s", c.cfg.Mongo.Replset)
+	}
+
+	// MongoDB client options
+	clientOptions := options.Client().ApplyURI(uri)
+
+	// Yeni bir client oluştur ve bağlan
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("MongoDB client oluşturulamadı: %v", err)
+	}
+
+	// Bağlantıyı test et
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		client.Disconnect(ctx)
+		return nil, fmt.Errorf("MongoDB bağlantısı test edilemedi: %v", err)
+	}
+
+	return client, nil
+}

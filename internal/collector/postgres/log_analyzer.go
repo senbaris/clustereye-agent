@@ -86,7 +86,7 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	}
 	defer file.Close()
 
-	var logEntries []*pb.PostgresLogEntry        // Yavaş sorgular için
+	var logEntries []*pb.PostgresLogEntry        // Tüm geçerli girdiler
 	var last24HourEntries []*pb.PostgresLogEntry // Son 24 saatlik loglar
 	scanner := bufio.NewScanner(file)
 	totalLines := 0
@@ -145,8 +145,6 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 				} else {
 					buffer.message = append(buffer.message, line)
 				}
-			} else {
-				log.Printf("Bağlamsız satır atlanıyor: %s", line)
 			}
 		}
 	}
@@ -164,21 +162,11 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 		return nil, fmt.Errorf("log dosyası okuma hatası: %v", err)
 	}
 
-	// Eğer yavaş sorgu varsa onları, yoksa son 24 saatlik logları döndür
-	var resultEntries []*pb.PostgresLogEntry
-	if len(logEntries) > 0 {
-		resultEntries = logEntries
-		log.Printf("Yavaş sorgular döndürülüyor (%d adet)", len(logEntries))
-	} else {
-		resultEntries = last24HourEntries
-		log.Printf("Son 24 saatlik loglar döndürülüyor (%d adet)", len(last24HourEntries))
-	}
-
-	log.Printf("PostgreSQL log analizi tamamlandı: Toplam satır=%d, Geçerli girdiler=%d, Yavaş sorgular=%d, Çok satırlı sorgular=%d, Son 24 saat log sayısı=%d",
-		totalLines, validEntries, slowQueries, multiLineQueries, len(last24HourEntries))
+	log.Printf("PostgreSQL log analizi tamamlandı: Toplam satır=%d, Geçerli girdiler=%d, Yavaş sorgular=%d, Çok satırlı sorgular=%d",
+		totalLines, validEntries, slowQueries, multiLineQueries)
 
 	return &pb.PostgresLogAnalyzeResponse{
-		LogEntries: resultEntries,
+		LogEntries: logEntries, // Tüm geçerli girdileri döndür
 	}, nil
 }
 
@@ -262,16 +250,18 @@ func processBufferedEntry(buffer *LogBuffer) *pb.PostgresLogEntry {
 
 // processEntry handles a single log entry and updates the relevant collections
 func processEntry(entry *pb.PostgresLogEntry, logEntries, last24HourEntries *[]*pb.PostgresLogEntry, last24Hours int64, slowQueryThresholdMs int64, slowQueries *int) {
+	// Tüm geçerli girdileri logEntries'e ekle
+	*logEntries = append(*logEntries, entry)
+
 	// Son 24 saatlik logları ayrı bir slice'da tut
 	if entry.Timestamp >= last24Hours {
 		*last24HourEntries = append(*last24HourEntries, entry)
 		log.Printf("Son 24 saat logu bulundu: %s", entry.Message)
 	}
 
-	// Eğer duration değeri varsa ve eşiği geçiyorsa veya ERROR ise ekle
+	// Yavaş sorguları say
 	if entry.DurationMs > 0 && entry.DurationMs >= slowQueryThresholdMs {
 		*slowQueries++
-		*logEntries = append(*logEntries, entry)
 		log.Printf("Yavaş sorgu bulundu (%d ms): %s", entry.DurationMs, entry.InternalQuery)
 	}
 }
