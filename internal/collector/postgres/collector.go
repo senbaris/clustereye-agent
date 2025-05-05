@@ -334,16 +334,90 @@ func GetSystemMetrics() *pb.SystemMetrics {
 
 // getCPUUsage CPU kullanım yüzdesini döndürür
 func getCPUUsage() (float64, error) {
-	cmd := exec.Command("sh", "-c", "ps -A -o %cpu | awk '{s+=$1} END {print s}'")
+	// Linux sistemlerde /proc/stat kullan
+	if _, err := os.Stat("/proc/stat"); err == nil {
+		// İlk ölçüm
+		cpu1, err := readCPUStat()
+		if err != nil {
+			return 0, err
+		}
+
+		// 100ms bekle
+		time.Sleep(100 * time.Millisecond)
+
+		// İkinci ölçüm
+		cpu2, err := readCPUStat()
+		if err != nil {
+			return 0, err
+		}
+
+		// CPU kullanımını hesapla
+		totalDiff := cpu2.total - cpu1.total
+		if totalDiff == 0 {
+			return 0, nil
+		}
+
+		idleDiff := cpu2.idle - cpu1.idle
+		cpuUsage := 100 * (1 - float64(idleDiff)/float64(totalDiff))
+		return cpuUsage, nil
+	}
+
+	// Alternatif yöntem - top kullan
+	cmd := exec.Command("sh", "-c", "top -bn1 | grep '%Cpu' | awk '{print $2}'")
 	out, err := cmd.Output()
 	if err != nil {
-		return 0, err
+		// Son çare olarak ps komutunu kullan
+		cmd = exec.Command("sh", "-c", "ps -A -o %cpu | awk '{s+=$1} END {print s}'")
+		out, err = cmd.Output()
+		if err != nil {
+			return 0, err
+		}
 	}
+
 	cpuPercent, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 	if err != nil {
 		return 0, err
 	}
 	return cpuPercent, nil
+}
+
+type cpuStat struct {
+	idle  uint64
+	total uint64
+}
+
+func readCPUStat() (*cpuStat, error) {
+	contents, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(contents), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "cpu" {
+			// CPU times: user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+			var total uint64
+			numbers := make([]uint64, len(fields)-1)
+
+			for i := 1; i < len(fields); i++ {
+				num, err := strconv.ParseUint(fields[i], 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				numbers[i-1] = num
+				total += num
+			}
+
+			// idle is the 4th field (index 3)
+			return &cpuStat{
+				idle:  numbers[3],
+				total: total,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("CPU stats not found in /proc/stat")
 }
 
 // getCPUCores CPU çekirdek sayısını döndürür
