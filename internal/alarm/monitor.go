@@ -449,6 +449,9 @@ func (m *AlarmMonitor) checkSlowQueries() {
 		WHERE state = 'active'
 		AND query NOT ILIKE '%%pg_stat_activity%%'
 		AND query NOT ILIKE '%%START_REPLICATION SLOT%%'
+		AND query NOT ILIKE '%%autovacuum: %%'   -- Autovacuum sorgularını hariç tut
+		AND query NOT ILIKE '%%VACUUM %%'        -- Manual VACUUM sorgularını da hariç tut
+		AND query NOT ILIKE '%%EXPLAIN%%'        -- EXPLAIN sorgularını hariç tut
 		AND query_start < now() - interval '%d milliseconds'
 	`, m.thresholds.SlowQueryThresholdMs)
 
@@ -495,8 +498,10 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			usernameStr = username.String
 		}
 
-		slowQueries = append(slowQueries, fmt.Sprintf("PID=%d, User=%s, DB=%s, Duration=%.2fms, Query=%s",
-			pid, usernameStr, database, durationMs, queryText))
+		// Sorgu metnini kırpmadan ekle - uzun sorgular için de tam metin gönderilsin
+		queryInfo := fmt.Sprintf("PID=%d, User=%s, DB=%s, Duration=%.2fms, Query=%s",
+			pid, usernameStr, database, durationMs, queryText)
+		slowQueries = append(slowQueries, queryInfo)
 	}
 
 	if len(slowQueries) > 0 {
@@ -515,9 +520,10 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			}
 		}
 
+		// Tüm yavaş sorguları göster (sınırlama olmadan)
 		message := fmt.Sprintf("Found %d slow queries exceeding %dms threshold. Max duration: %.2fms\n%s",
 			len(slowQueries), m.thresholds.SlowQueryThresholdMs, maxDuration,
-			strings.Join(slowQueries[:min(3, len(slowQueries))], "\n"))
+			strings.Join(slowQueries, "\n"))
 
 		alarmEvent := &pb.AlarmEvent{
 			Id:          uuid.New().String(),

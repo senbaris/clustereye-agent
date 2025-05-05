@@ -1231,6 +1231,72 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
+				// Sistem metrikleri sorgusu için özel işleme
+				if query.Command == "get_system_metrics" {
+					log.Printf("Sistem metrikleri sorgusu alındı (QueryID: %s)", query.QueryId)
+
+					// Metrikleri topla
+					metrics := postgres.GetSystemMetrics()
+
+					// Metrics verilerini structpb.Struct formatına dönüştür
+					metricsStruct := &structpb.Struct{
+						Fields: map[string]*structpb.Value{
+							"cpu_usage":        structpb.NewNumberValue(metrics.CpuUsage),
+							"cpu_cores":        structpb.NewNumberValue(float64(metrics.CpuCores)),
+							"memory_usage":     structpb.NewNumberValue(metrics.MemoryUsage),
+							"total_memory":     structpb.NewNumberValue(float64(metrics.TotalMemory)),
+							"free_memory":      structpb.NewNumberValue(float64(metrics.FreeMemory)),
+							"load_average_1m":  structpb.NewNumberValue(metrics.LoadAverage_1M),
+							"load_average_5m":  structpb.NewNumberValue(metrics.LoadAverage_5M),
+							"load_average_15m": structpb.NewNumberValue(metrics.LoadAverage_15M),
+							"total_disk":       structpb.NewNumberValue(float64(metrics.TotalDisk)),
+							"free_disk":        structpb.NewNumberValue(float64(metrics.FreeDisk)),
+							"os_version":       structpb.NewStringValue(metrics.OsVersion),
+							"kernel_version":   structpb.NewStringValue(metrics.KernelVersion),
+							"uptime":           structpb.NewNumberValue(float64(metrics.Uptime)),
+						},
+					}
+
+					// structpb.Struct'ı Any tipine çevir
+					anyValue, err := anypb.New(metricsStruct)
+					if err != nil {
+						log.Printf("Metrics struct'ı Any tipine çevrilemedi: %v", err)
+						// Hata durumunda boş bir yanıt gönder
+						queryResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("Metrics struct'ı Any tipine çevrilemedi: %v", err),
+						}
+						sendQueryResult(r.stream, query.QueryId, queryResult)
+						isProcessingQuery = false
+						continue
+					}
+
+					// Yanıtı oluştur ve gönder
+					queryResult := &pb.QueryResult{
+						QueryId: query.QueryId,
+						Result:  anyValue,
+					}
+
+					// QueryResult mesajı olarak gönder
+					err = r.stream.Send(&pb.AgentMessage{
+						Payload: &pb.AgentMessage_QueryResult{
+							QueryResult: queryResult,
+						},
+					})
+
+					if err != nil {
+						log.Printf("Sistem metrikleri sorgusu yanıtı gönderilemedi: %v", err)
+						if err := r.reconnect(); err != nil {
+							log.Printf("Yeniden bağlantı başarısız: %v", err)
+						}
+					} else {
+						log.Printf("Sistem metrikleri sorgusu başarıyla yanıtlandı (QueryID: %s)", query.QueryId)
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
 				// PostgreSQL log dosyaları için özel işleme
 				if strings.HasPrefix(query.Command, "list_postgres_logs") {
 					log.Printf("PostgreSQL log dosyaları sorgusu tespit edildi")
