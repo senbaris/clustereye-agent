@@ -348,10 +348,16 @@ func getCPUUsage() (float64, error) {
 
 // getCPUCores CPU çekirdek sayısını döndürür
 func getCPUCores() (int32, error) {
-	cmd := exec.Command("sh", "-c", "sysctl -n hw.ncpu")
+	// Linux sistemlerde nproc komutunu kullan
+	cmd := exec.Command("nproc")
 	out, err := cmd.Output()
 	if err != nil {
-		return 0, err
+		// Alternatif olarak /proc/cpuinfo'dan say
+		cmd = exec.Command("sh", "-c", "grep -c processor /proc/cpuinfo")
+		out, err = cmd.Output()
+		if err != nil {
+			return 0, err
+		}
 	}
 	cores, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
 	if err != nil {
@@ -427,26 +433,23 @@ func GetTotalMemory() int64 {
 
 // getLoadAverage sistem yükünü döndürür
 func getLoadAverage() ([]float64, error) {
-	cmd := exec.Command("sh", "-c", "sysctl -n vm.loadavg")
-	out, err := cmd.Output()
+	// Linux sistemlerde /proc/loadavg dosyasını oku
+	content, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
 		return nil, err
 	}
 
-	// Çıktı formatı: { 1.23 1.45 1.67 }
-	loadStr := strings.TrimSpace(string(out))
-	loadStr = strings.Trim(loadStr, "{}")
-	loadStrs := strings.Fields(loadStr)
-
-	if len(loadStrs) < 3 {
-		return nil, fmt.Errorf("unexpected loadavg format: %s", loadStr)
+	// Çıktı formatı: "0.00 0.00 0.00 ..."
+	fields := strings.Fields(string(content))
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("unexpected loadavg format: %s", content)
 	}
 
 	loads := make([]float64, 3)
 	for i := 0; i < 3; i++ {
-		load, err := strconv.ParseFloat(loadStrs[i], 64)
+		load, err := strconv.ParseFloat(fields[i], 64)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse load value: %s", loadStrs[i])
+			return nil, fmt.Errorf("failed to parse load value: %s", fields[i])
 		}
 		loads[i] = load
 	}
@@ -666,28 +669,44 @@ func getDiskUsage() (map[string]interface{}, error) {
 func getOSInfo() (map[string]string, error) {
 	osInfo := make(map[string]string)
 
-	// OS versiyonu
-	cmd := exec.Command("sh", "-c", "sw_vers -productVersion")
-	if out, err := cmd.Output(); err == nil {
-		osVersion := "macOS " + strings.TrimSpace(string(out))
-		// Boyut kontrolü - 50 karakterden uzunsa kısalt
-		if len(osVersion) > 50 {
-			osVersion = osVersion[:50]
+	// OS versiyonu için /etc/os-release dosyasını oku
+	content, err := os.ReadFile("/etc/os-release")
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "VERSION=") || strings.HasPrefix(line, "VERSION_ID=") {
+				version := strings.Trim(strings.SplitN(line, "=", 2)[1], "\"")
+				osInfo["os_version"] = version
+				break
+			}
 		}
-		osInfo["os_version"] = osVersion
-		log.Printf("OS Version: %s (length: %d)", osVersion, len(osVersion))
 	}
 
 	// Kernel versiyonu
-	cmd = exec.Command("sh", "-c", "uname -r")
+	cmd := exec.Command("uname", "-r")
 	if out, err := cmd.Output(); err == nil {
 		kernelVersion := strings.TrimSpace(string(out))
-		// Boyut kontrolü - 50 karakterden uzunsa kısalt
-		if len(kernelVersion) > 50 {
-			kernelVersion = kernelVersion[:50]
-		}
 		osInfo["kernel_version"] = kernelVersion
-		log.Printf("Kernel Version: %s (length: %d)", kernelVersion, len(kernelVersion))
+	}
+
+	// Eğer os_version alınamadıysa, alternatif yöntem dene
+	if _, exists := osInfo["os_version"]; !exists {
+		if _, err := os.Stat("/etc/redhat-release"); err == nil {
+			// CentOS/RHEL için
+			content, err := os.ReadFile("/etc/redhat-release")
+			if err == nil {
+				osInfo["os_version"] = strings.TrimSpace(string(content))
+			}
+		} else {
+			// Debian/Ubuntu için
+			cmd := exec.Command("lsb_release", "-d")
+			if out, err := cmd.Output(); err == nil {
+				desc := strings.TrimSpace(string(out))
+				if strings.HasPrefix(desc, "Description:") {
+					osInfo["os_version"] = strings.TrimSpace(strings.TrimPrefix(desc, "Description:"))
+				}
+			}
+		}
 	}
 
 	return osInfo, nil
@@ -695,16 +714,20 @@ func getOSInfo() (map[string]string, error) {
 
 // getUptime sistemin çalışma süresini saniye cinsinden döndürür
 func getUptime() (int64, error) {
-	cmd := exec.Command("sh", "-c", "sysctl -n kern.boottime | awk '{print $4}' | tr -d ','")
-	out, err := cmd.Output()
+	// Linux sistemlerde /proc/uptime dosyasını oku
+	content, err := os.ReadFile("/proc/uptime")
 	if err != nil {
 		return 0, err
 	}
-	bootTime, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+
+	// İlk alan uptime değeridir (saniye cinsinden)
+	uptime := strings.Fields(string(content))[0]
+	uptimeFloat, err := strconv.ParseFloat(uptime, 64)
 	if err != nil {
 		return 0, err
 	}
-	return time.Now().Unix() - bootTime, nil
+
+	return int64(uptimeFloat), nil
 }
 
 // isMatchingPostgresLogName dosya adının PostgreSQL log dosyası kalıbına uyup uymadığını kontrol eder
