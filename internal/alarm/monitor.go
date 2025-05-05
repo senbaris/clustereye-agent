@@ -3,7 +3,6 @@ package alarm
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +18,8 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 const (
@@ -457,7 +458,7 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 	primaryDatabase := ""
 
 	// Tüm veritabanlarını kontrol et
-	databases, err := client.ListDatabaseNames(context.Background(), map[string]interface{}{})
+	databases, err := client.ListDatabaseNames(context.Background(), bson.D{})
 	if err != nil {
 		log.Printf("Veritabanları listelenemedi: %v", err)
 		return
@@ -472,19 +473,19 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		db := client.Database(dbName)
 
 		// Aktif operasyonları kontrol et
-		var currentOps map[string]interface{}
-		err = db.RunCommand(context.Background(), map[string]interface{}{
-			"currentOp": true,
-			"active":    true,
+		var currentOps bson.M
+		err = db.RunCommand(context.Background(), bson.D{
+			{Key: "currentOp", Value: true},
+			{Key: "active", Value: true},
 		}).Decode(&currentOps)
 		if err != nil {
 			log.Printf("Aktif operasyonlar alınamadı (%s): %v", dbName, err)
 			continue
 		}
 
-		if inprog, ok := currentOps["inprog"].([]interface{}); ok {
+		if inprog, ok := currentOps["inprog"].(primitive.A); ok {
 			for _, op := range inprog {
-				if opMap, ok := op.(map[string]interface{}); ok {
+				if opMap, ok := op.(bson.M); ok {
 					// Operasyon süresini kontrol et (secs_running)
 					if secs, ok := opMap["secs_running"].(float64); ok {
 						millis := secs * 1000
@@ -498,11 +499,11 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 							ns := opMap["ns"].(string)
 							opType := opMap["op"].(string)
 							query := "N/A"
-							if q, ok := opMap["query"].(map[string]interface{}); ok {
-								queryBytes, _ := json.Marshal(q)
+							if q, ok := opMap["query"].(bson.M); ok {
+								queryBytes, _ := bson.MarshalExtJSON(q, true, true)
 								query = string(queryBytes)
-							} else if q, ok := opMap["command"].(map[string]interface{}); ok {
-								queryBytes, _ := json.Marshal(q)
+							} else if q, ok := opMap["command"].(bson.M); ok {
+								queryBytes, _ := bson.MarshalExtJSON(q, true, true)
 								query = string(queryBytes)
 							}
 
