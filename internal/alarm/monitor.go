@@ -443,6 +443,8 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		return
 	}
 
+	log.Printf("MongoDB yavaş sorgu kontrolü başlıyor. Threshold: %d ms", m.thresholds.SlowQueryThresholdMs)
+
 	// MongoDB kolektörünü oluştur
 	mongoCollector := mongo.NewMongoCollector(m.config)
 	client, err := mongoCollector.GetClient()
@@ -463,70 +465,99 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 	err = adminDB.RunCommand(context.Background(), bson.D{
 		{Key: "currentOp", Value: true},
 		{Key: "active", Value: true},
+		{Key: "microsecs_running", Value: bson.D{{Key: "$exists", Value: true}}},
 	}).Decode(&currentOps)
 	if err != nil {
 		log.Printf("Admin veritabanında currentOp komutu çalıştırılamadı: %v", err)
 		return
 	}
 
+	log.Printf("currentOp komutu başarıyla çalıştırıldı, sonuçlar işleniyor...")
+
 	if inprog, ok := currentOps["inprog"].(primitive.A); ok {
+		log.Printf("Toplam %d aktif operasyon bulundu", len(inprog))
 		for _, op := range inprog {
 			if opMap, ok := op.(bson.M); ok {
-				// Operasyon süresini kontrol et (secs_running)
-				if secs, ok := opMap["secs_running"].(float64); ok {
-					millis := secs * 1000
-					if millis >= float64(m.thresholds.SlowQueryThresholdMs) {
-						// Veritabanı adını al
-						dbName := "unknown"
-						if ns, ok := opMap["ns"].(string); ok && ns != "" {
-							parts := strings.SplitN(ns, ".", 2)
-							if len(parts) > 0 {
-								dbName = parts[0]
-							}
-						}
+				// Debug için operasyon detaylarını logla
+				opBytes, _ := bson.MarshalExtJSON(opMap, true, true)
+				log.Printf("İşlenen operasyon: %s", string(opBytes))
 
-						// Admin ve config veritabanlarını atla
-						if dbName == "admin" || dbName == "config" || dbName == "local" {
-							continue
-						}
+				var durationMs float64
 
-						if millis > maxDuration {
-							maxDuration = millis
-							primaryDatabase = dbName
-						}
+				// Önce microsecs_running'i kontrol et (daha hassas)
+				if microsecs, ok := opMap["microsecs_running"].(int64); ok {
+					durationMs = float64(microsecs) / 1000.0
+					log.Printf("Operasyon süresi (microsecs_running): %.2f ms", durationMs)
+				} else if secs, ok := opMap["secs_running"].(float64); ok {
+					durationMs = secs * 1000
+					log.Printf("Operasyon süresi (secs_running): %.2f ms", durationMs)
+				} else {
+					log.Printf("Operasyon süresi bulunamadı")
+					continue
+				}
 
-						// Operasyon detaylarını al
-						ns := opMap["ns"].(string)
-						opType := opMap["op"].(string)
-						query := "N/A"
-						if q, ok := opMap["query"].(bson.M); ok {
-							queryBytes, _ := bson.MarshalExtJSON(q, true, true)
-							query = string(queryBytes)
-						} else if q, ok := opMap["command"].(bson.M); ok {
-							queryBytes, _ := bson.MarshalExtJSON(q, true, true)
-							query = string(queryBytes)
-						}
+				if durationMs >= float64(m.thresholds.SlowQueryThresholdMs) {
+					log.Printf("Yavaş sorgu tespit edildi! Süre: %.2f ms (Threshold: %d ms)",
+						durationMs, m.thresholds.SlowQueryThresholdMs)
 
-						// Client bilgilerini al
-						clientInfo := "N/A"
-						if client, ok := opMap["client"].(string); ok {
-							clientInfo = client
+					// Veritabanı adını al
+					dbName := "unknown"
+					if ns, ok := opMap["ns"].(string); ok && ns != "" {
+						parts := strings.SplitN(ns, ".", 2)
+						if len(parts) > 0 {
+							dbName = parts[0]
 						}
-
-						// Operasyon ID'sini al
-						opId := "N/A"
-						if id, ok := opMap["opid"].(int64); ok {
-							opId = fmt.Sprintf("%d", id)
-						}
-
-						queryInfo := fmt.Sprintf("DB=%s, Collection=%s, Operation=%s, Duration=%.2fms, OpId=%s, Client=%s, Query=%s",
-							dbName, ns, opType, millis, opId, clientInfo, query)
-						slowQueries = append(slowQueries, queryInfo)
 					}
+
+					// Admin ve config veritabanlarını atla
+					if dbName == "admin" || dbName == "config" || dbName == "local" {
+						log.Printf("Sistem veritabanı sorgusu atlanıyor: %s", dbName)
+						continue
+					}
+
+					if durationMs > maxDuration {
+						maxDuration = durationMs
+						primaryDatabase = dbName
+					}
+
+					// Operasyon detaylarını al
+					ns := opMap["ns"].(string)
+					opType := opMap["op"].(string)
+					query := "N/A"
+					if q, ok := opMap["query"].(bson.M); ok {
+						queryBytes, _ := bson.MarshalExtJSON(q, true, true)
+						query = string(queryBytes)
+					} else if q, ok := opMap["command"].(bson.M); ok {
+						queryBytes, _ := bson.MarshalExtJSON(q, true, true)
+						query = string(queryBytes)
+					}
+
+					// Client bilgilerini al
+					clientInfo := "N/A"
+					if client, ok := opMap["client"].(string); ok {
+						clientInfo = client
+					}
+
+					// Operasyon ID'sini al
+					opId := "N/A"
+					if id, ok := opMap["opid"].(int64); ok {
+						opId = fmt.Sprintf("%d", id)
+					}
+
+					queryInfo := fmt.Sprintf("DB=%s, Collection=%s, Operation=%s, Duration=%.2fms, OpId=%s, Client=%s, Query=%s",
+						dbName, ns, opType, durationMs, opId, clientInfo, query)
+					slowQueries = append(slowQueries, queryInfo)
+					log.Printf("Yavaş sorgu eklendi: %s", queryInfo)
+				} else {
+					log.Printf("Normal süreli sorgu: %.2f ms", durationMs)
 				}
 			}
 		}
+	} else {
+		log.Printf("Aktif operasyonlar listesi bulunamadı veya boş")
 	}
+
+	log.Printf("Toplam %d yavaş sorgu bulundu", len(slowQueries))
 
 	if len(slowQueries) > 0 {
 		alarmKey := "mongodb_slow_queries"
