@@ -478,28 +478,19 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		log.Printf("Toplam %d aktif operasyon bulundu", len(inprog))
 		for _, op := range inprog {
 			if opMap, ok := op.(bson.M); ok {
-				// Debug için operasyon detaylarını logla
-				opBytes, _ := bson.MarshalExtJSON(opMap, true, true)
-				log.Printf("İşlenen operasyon: %s", string(opBytes))
-
+				// Debug için operasyon detaylarını loglamayı kaldır
 				var durationMs float64
 
 				// Önce microsecs_running'i kontrol et (daha hassas)
 				if microsecs, ok := opMap["microsecs_running"].(int64); ok {
 					durationMs = float64(microsecs) / 1000.0
-					log.Printf("Operasyon süresi (microsecs_running): %.2f ms", durationMs)
 				} else if secs, ok := opMap["secs_running"].(float64); ok {
 					durationMs = secs * 1000
-					log.Printf("Operasyon süresi (secs_running): %.2f ms", durationMs)
 				} else {
-					log.Printf("Operasyon süresi bulunamadı")
 					continue
 				}
 
 				if durationMs >= float64(m.thresholds.SlowQueryThresholdMs) {
-					log.Printf("Yavaş sorgu tespit edildi! Süre: %.2f ms (Threshold: %d ms)",
-						durationMs, m.thresholds.SlowQueryThresholdMs)
-
 					// Veritabanı adını al
 					dbName := "unknown"
 					if ns, ok := opMap["ns"].(string); ok && ns != "" {
@@ -509,9 +500,23 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 						}
 					}
 
-					// Admin ve config veritabanlarını atla
+					// Sadece belirli sistem operasyonlarını atla
+					skipQuery := false
 					if dbName == "admin" || dbName == "config" || dbName == "local" {
-						log.Printf("Sistem veritabanı sorgusu atlanıyor: %s", dbName)
+						// Command'i kontrol et
+						if cmd, ok := opMap["command"].(bson.M); ok {
+							// Sadece belirli admin komutlarını atla
+							if _, isHello := cmd["hello"]; isHello {
+								skipQuery = true
+							} else if _, isIsMaster := cmd["isMaster"]; isIsMaster {
+								skipQuery = true
+							} else if _, isReplSetGetStatus := cmd["replSetGetStatus"]; isReplSetGetStatus {
+								skipQuery = true
+							}
+						}
+					}
+
+					if skipQuery {
 						continue
 					}
 
@@ -547,19 +552,13 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 					queryInfo := fmt.Sprintf("DB=%s, Collection=%s, Operation=%s, Duration=%.2fms, OpId=%s, Client=%s, Query=%s",
 						dbName, ns, opType, durationMs, opId, clientInfo, query)
 					slowQueries = append(slowQueries, queryInfo)
-					log.Printf("Yavaş sorgu eklendi: %s", queryInfo)
-				} else {
-					log.Printf("Normal süreli sorgu: %.2f ms", durationMs)
 				}
 			}
 		}
-	} else {
-		log.Printf("Aktif operasyonlar listesi bulunamadı veya boş")
 	}
 
-	log.Printf("Toplam %d yavaş sorgu bulundu", len(slowQueries))
-
 	if len(slowQueries) > 0 {
+		log.Printf("Toplam %d yavaş sorgu tespit edildi. En uzun süren sorgu: %.2f ms", len(slowQueries), maxDuration)
 		alarmKey := "mongodb_slow_queries"
 
 		// Rate limiting kontrolü
