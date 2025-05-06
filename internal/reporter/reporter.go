@@ -3022,61 +3022,106 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		log.Printf("Explain alanı tespit edildi")
 
 		// explain değeri map olabilir
-		explainObject, isMap := explainValue.(map[string]interface{})
-		if isMap {
+		var explainObject map[string]interface{}
+
+		switch v := explainValue.(type) {
+		case map[string]interface{}:
+			explainObject = v
+		case bson.M:
+			explainObject = map[string]interface{}(v)
+		default:
+			// JSON dönüşümü dene
+			if jsonBytes, err := json.Marshal(explainValue); err == nil {
+				if err := json.Unmarshal(jsonBytes, &explainObject); err != nil {
+					log.Printf("Explain değeri JSON parse edilemedi: %v", err)
+				}
+			}
+		}
+
+		if explainObject != nil {
 			log.Printf("Explain bir map/object: %+v", explainObject)
 
-			// explainObject içinde "find" alanı olması beklenir
+			// Find komutu var mı kontrol et
 			if findValue, hasFind := explainObject["find"]; hasFind {
-				log.Printf("Nested find bulundu: %v", findValue)
+				log.Printf("Find komutu bulundu: %v", findValue)
 
-				// Doğru formatı oluştur: {find: collection, filter: {...}, ...}
-				commandToExplain = bson.D{{Key: "find", Value: findValue}}
+				// Find komutunu oluştur
+				findCmd := bson.D{{Key: "find", Value: findValue}}
 
-				// Diğer parametreleri ekle
+				// Filter varsa ekle
+				if filterValue, hasFilter := explainObject["filter"]; hasFilter {
+					findCmd = append(findCmd, bson.E{Key: "filter", Value: filterValue})
+				}
+
+				// Diğer parametreleri ekle (sort, limit, skip vb.)
 				for k, v := range explainObject {
-					if k != "find" {
-						commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
+					if k != "find" && k != "filter" {
+						findCmd = append(findCmd, bson.E{Key: k, Value: v})
 					}
 				}
+
+				// Explain komutunu oluştur
+				explainOpts := bson.D{
+					{Key: "explain", Value: findCmd},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+
+				log.Printf("MongoDB find explain komutu: %+v", explainOpts)
+				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 			} else if aggValue, hasAgg := explainObject["aggregate"]; hasAgg {
-				log.Printf("Nested aggregate bulundu: %v", aggValue)
+				log.Printf("Aggregate komutu bulundu: %v", aggValue)
 
-				// Aggregate komutu
-				commandToExplain = bson.D{{Key: "aggregate", Value: aggValue}}
+				// Aggregate komutunu oluştur
+				aggCmd := bson.D{{Key: "aggregate", Value: aggValue}}
+
+				// Pipeline varsa ekle
+				if pipelineValue, hasPipeline := explainObject["pipeline"]; hasPipeline {
+					aggCmd = append(aggCmd, bson.E{Key: "pipeline", Value: pipelineValue})
+				}
+
+				// Cursor varsa ekle
+				if cursorValue, hasCursor := explainObject["cursor"]; hasCursor {
+					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: cursorValue})
+				} else {
+					// MongoDB varsayılan cursor ekle
+					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: bson.D{}})
+				}
 
 				// Diğer parametreleri ekle
 				for k, v := range explainObject {
-					if k != "aggregate" {
-						commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
+					if k != "aggregate" && k != "pipeline" && k != "cursor" {
+						aggCmd = append(aggCmd, bson.E{Key: k, Value: v})
 					}
 				}
+
+				// Explain komutunu oluştur
+				explainOpts := bson.D{
+					{Key: "explain", Value: aggCmd},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+
+				log.Printf("MongoDB aggregate explain komutu: %+v", explainOpts)
+				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 			} else {
-				log.Printf("Explain içinde tanınabilir komut bulunamadı, olduğu gibi gönderiliyor")
-				// Explain içeriğini doğrudan açıklamaya çalış
+				log.Printf("Explain içinde tanınabilir komut bulunamadı")
+
+				// Explain içeriğini doğrudan komut olarak kullan
 				explainOpts := bson.D{
 					{Key: "explain", Value: explainObject},
 					{Key: "verbosity", Value: "allPlansExecution"},
 				}
+
+				log.Printf("MongoDB genel explain komutu: %+v", explainOpts)
 				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 			}
 		} else {
-			// explainValue bir string/primitive olabilir
-			log.Printf("Explain primitif bir değer: %v", explainValue)
+			// explainValue bir primitive değer
+			log.Printf("Explain bir primitive değer: %v", explainValue)
 			explainOpts := bson.D{
 				{Key: "explain", Value: explainValue},
 				{Key: "verbosity", Value: "allPlansExecution"},
 			}
-			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
-		}
-
-		// CommandToExplain oluşturulduysa çalıştır
-		if commandToExplain != nil {
-			explainOpts := bson.D{
-				{Key: "explain", Value: commandToExplain},
-				{Key: "verbosity", Value: "allPlansExecution"},
-			}
-			log.Printf("MongoDB explain komut: %+v", explainOpts)
+			log.Printf("MongoDB primitive explain komutu: %+v", explainOpts)
 			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 		}
 	}
@@ -3151,21 +3196,69 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		// Son çare - admin veritabanında dene
 		adminDB := client.Database("admin")
 
-		if commandToExplain != nil {
-			explainOpts := bson.D{
-				{Key: "explain", Value: commandToExplain},
-				{Key: "verbosity", Value: "allPlansExecution"},
+		// Explain komutunu yeniden oluştur
+		var explainCmd bson.D
+
+		// Eğer explain içinde find/aggregate varsa, doğrudan o komutu kullan
+		if explainValue, hasExplain := coreCmdDoc["explain"]; hasExplain {
+			if explainMap, ok := explainValue.(map[string]interface{}); ok {
+				if findValue, hasFind := explainMap["find"]; hasFind {
+					// Find komutu
+					findCmd := bson.D{{Key: "find", Value: findValue}}
+
+					// Filter varsa ekle
+					if filterValue, hasFilter := explainMap["filter"]; hasFilter {
+						findCmd = append(findCmd, bson.E{Key: "filter", Value: filterValue})
+					}
+
+					// Diğer parametreleri ekle
+					for k, v := range explainMap {
+						if k != "find" && k != "filter" {
+							findCmd = append(findCmd, bson.E{Key: k, Value: v})
+						}
+					}
+
+					explainCmd = bson.D{
+						{Key: "explain", Value: findCmd},
+						{Key: "verbosity", Value: "allPlansExecution"},
+					}
+				} else if aggValue, hasAgg := explainMap["aggregate"]; hasAgg {
+					// Aggregate komutu
+					aggCmd := bson.D{{Key: "aggregate", Value: aggValue}}
+
+					// Pipeline varsa ekle
+					if pipelineValue, hasPipeline := explainMap["pipeline"]; hasPipeline {
+						aggCmd = append(aggCmd, bson.E{Key: "pipeline", Value: pipelineValue})
+					}
+
+					// Cursor ekle
+					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: bson.D{}})
+
+					// Diğer parametreleri ekle
+					for k, v := range explainMap {
+						if k != "aggregate" && k != "pipeline" && k != "cursor" {
+							aggCmd = append(aggCmd, bson.E{Key: k, Value: v})
+						}
+					}
+
+					explainCmd = bson.D{
+						{Key: "explain", Value: aggCmd},
+						{Key: "verbosity", Value: "allPlansExecution"},
+					}
+				}
 			}
-			log.Printf("Admin veritabanında explain deneniyor: %+v", explainOpts)
-			err = adminDB.RunCommand(ctx, explainOpts).Decode(&explainResult)
-		} else {
-			explainOpts := bson.D{
+		}
+
+		// Eğer özel bir komut oluşturulmadıysa, varsayılan explain kullan
+		if len(explainCmd) == 0 {
+			explainCmd = bson.D{
 				{Key: "explain", Value: coreCmdDoc},
 				{Key: "verbosity", Value: "allPlansExecution"},
 			}
-			log.Printf("Admin veritabanında genel explain deneniyor: %+v", explainOpts)
-			err = adminDB.RunCommand(ctx, explainOpts).Decode(&explainResult)
 		}
+
+		log.Printf("Admin veritabanında explain deneniyor: %+v", explainCmd)
+		err = adminDB.RunCommand(ctx, explainCmd).Decode(&explainResult)
 
 		if err != nil {
 			errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
