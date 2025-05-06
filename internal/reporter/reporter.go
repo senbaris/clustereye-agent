@@ -1904,7 +1904,7 @@ func (r *Reporter) listenForCommands() {
 							if len(parts) >= 3 {
 								// Format: MONGO_EXPLAIN|<database>|<query_json>
 								database = parts[1]
-								queryStr = parts[2]
+								queryStr = strings.Join(parts[2:], "|") // Eğer sorgu içinde | karakteri varsa birleştir
 								log.Printf("Protokol parse edildi: database=%s, sorgu uzunluğu=%d",
 									database, len(queryStr))
 							} else if len(parts) == 2 {
@@ -1931,14 +1931,53 @@ func (r *Reporter) listenForCommands() {
 							log.Printf("MongoDB sorgusu: %s", queryStr)
 						}
 
+						// Sorgu formatını kontrol et - eğer JSON wrapper formatındaysa parse et
+						var finalQuery string
+						if strings.Contains(queryStr, "\"database\"") && strings.Contains(queryStr, "\"query\"") {
+							log.Printf("JSON wrapper formatı tespit edildi, içerik çıkarılıyor")
+
+							// JSON'u parse et ve içindeki sorguyu al
+							var wrapper struct {
+								Database string          `json:"database"`
+								Query    json.RawMessage `json:"query"`
+							}
+
+							if err := json.Unmarshal([]byte(queryStr), &wrapper); err == nil {
+								// Database'i güncelle
+								if wrapper.Database != "" && wrapper.Database != "null" {
+									database = wrapper.Database
+									log.Printf("JSON wrapper'dan veritabanı alındı: %s", database)
+								}
+
+								// İç sorguyu çıkar
+								finalQuery = string(wrapper.Query)
+
+								// Eğer sorgu çift tırnak içindeyse, string escape karakterleri temizle
+								if strings.HasPrefix(finalQuery, "\"") && strings.HasSuffix(finalQuery, "\"") {
+									unquoted, err := strconv.Unquote(finalQuery)
+									if err == nil {
+										finalQuery = unquoted
+										log.Printf("String unquote başarılı, temizlenmiş sorgu uzunluğu: %d", len(finalQuery))
+									} else {
+										log.Printf("String unquote başarısız: %v", err)
+									}
+								}
+							} else {
+								log.Printf("JSON wrapper parse hatası: %v, ham sorgu kullanılacak", err)
+								finalQuery = queryStr
+							}
+						} else {
+							finalQuery = queryStr
+						}
+
 						// Hostname'den agentID oluştur
 						hostname, _ := os.Hostname()
 						agentID := "agent_" + hostname
 
 						explainReq := &pb.ExplainQueryRequest{
 							AgentId:  agentID,
-							Database: database, // Protokolden gelen veya orijinal database
-							Query:    queryStr, // Protokolden çıkarılan sorgu
+							Database: database,   // Protokolden gelen veya orijinal database
+							Query:    finalQuery, // İşlenmiş sorgu
 						}
 
 						explainResp, err := r.ExplainMongoQuery(context.Background(), explainReq)
@@ -2798,7 +2837,10 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	}
 
 	// Detaylı sorgu incelemesi - sorgu formatı analizi
-	log.Printf("Gelen ham sorgu string (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+	if len(req.Query) > 0 {
+		log.Printf("Gelen ham sorgu string (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+	}
+
 	log.Printf("Sorgu uzunluğu: %d bytes", len(req.Query))
 	// İlk 10 byte'ı hex formatında logla
 	if len(req.Query) > 0 {
@@ -2811,7 +2853,9 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		log.Printf("Server protokol formatı tespit edildi: MONGODB_EXPLAIN|| prefixli sorgu")
 		// Prefix'i kaldır ve asıl sorguyu al
 		req.Query = strings.TrimPrefix(req.Query, "MONGODB_EXPLAIN||")
-		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+		if len(req.Query) > 0 {
+			log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+		}
 	} else if strings.HasPrefix(req.Query, "MONGO_EXPLAIN|") {
 		log.Printf("Server protokol formatı tespit edildi: MONGO_EXPLAIN| prefixli sorgu")
 		// Protokol formatını parse et
@@ -2820,17 +2864,20 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 			// Format: MONGO_EXPLAIN|<database>|<query_json>
 			// Database bilgisini güncelle
 			newDatabase := parts[1]
-			if newDatabase != "" && req.Database == "" {
+			if newDatabase != "" && newDatabase != "null" {
 				req.Database = newDatabase
 				log.Printf("Protokolden veritabanı alındı: %s", req.Database)
 			}
-			// Sorguyu güncelle
-			req.Query = parts[2]
+			// Sorguyu güncelle - 2. indeksten sonraki tüm parçaları birleştir
+			// (sorgu içinde pipe karakteri olabilir)
+			req.Query = strings.Join(parts[2:], "|")
 		} else if len(parts) == 2 {
 			// Format: MONGO_EXPLAIN|<query_json>
 			req.Query = parts[1]
 		}
-		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+		if len(req.Query) > 0 {
+			log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+		}
 	}
 
 	// Sorgunun içeriğini kontrol et, eğer {"database": "...", "query": ...} formatında ise, iç sorguyu çıkar
@@ -2845,7 +2892,7 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 
 		if err := json.Unmarshal([]byte(req.Query), &wrapper); err == nil {
 			// Database bilgisini güncelle eğer boşsa
-			if wrapper.Database != "" && req.Database == "" {
+			if wrapper.Database != "" && wrapper.Database != "null" && req.Database == "" {
 				req.Database = wrapper.Database
 				log.Printf("JSON içinden veritabanı alındı: %s", req.Database)
 			}
@@ -2888,70 +2935,44 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	}
 	defer client.Disconnect(context.Background())
 
-	// Sorgu tipini tespit etme
-	var explainResult bson.M
-	queryString := req.Query
+	// Sorgu JSON string formatını debug et
+	log.Printf("MongoDB sorgu JSON string: %s", req.Query)
 
-	// JSON formatını analiz et - başta ve sonda olabilecek boşlukları temizle
-	queryString = strings.TrimSpace(queryString)
+	// Önce sorguyu temizle - gereksiz boşlukları ve özel karakterleri temizle
+	cleanedQuery := strings.TrimSpace(req.Query)
+	cleanedQuery = strings.ReplaceAll(cleanedQuery, "\n", " ")
+	cleanedQuery = strings.ReplaceAll(cleanedQuery, "\r", "")
+	cleanedQuery = strings.ReplaceAll(cleanedQuery, "\t", " ")
 
-	// Log JSON string formatını debug etmek için
-	log.Printf("MongoDB sorgu JSON string: %s", queryString)
-
-	// BSON/JSON parse etme
-	// Önce MongoDB Extended JSON formatını normal haline getirip decode edelim
-	// Tüm yeni satır ve boşlukları temizleyelim
-	queryString = strings.ReplaceAll(queryString, "\n", " ")
-	queryString = strings.ReplaceAll(queryString, "\r", "")
-	queryString = strings.ReplaceAll(queryString, "\t", " ")
-
-	// Gereksiz boşlukları temizleyelim
-	// Birden fazla boşluğu tek boşluğa indirgeme
-	for strings.Contains(queryString, "  ") {
-		queryString = strings.ReplaceAll(queryString, "  ", " ")
+	// Gereksiz boşlukları tek boşluğa indirge
+	for strings.Contains(cleanedQuery, "  ") {
+		cleanedQuery = strings.ReplaceAll(cleanedQuery, "  ", " ")
 	}
 
-	log.Printf("Temizlenmiş sorgu: %s", queryString)
+	log.Printf("Temizlenmiş sorgu: %s", cleanedQuery)
 
-	// Doğrudan MongoDB sürücüsünün BSON parser'ını kullanalım
+	// Sorguyu parse et
 	var queryDoc bson.M
-	err = bson.UnmarshalExtJSON([]byte(queryString), true, &queryDoc)
+	var explainResult bson.M
 
+	// Önce BSON parser dene
+	err = bson.UnmarshalExtJSON([]byte(cleanedQuery), true, &queryDoc)
 	if err != nil {
-		log.Printf("MongoDB Extended JSON parse hatası: %v", err)
-		log.Printf("Parse hata detayı: %T - %v", err, err)
+		log.Printf("BSON parse hatası: %v, standart JSON parser deneniyor", err)
 
-		// JSON parse hatasından önce, sorgunun geçerli JSON olup olmadığını kontrol et
-		if !isValidJSON(queryString) {
-			log.Printf("Sorgu geçerli bir JSON değil, server protokol formatı tekrar kontrol ediliyor...")
-
-			// JSON değilse ve server protokol formatı olabilir, başka bir ayrıştırma dene
-			if strings.Contains(queryString, "MONGODB_EXPLAIN") {
-				log.Printf("Sorgu içinde 'MONGODB_EXPLAIN' ifadesi bulundu, protokol formatı olabilir")
-				parts := strings.Split(queryString, "||")
-				if len(parts) > 1 {
-					queryString = parts[1]
-					log.Printf("Protokol ayrıştırması sonrası sorgu: %s", queryString)
-				}
-			}
-		}
-
-		// BSON parser başarısız olursa, standart JSON parser'ı deneyelim
-		err = json.Unmarshal([]byte(queryString), &queryDoc)
-
+		// Standart JSON parser'ı dene
+		err = json.Unmarshal([]byte(cleanedQuery), &queryDoc)
 		if err != nil {
-			log.Printf("Standart JSON parse de başarısız: %v", err)
+			log.Printf("JSON parse de başarısız: %v", err)
 
-			// Sorgu geldiği gibi MongoDB'ye göndermeyi deneyelim
-			// Önce find ve aggregate komutlarını kontrol edelim
-			if strings.Contains(queryString, "\"find\"") {
-				// Find sorgusu olabilir, basit bir find sorgusu oluşturalım
-				collName := ""
-				if findRegex := regexp.MustCompile(`"find"\s*:\s*"([^"]+)"`); findRegex.MatchString(queryString) {
-					matches := findRegex.FindStringSubmatch(queryString)
+			// Basit regex ile find ve filter sorgusu çıkarmayı dene
+			if strings.Contains(cleanedQuery, "\"find\"") {
+				// Find sorgusu tespit et
+				if findRegex := regexp.MustCompile(`"find"\s*:\s*"([^"]+)"`); findRegex.MatchString(cleanedQuery) {
+					matches := findRegex.FindStringSubmatch(cleanedQuery)
 					if len(matches) > 1 {
-						collName = matches[1]
-						log.Printf("Find collection adı: %s", collName)
+						collName := matches[1]
+						log.Printf("Regex ile collection ismi bulundu: %s", collName)
 
 						// Basit bir find sorgusu oluştur
 						queryDoc = bson.M{
@@ -2959,57 +2980,13 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 							"filter": bson.M{},
 						}
 
-						// Filter varsa onu da almaya çalışalım
-						if filterRegex := regexp.MustCompile(`"filter"\s*:\s*({[^}]+})`); filterRegex.MatchString(queryString) {
-							matches := filterRegex.FindStringSubmatch(queryString)
-							if len(matches) > 1 {
-								filterStr := matches[1]
-								var filterDoc bson.M
-								if err := json.Unmarshal([]byte(filterStr), &filterDoc); err == nil {
-									queryDoc["filter"] = filterDoc
-								}
-							}
-						}
-
-						// Hata sıfırlayalım
-						err = nil
-					}
-				}
-			} else if strings.Contains(queryString, "\"aggregate\"") {
-				// Aggregate sorgusu olabilir
-				collName := ""
-				if aggRegex := regexp.MustCompile(`"aggregate"\s*:\s*"([^"]+)"`); aggRegex.MatchString(queryString) {
-					matches := aggRegex.FindStringSubmatch(queryString)
-					if len(matches) > 1 {
-						collName = matches[1]
-						log.Printf("Aggregate collection adı: %s", collName)
-
-						// Basit bir aggregate sorgusu oluştur
-						queryDoc = bson.M{
-							"aggregate": collName,
-							"pipeline":  bson.A{},
-							"cursor":    bson.M{},
-						}
-
-						// Pipeline varsa onu da almaya çalışalım
-						if pipelineRegex := regexp.MustCompile(`"pipeline"\s*:\s*(\[[^\]]+\])`); pipelineRegex.MatchString(queryString) {
-							matches := pipelineRegex.FindStringSubmatch(queryString)
-							if len(matches) > 1 {
-								pipelineStr := matches[1]
-								var pipelineArray []interface{}
-								if err := json.Unmarshal([]byte(pipelineStr), &pipelineArray); err == nil {
-									queryDoc["pipeline"] = pipelineArray
-								}
-							}
-						}
-
-						// Hata sıfırlayalım
+						// Hata sıfırla
 						err = nil
 					}
 				}
 			}
 
-			// Yine başarısız olursa direkt hata dön
+			// Yine parse edilemezse direkt hata dön
 			if err != nil {
 				errMsg := fmt.Sprintf("Sorgu JSON formatında değil: %v", err)
 				log.Printf("HATA: %s", errMsg)
@@ -3022,19 +2999,12 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		}
 	}
 
-	// Sorgu tipini belirle ve direct yöntem kullan
-	log.Printf("Sorgu dokümanı: %+v", queryDoc)
-
 	// Veritabanı bağlantısı
 	database := client.Database(req.Database)
 
-	// Açıklanacak komutun çekirdeğini oluştur
-	// Gereksiz MongoDB bağlantı meta verilerini kaldır
+	// Meta verilerini temizle
 	coreCmdDoc := bson.M{}
-
-	// Şimdi önemli alanları kopyala
 	for k, v := range queryDoc {
-		// $clusterTime, $db, lsid gibi meta alanları atla
 		if !strings.HasPrefix(k, "$") && k != "lsid" {
 			coreCmdDoc[k] = v
 		}
@@ -3042,202 +3012,169 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 
 	log.Printf("Temizlenmiş komut: %+v", coreCmdDoc)
 
-	// Sorgu tipine göre işlem yap
-	if collName, hasAggregate := coreCmdDoc["aggregate"]; hasAggregate {
-		// Aggregate sorgusu
-		log.Printf("Aggregate sorgusu tespit edildi")
+	// Direkt olarak explain/find/aggregate olup olmadığını kontrol et
+	var commandToExplain bson.D
+	var processed bool = false
 
-		var pipeline bson.A
-		if pipelineInterface, hasPipeline := coreCmdDoc["pipeline"]; hasPipeline {
-			if pipelineArray, ok := pipelineInterface.(bson.A); ok {
-				pipeline = pipelineArray
-			} else if pipelineArray, ok := pipelineInterface.([]interface{}); ok {
-				pipeline = bson.A(pipelineArray)
-			} else {
-				// Pipeline'ı BSON'a çevirmeyi dene
-				pipelineBson, err := bson.Marshal(pipelineInterface)
-				if err != nil {
-					errMsg := fmt.Sprintf("Pipeline BSON'a dönüştürülemedi: %v", err)
-					log.Printf("HATA: %s", errMsg)
-					return &pb.ExplainQueryResponse{
-						Status:       "error",
-						ErrorMessage: errMsg,
-					}, nil
-				}
+	// EXPLAIN - En yaygın senaryo - "explain" alanı var mı kontrol et
+	if explainValue, hasExplain := coreCmdDoc["explain"]; hasExplain {
+		processed = true
+		log.Printf("Explain alanı tespit edildi")
 
-				err = bson.Unmarshal(pipelineBson, &pipeline)
-				if err != nil {
-					errMsg := fmt.Sprintf("Pipeline array'e dönüştürülemedi: %v", err)
-					log.Printf("HATA: %s", errMsg)
-					return &pb.ExplainQueryResponse{
-						Status:       "error",
-						ErrorMessage: errMsg,
-					}, nil
-				}
-			}
-		}
+		// explain değeri map olabilir
+		explainObject, isMap := explainValue.(map[string]interface{})
+		if isMap {
+			log.Printf("Explain bir map/object: %+v", explainObject)
 
-		// Explain komutunu oluştur
-		cmdDoc := bson.D{
-			{Key: "aggregate", Value: collName},
-			{Key: "pipeline", Value: pipeline},
-			{Key: "cursor", Value: bson.D{}},
-		}
+			// explainObject içinde "find" alanı olması beklenir
+			if findValue, hasFind := explainObject["find"]; hasFind {
+				log.Printf("Nested find bulundu: %v", findValue)
 
-		// Diğer parametreleri (limit, skip vb.) ekle
-		for k, v := range coreCmdDoc {
-			if k != "aggregate" && k != "pipeline" && k != "cursor" {
-				cmdDoc = append(cmdDoc, bson.E{Key: k, Value: v})
-			}
-		}
+				// Doğru formatı oluştur: {find: collection, filter: {...}, ...}
+				commandToExplain = bson.D{{Key: "find", Value: findValue}}
 
-		explainOpts := bson.D{
-			{Key: "explain", Value: cmdDoc},
-			{Key: "verbosity", Value: "allPlansExecution"},
-		}
-
-		log.Printf("MongoDB explain komutu: %+v", explainOpts)
-		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
-	} else if collName, hasFind := coreCmdDoc["find"]; hasFind {
-		// Find sorgusu
-		log.Printf("Find sorgusu tespit edildi")
-
-		// Find komutunu oluştur, tüm ek parametreleri de ekle
-		cmdDoc := bson.D{{Key: "find", Value: collName}}
-
-		// Diğer parametreleri ekle (filter, sort, limit, skip)
-		for k, v := range coreCmdDoc {
-			if k != "find" {
-				cmdDoc = append(cmdDoc, bson.E{Key: k, Value: v})
-			}
-		}
-
-		// Explain komutu
-		explainOpts := bson.D{
-			{Key: "explain", Value: cmdDoc},
-			{Key: "verbosity", Value: "allPlansExecution"},
-		}
-
-		log.Printf("MongoDB explain komutu: %+v", explainOpts)
-		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
-	} else if explainCmd, hasExplain := coreCmdDoc["explain"]; hasExplain {
-		// İç içe explain komutu var, bunu düzelt
-		log.Printf("İç içe explain sorgusu tespit edildi: %v", explainCmd)
-
-		// İç explain'i parse et
-		var innerExplain bson.M
-		if innerMap, ok := explainCmd.(map[string]interface{}); ok {
-			innerExplain = innerMap
-			// Doğru explain komutunu oluştur
-			var explainCmd bson.D
-
-			// find ve filter'ı çıkar
-			if findVal, hasFind := innerExplain["find"]; hasFind {
-				explainCmd = append(explainCmd, bson.E{Key: "find", Value: findVal})
-
-				// Diğer özellikleri ekle (filter, sort, limit, skip vb.)
-				for k, v := range innerExplain {
+				// Diğer parametreleri ekle
+				for k, v := range explainObject {
 					if k != "find" {
-						explainCmd = append(explainCmd, bson.E{Key: k, Value: v})
+						commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
 					}
 				}
+			} else if aggValue, hasAgg := explainObject["aggregate"]; hasAgg {
+				log.Printf("Nested aggregate bulundu: %v", aggValue)
 
-				// Explain komutu
-				explainOpts := bson.D{
-					{Key: "explain", Value: explainCmd},
-					{Key: "verbosity", Value: "allPlansExecution"},
-				}
+				// Aggregate komutu
+				commandToExplain = bson.D{{Key: "aggregate", Value: aggValue}}
 
-				log.Printf("Düzeltilmiş MongoDB explain komutu: %+v", explainOpts)
-				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
-			} else if aggVal, hasAgg := innerExplain["aggregate"]; hasAgg {
-				// Aggregate komutunu işle
-				explainCmd = append(explainCmd, bson.E{Key: "aggregate", Value: aggVal})
-
-				// Diğer özellikleri ekle (pipeline, cursor vb.)
-				for k, v := range innerExplain {
+				// Diğer parametreleri ekle
+				for k, v := range explainObject {
 					if k != "aggregate" {
-						explainCmd = append(explainCmd, bson.E{Key: k, Value: v})
+						commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
 					}
 				}
-
-				// Explain komutu
-				explainOpts := bson.D{
-					{Key: "explain", Value: explainCmd},
-					{Key: "verbosity", Value: "allPlansExecution"},
-				}
-
-				log.Printf("Düzeltilmiş MongoDB aggregate explain komutu: %+v", explainOpts)
-				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 			} else {
-				log.Printf("İç explain içinde find veya aggregate komutu bulunamadı")
-				// Olduğu gibi gönder son çare olarak
+				log.Printf("Explain içinde tanınabilir komut bulunamadı, olduğu gibi gönderiliyor")
+				// Explain içeriğini doğrudan açıklamaya çalış
 				explainOpts := bson.D{
-					{Key: "explain", Value: innerExplain},
+					{Key: "explain", Value: explainObject},
 					{Key: "verbosity", Value: "allPlansExecution"},
 				}
 				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 			}
 		} else {
-			log.Printf("İç explain map formatında değil, doğrudan gönderiliyor")
-			// Diğer tip sorgular - temizlenmiş sorguyu doğrudan aç
+			// explainValue bir string/primitive olabilir
+			log.Printf("Explain primitif bir değer: %v", explainValue)
 			explainOpts := bson.D{
-				{Key: "explain", Value: coreCmdDoc},
+				{Key: "explain", Value: explainValue},
 				{Key: "verbosity", Value: "allPlansExecution"},
 			}
-
-			log.Printf("MongoDB explain komutu (diğer tip): %+v", explainOpts)
 			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 		}
-	} else {
-		// Diğer tip sorgular - temizlenmiş sorguyu doğrudan aç
+
+		// CommandToExplain oluşturulduysa çalıştır
+		if commandToExplain != nil {
+			explainOpts := bson.D{
+				{Key: "explain", Value: commandToExplain},
+				{Key: "verbosity", Value: "allPlansExecution"},
+			}
+			log.Printf("MongoDB explain komut: %+v", explainOpts)
+			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		}
+	}
+
+	// FIND komutunu direkt olarak çalıştırma
+	if !processed {
+		if findValue, hasFind := coreCmdDoc["find"]; hasFind {
+			processed = true
+			log.Printf("Find komutu tespit edildi: %v", findValue)
+
+			// Find komutunu oluştur
+			commandToExplain = bson.D{{Key: "find", Value: findValue}}
+
+			// Diğer parametreleri ekle
+			for k, v := range coreCmdDoc {
+				if k != "find" {
+					commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
+				}
+			}
+
+			// Explain et
+			explainOpts := bson.D{
+				{Key: "explain", Value: commandToExplain},
+				{Key: "verbosity", Value: "allPlansExecution"},
+			}
+			log.Printf("MongoDB find explain: %+v", explainOpts)
+			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		}
+	}
+
+	// AGGREGATE komutunu direkt olarak çalıştırma
+	if !processed {
+		if aggValue, hasAgg := coreCmdDoc["aggregate"]; hasAgg {
+			processed = true
+			log.Printf("Aggregate komutu tespit edildi: %v", aggValue)
+
+			// Aggregate komutunu oluştur
+			commandToExplain = bson.D{{Key: "aggregate", Value: aggValue}}
+
+			// Diğer parametreleri ekle
+			for k, v := range coreCmdDoc {
+				if k != "aggregate" {
+					commandToExplain = append(commandToExplain, bson.E{Key: k, Value: v})
+				}
+			}
+
+			// Explain et
+			explainOpts := bson.D{
+				{Key: "explain", Value: commandToExplain},
+				{Key: "verbosity", Value: "allPlansExecution"},
+			}
+			log.Printf("MongoDB aggregate explain: %+v", explainOpts)
+			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		}
+	}
+
+	// Hiçbir özel komut tanınmadıysa
+	if !processed {
+		log.Printf("Tanınabilir MongoDB komutu bulunamadı, olduğu gibi açıklamaya çalışılıyor")
 		explainOpts := bson.D{
 			{Key: "explain", Value: coreCmdDoc},
 			{Key: "verbosity", Value: "allPlansExecution"},
 		}
-
-		log.Printf("MongoDB explain komutu (diğer tip): %+v", explainOpts)
+		log.Printf("MongoDB genel explain: %+v", explainOpts)
 		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 	}
 
+	// Hata oluştuysa, alternatif yöntemleri dene
 	if err != nil {
-		// Son bir şans - doğrudan sorguyu çalıştırmayı dene
-		log.Printf("Direkt explain başarısız oldu, farklı yaklaşım deneniyor: %v", err)
+		log.Printf("İlk explain başarısız: %v, alternatif yöntemler deneniyor", err)
 
-		// MongoDB'nin native bson formatına dönüştürelim
-		cmdBytes, err := bson.Marshal(coreCmdDoc)
-		if err != nil {
-			log.Printf("BSON marshal hatası: %v", err)
-		} else {
-			var cmdNative bson.D
-			if err := bson.Unmarshal(cmdBytes, &cmdNative); err != nil {
-				log.Printf("BSON unmarshal hatası: %v", err)
-			} else {
-				// Native formatla explain dene
-				explainCmd := bson.D{
-					{Key: "explain", Value: cmdNative},
-					{Key: "verbosity", Value: "allPlansExecution"},
-				}
+		// Son çare - admin veritabanında dene
+		adminDB := client.Database("admin")
 
-				log.Printf("Son şans MongoDB explain (native BSON): %+v", explainCmd)
-				err = database.RunCommand(ctx, explainCmd).Decode(&explainResult)
-
-				if err != nil {
-					// Admin veritabanında dene
-					adminDB := client.Database("admin")
-					err = adminDB.RunCommand(ctx, explainCmd).Decode(&explainResult)
-
-					if err != nil {
-						errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
-						log.Printf("HATA: %s", errMsg)
-						return &pb.ExplainQueryResponse{
-							Status:       "error",
-							ErrorMessage: errMsg,
-							Plan:         "",
-						}, nil
-					}
-				}
+		if commandToExplain != nil {
+			explainOpts := bson.D{
+				{Key: "explain", Value: commandToExplain},
+				{Key: "verbosity", Value: "allPlansExecution"},
 			}
+			log.Printf("Admin veritabanında explain deneniyor: %+v", explainOpts)
+			err = adminDB.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		} else {
+			explainOpts := bson.D{
+				{Key: "explain", Value: coreCmdDoc},
+				{Key: "verbosity", Value: "allPlansExecution"},
+			}
+			log.Printf("Admin veritabanında genel explain deneniyor: %+v", explainOpts)
+			err = adminDB.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		}
+
+		if err != nil {
+			errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
+			log.Printf("HATA: %s", errMsg)
+			return &pb.ExplainQueryResponse{
+				Status:       "error",
+				ErrorMessage: errMsg,
+				Plan:         "",
+			}, nil
 		}
 	}
 
@@ -3255,56 +3192,8 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	// Debug için JSON çıktısını logla
 	log.Printf("MongoDB explain JSON sonucu: %s", string(resultBytes))
 
-	// Okunabilir bir format oluştur
-	var planText string
-	var resultMap map[string]interface{}
-
-	if err := json.Unmarshal(resultBytes, &resultMap); err != nil {
-		log.Printf("UYARI: JSON parse edilemedi, ham sonuç kullanılacak: %v", err)
-		planText = string(resultBytes)
-	} else {
-		// MongoDB explain sonuçları farklı anahtarlarda olabilir
-		if explainData, ok := resultMap["queryPlanner"]; ok {
-			// queryPlanner formatında
-			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
-			if err == nil {
-				planText += "## Query Planner\n" + string(explainBytes) + "\n\n"
-			}
-		}
-
-		if explainData, ok := resultMap["executionStats"]; ok {
-			// executionStats formatında
-			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
-			if err == nil {
-				planText += "## Execution Stats\n" + string(explainBytes) + "\n\n"
-			}
-		}
-
-		if explainData, ok := resultMap["serverInfo"]; ok {
-			// serverInfo formatında
-			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
-			if err == nil {
-				planText += "## Server Info\n" + string(explainBytes) + "\n\n"
-			}
-		}
-
-		// Eğer özel formatlar bulunamadıysa, tüm JSON yanıtını kullan
-		if planText == "" {
-			// İkinci bir şans olarak command sonucuna bak
-			if cmdResult, ok := resultMap["command"]; ok {
-				cmdBytes, err := json.MarshalIndent(cmdResult, "", "  ")
-				if err == nil {
-					planText = "## Command\n" + string(cmdBytes) + "\n\n"
-				}
-			}
-
-			// Hala boşsa, tüm sonucu kullan
-			if planText == "" {
-				resultBytes, _ := json.MarshalIndent(resultMap, "", "  ")
-				planText = string(resultBytes)
-			}
-		}
-	}
+	// Okunabilir plan oluştur
+	planText := createReadablePlan(resultBytes)
 
 	log.Printf("MongoDB sorgu planı başarıyla alındı")
 	return &pb.ExplainQueryResponse{
@@ -3325,4 +3214,59 @@ func min(x, y int) int {
 		return x
 	}
 	return y
+}
+
+// Okunabilir plan oluşturmak için yardımcı fonksiyon
+func createReadablePlan(resultBytes []byte) string {
+	var planText string
+	var resultMap map[string]interface{}
+
+	if err := json.Unmarshal(resultBytes, &resultMap); err != nil {
+		log.Printf("UYARI: JSON parse edilemedi, ham sonuç kullanılacak: %v", err)
+		return string(resultBytes)
+	}
+
+	// MongoDB explain sonuçları farklı anahtarlarda olabilir
+	if explainData, ok := resultMap["queryPlanner"]; ok {
+		// queryPlanner formatında
+		explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+		if err == nil {
+			planText += "## Query Planner\n" + string(explainBytes) + "\n\n"
+		}
+	}
+
+	if explainData, ok := resultMap["executionStats"]; ok {
+		// executionStats formatında
+		explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+		if err == nil {
+			planText += "## Execution Stats\n" + string(explainBytes) + "\n\n"
+		}
+	}
+
+	if explainData, ok := resultMap["serverInfo"]; ok {
+		// serverInfo formatında
+		explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+		if err == nil {
+			planText += "## Server Info\n" + string(explainBytes) + "\n\n"
+		}
+	}
+
+	// Eğer özel formatlar bulunamadıysa, tüm JSON yanıtını kullan
+	if planText == "" {
+		// İkinci bir şans olarak command sonucuna bak
+		if cmdResult, ok := resultMap["command"]; ok {
+			cmdBytes, err := json.MarshalIndent(cmdResult, "", "  ")
+			if err == nil {
+				planText = "## Command\n" + string(cmdBytes) + "\n\n"
+			}
+		}
+
+		// Hala boşsa, tüm sonucu kullan
+		if planText == "" {
+			resultBytes, _ := json.MarshalIndent(resultMap, "", "  ")
+			planText = string(resultBytes)
+		}
+	}
+
+	return planText
 }
