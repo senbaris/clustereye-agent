@@ -2797,8 +2797,42 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		// Hata var, daha fazla debug bilgisi logla
 		log.Printf("HATA: JSON parse hatası: %v, sorgu: %q", err, queryString)
 
+		// Eğer sorgu kompleks bir JSON objesi olabilir - gelen sorgu bazen iç içe JSON objesi içinde olabilir
+		// Bu sorunu çözmek için, sorgudaki tüm escape karakterlerini ve newline'ları düzenleyelim
+
+		// Önce sorguyu tek satıra indir
+		cleanQuery := strings.ReplaceAll(queryString, "\n", " ")
+
+		// İçteki escapeleri kaldır, tırnakları düzelt
+		cleanQuery = strings.ReplaceAll(cleanQuery, "\\\"", "\"")
+
+		// JSON objesini düzgün algılamak için köşeli parantezleri ve çift tırnakları kontrol et
+		if !strings.HasPrefix(cleanQuery, "{") {
+			// Sorgunun başında { yoksa, başlangıç ve bitiş parantezleri ekleyelim
+			cleanQuery = "{" + cleanQuery + "}"
+		}
+
+		// Temizlenmiş sorguyu parse etmeyi dene
+		log.Printf("Düzeltilmiş sorgu formatı: %s", cleanQuery)
+		err = json.Unmarshal([]byte(cleanQuery), &queryDoc)
+
+		// Hala hata varsa, sorgudaki gömülü JSON stringlerini kontrol edelim
+		if err != nil && strings.Contains(cleanQuery, "\"query\":") {
+			// "query" alanı içinde gömülü bir JSON olabilir
+			queryRegex := regexp.MustCompile(`"query":\s*"(.+?)"`)
+			if matches := queryRegex.FindStringSubmatch(cleanQuery); len(matches) >= 2 {
+				embeddedQuery := matches[1]
+				// Embedded JSON stringini gerçek JSON'a dönüştürmeye çalış
+				embeddedQuery = strings.ReplaceAll(embeddedQuery, "\\", "")
+				log.Printf("Gömülü sorgu tespit edildi: %s", embeddedQuery)
+
+				// Eğer bu bir gömülü JSON stringi ise, bunu ana sorgu olarak kullan
+				err = json.Unmarshal([]byte(embeddedQuery), &queryDoc)
+			}
+		}
+
 		// Eğer ilk karakter { değilse, JSON formatına çevirmeyi dene
-		if !strings.HasPrefix(queryString, "{") {
+		if err != nil && !strings.HasPrefix(queryString, "{") {
 			log.Printf("JSON formatı değil, uyarlanmaya çalışılıyor...")
 
 			// Sorgunun ne olduğunu anlamaya çalış ve uygun formata çevir
@@ -2956,6 +2990,54 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 				{Key: "find", Value: collectionName},
 				{Key: "filter", Value: filter},
 			}},
+			{Key: "verbosity", Value: "allPlansExecution"},
+		}
+
+		// Sort, limit, skip gibi alanları da ekle (varsa)
+		findCommand := bson.D{
+			{Key: "find", Value: collectionName},
+			{Key: "filter", Value: filter},
+		}
+
+		if sortInterface, hasSort := queryDoc["sort"]; hasSort {
+			sortBson, err := bson.Marshal(sortInterface)
+			if err == nil {
+				var sort bson.D
+				if err = bson.Unmarshal(sortBson, &sort); err == nil {
+					findCommand = append(findCommand, bson.E{Key: "sort", Value: sort})
+				}
+			}
+		}
+
+		if limitInterface, hasLimit := queryDoc["limit"]; hasLimit {
+			limit, ok := limitInterface.(map[string]interface{})
+			if ok {
+				if limitNum, hasLimitNum := limit["$numberInt"]; hasLimitNum {
+					if limitStr, ok := limitNum.(string); ok {
+						if limitVal, err := strconv.Atoi(limitStr); err == nil {
+							findCommand = append(findCommand, bson.E{Key: "limit", Value: limitVal})
+						}
+					}
+				}
+			}
+		}
+
+		if skipInterface, hasSkip := queryDoc["skip"]; hasSkip {
+			skip, ok := skipInterface.(map[string]interface{})
+			if ok {
+				if skipNum, hasSkipNum := skip["$numberInt"]; hasSkipNum {
+					if skipStr, ok := skipNum.(string); ok {
+						if skipVal, err := strconv.Atoi(skipStr); err == nil {
+							findCommand = append(findCommand, bson.E{Key: "skip", Value: skipVal})
+						}
+					}
+				}
+			}
+		}
+
+		// Güncellenmiş explain komutu
+		explainOpts = bson.D{
+			{Key: "explain", Value: findCommand},
 			{Key: "verbosity", Value: "allPlansExecution"},
 		}
 
