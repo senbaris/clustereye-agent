@@ -3120,6 +3120,75 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 
 		log.Printf("MongoDB explain komutu: %+v", explainOpts)
 		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+	} else if explainCmd, hasExplain := coreCmdDoc["explain"]; hasExplain {
+		// İç içe explain komutu var, bunu düzelt
+		log.Printf("İç içe explain sorgusu tespit edildi: %v", explainCmd)
+
+		// İç explain'i parse et
+		var innerExplain bson.M
+		if innerMap, ok := explainCmd.(map[string]interface{}); ok {
+			innerExplain = innerMap
+			// Doğru explain komutunu oluştur
+			var explainCmd bson.D
+
+			// find ve filter'ı çıkar
+			if findVal, hasFind := innerExplain["find"]; hasFind {
+				explainCmd = append(explainCmd, bson.E{Key: "find", Value: findVal})
+
+				// Diğer özellikleri ekle (filter, sort, limit, skip vb.)
+				for k, v := range innerExplain {
+					if k != "find" {
+						explainCmd = append(explainCmd, bson.E{Key: k, Value: v})
+					}
+				}
+
+				// Explain komutu
+				explainOpts := bson.D{
+					{Key: "explain", Value: explainCmd},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+
+				log.Printf("Düzeltilmiş MongoDB explain komutu: %+v", explainOpts)
+				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+			} else if aggVal, hasAgg := innerExplain["aggregate"]; hasAgg {
+				// Aggregate komutunu işle
+				explainCmd = append(explainCmd, bson.E{Key: "aggregate", Value: aggVal})
+
+				// Diğer özellikleri ekle (pipeline, cursor vb.)
+				for k, v := range innerExplain {
+					if k != "aggregate" {
+						explainCmd = append(explainCmd, bson.E{Key: k, Value: v})
+					}
+				}
+
+				// Explain komutu
+				explainOpts := bson.D{
+					{Key: "explain", Value: explainCmd},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+
+				log.Printf("Düzeltilmiş MongoDB aggregate explain komutu: %+v", explainOpts)
+				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+			} else {
+				log.Printf("İç explain içinde find veya aggregate komutu bulunamadı")
+				// Olduğu gibi gönder son çare olarak
+				explainOpts := bson.D{
+					{Key: "explain", Value: innerExplain},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+				err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+			}
+		} else {
+			log.Printf("İç explain map formatında değil, doğrudan gönderiliyor")
+			// Diğer tip sorgular - temizlenmiş sorguyu doğrudan aç
+			explainOpts := bson.D{
+				{Key: "explain", Value: coreCmdDoc},
+				{Key: "verbosity", Value: "allPlansExecution"},
+			}
+
+			log.Printf("MongoDB explain komutu (diğer tip): %+v", explainOpts)
+			err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
+		}
 	} else {
 		// Diğer tip sorgular - temizlenmiş sorguyu doğrudan aç
 		explainOpts := bson.D{
