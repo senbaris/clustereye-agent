@@ -3,6 +3,7 @@ package reporter
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
+	"go.mongodb.org/mongo-driver/bson"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -2663,5 +2665,149 @@ func (r *Reporter) ExplainQuery(ctx context.Context, req *pb.ExplainQueryRequest
 	return &pb.ExplainQueryResponse{
 		Status: "success",
 		Plan:   plan,
+	}, nil
+}
+
+// ExplainMongoQuery returns an execution plan for a MongoDB query using explain()
+func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRequest) (*pb.ExplainQueryResponse, error) {
+	log.Printf("MongoDB sorgu planı isteği alındı. AgentID: %s, Veritabanı: %s", req.AgentId, req.Database)
+
+	// Veritabanını ve sorguyu kontrol et
+	if req.Database == "" {
+		errMsg := "Veritabanı adı gereklidir"
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	if req.Query == "" {
+		errMsg := "Sorgu metni gereklidir"
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// MongoDB kolektörünü oluştur
+	mongoCollector := mongo.NewMongoCollector(r.cfg)
+
+	// MongoDB bağlantısı oluştur
+	client, err := mongoCollector.GetClient()
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB bağlantısı açılamadı: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+	defer client.Disconnect(context.Background())
+
+	// Admin veritabanını kullan (explain komutu için gerekli)
+	adminDB := client.Database("admin")
+
+	// Explain komutunu oluştur
+	// MongoDB için BSON formatında bir explain komutu oluşturuyoruz
+	explainCmd := bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "$eval", Value: req.Query},
+		}},
+		{Key: "verbosity", Value: "allPlansExecution"},
+	}
+
+	log.Printf("MongoDB sorgu planı alınıyor: %v", explainCmd)
+
+	// Sorguyu çalıştır
+	var explainResult bson.M
+	err = adminDB.RunCommand(ctx, explainCmd).Decode(&explainResult)
+	if err != nil {
+		// İlk yöntem başarısız olursa, alternatif yapılandırma dene
+		log.Printf("İlk yöntem başarısız oldu, alternatif yöntem deneniyor: %v", err)
+
+		// JavaScript eval komutunu hazırla
+		evalCmd := bson.D{
+			{Key: "eval", Value: fmt.Sprintf("db.runCommand({explain: %s, verbosity: 'allPlansExecution'})", req.Query)},
+		}
+
+		log.Printf("Alternatif MongoDB sorgu planı alınıyor: %v", evalCmd)
+
+		err = adminDB.RunCommand(ctx, evalCmd).Decode(&explainResult)
+		if err != nil {
+			errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
+			log.Printf("HATA: %s", errMsg)
+			return &pb.ExplainQueryResponse{
+				Status:       "error",
+				ErrorMessage: errMsg,
+			}, nil
+		}
+	}
+
+	// Sonucu JSON'a dönüştür
+	resultBytes, err := bson.MarshalExtJSON(explainResult, true, true)
+	if err != nil {
+		errMsg := fmt.Sprintf("MongoDB sorgu planı JSON'a dönüştürülemedi: %v", err)
+		log.Printf("HATA: %s", errMsg)
+		return &pb.ExplainQueryResponse{
+			Status:       "error",
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Okunabilir bir format oluştur
+	var planText string
+	var resultMap map[string]interface{}
+
+	if err := json.Unmarshal(resultBytes, &resultMap); err != nil {
+		log.Printf("UYARI: JSON parse edilemedi, ham sonuç kullanılacak: %v", err)
+		planText = string(resultBytes)
+	} else {
+		// MongoDB explain sonuçları farklı anahtarlarda olabilir
+		if explainData, ok := resultMap["queryPlanner"]; ok {
+			// queryPlanner formatında
+			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+			if err == nil {
+				planText += "## Query Planner\n" + string(explainBytes) + "\n\n"
+			}
+		}
+
+		if explainData, ok := resultMap["executionStats"]; ok {
+			// executionStats formatında
+			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+			if err == nil {
+				planText += "## Execution Stats\n" + string(explainBytes) + "\n\n"
+			}
+		}
+
+		if explainData, ok := resultMap["serverInfo"]; ok {
+			// serverInfo formatında
+			explainBytes, err := json.MarshalIndent(explainData, "", "  ")
+			if err == nil {
+				planText += "## Server Info\n" + string(explainBytes) + "\n\n"
+			}
+		}
+
+		// Eğer özel formatlar bulunamadıysa, tüm JSON yanıtını kullan
+		if planText == "" {
+			// İkinci bir şans olarak retval alanına bak
+			if retval, ok := resultMap["retval"]; ok {
+				retvalBytes, err := json.MarshalIndent(retval, "", "  ")
+				if err == nil {
+					planText = string(retvalBytes)
+				} else {
+					planText = string(resultBytes) // Ham sonuç
+				}
+			} else {
+				planText = string(resultBytes) // Ham sonuç
+			}
+		}
+	}
+
+	log.Printf("MongoDB sorgu planı başarıyla alındı")
+	return &pb.ExplainQueryResponse{
+		Status: "success",
+		Plan:   planText,
 	}, nil
 }

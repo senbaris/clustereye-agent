@@ -904,54 +904,68 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		return
 	}
 
-	// PostgreSQL data dizinini bul
-	dataDir := "/var/lib/postgresql" // varsayılan dizin
-	configFile, err := postgres.FindPostgresConfigFile()
-	if err == nil {
-		// Konfigürasyon dosyasından data dizinini al
-		content, err := os.ReadFile(configFile)
-		if err == nil {
-			lines := strings.Split(string(content), "\n")
-			for _, line := range lines {
-				if strings.Contains(line, "data_directory") {
-					parts := strings.Split(line, "'")
-					if len(parts) >= 2 {
-						dataDir = strings.TrimSpace(parts[1])
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// Disk kullanımını kontrol et
-	cmd := exec.Command("df", "-h", dataDir)
+	// Tüm dosya sistemlerini kontrol et
+	cmd := exec.Command("df", "-h")
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("Disk kullanımı alınamadı: %v", err)
 		return
 	}
 
-	// df çıktısını parse et (son satırı al)
+	// df çıktısını parse et
 	lines := strings.Split(string(output), "\n")
 	if len(lines) < 2 {
 		log.Printf("Disk kullanım bilgisi parse edilemedi")
 		return
 	}
 
-	// Son satırı al ve kullanım yüzdesini çıkar
-	fields := strings.Fields(lines[1])
-	if len(fields) < 5 {
-		log.Printf("Disk kullanım alanları parse edilemedi")
-		return
-	}
+	// Her dosya sistemini kontrol et
+	var highUsageFilesystems []string
+	maxUsage := 0.0
+	maxUsageFS := ""
 
-	// Yüzde işaretini kaldır
-	usageStr := strings.TrimSuffix(fields[4], "%")
-	diskUsage, err := strconv.ParseFloat(usageStr, 64)
-	if err != nil {
-		log.Printf("Disk kullanımı parse edilemedi: %v", err)
-		return
+	// İlk satır başlık olduğu için 1'den başla
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+
+		// Özel dosya sistemlerini atla
+		filesystem := fields[0]
+		mountPoint := fields[len(fields)-1]
+		if strings.HasPrefix(filesystem, "/dev/loop") ||
+			strings.HasPrefix(filesystem, "tmpfs") ||
+			strings.HasPrefix(filesystem, "devtmpfs") ||
+			strings.HasPrefix(filesystem, "udev") ||
+			strings.HasPrefix(mountPoint, "/boot") ||
+			strings.HasPrefix(mountPoint, "/snap") {
+			continue
+		}
+
+		// Yüzde işaretini kaldır
+		usageStr := strings.TrimSuffix(fields[4], "%")
+		diskUsage, err := strconv.ParseFloat(usageStr, 64)
+		if err != nil {
+			continue
+		}
+
+		// Threshold'u aşan dosya sistemlerini kaydet
+		if diskUsage >= m.thresholds.DiskThreshold {
+			fsInfo := fmt.Sprintf("%s (%s): %.2f%%", mountPoint, filesystem, diskUsage)
+			highUsageFilesystems = append(highUsageFilesystems, fsInfo)
+
+			// En yüksek kullanımı takip et
+			if diskUsage > maxUsage {
+				maxUsage = diskUsage
+				maxUsageFS = mountPoint
+			}
+		}
 	}
 
 	alarmKey := "system_disk_usage"
@@ -966,23 +980,29 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 		if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
 			prevTriggered := prevAlarm.Status == "triggered"
-			currentHigh := diskUsage >= m.thresholds.DiskThreshold
+			currentHigh := len(highUsageFilesystems) > 0
 			if prevTriggered == currentHigh {
 				return
 			}
 		}
 	}
 
-	if diskUsage >= m.thresholds.DiskThreshold {
+	if len(highUsageFilesystems) > 0 {
 		// Yeni alarm oluştur
+		message := fmt.Sprintf("High disk usage detected on %d filesystem(s) (highest: %s at %.2f%%):\n%s",
+			len(highUsageFilesystems),
+			maxUsageFS,
+			maxUsage,
+			strings.Join(highUsageFilesystems, "\n"))
+
 		alarmEvent := &pb.AlarmEvent{
 			Id:          uuid.New().String(),
 			AlarmId:     alarmKey,
 			AgentId:     m.agentID,
 			Status:      "triggered",
 			MetricName:  "system_disk_usage",
-			MetricValue: fmt.Sprintf("%.2f", diskUsage),
-			Message:     fmt.Sprintf("High disk usage detected on %s: %.2f%% (threshold: %.2f%%)", dataDir, diskUsage, m.thresholds.DiskThreshold),
+			MetricValue: fmt.Sprintf("%.2f", maxUsage),
+			Message:     message,
 			Timestamp:   time.Now().Format(time.RFC3339),
 			Severity:    "warning",
 		}
@@ -1003,8 +1023,8 @@ func (m *AlarmMonitor) checkDiskUsage() {
 			AgentId:     m.agentID,
 			Status:      "resolved",
 			MetricName:  "system_disk_usage",
-			MetricValue: fmt.Sprintf("%.2f", diskUsage),
-			Message:     fmt.Sprintf("Disk usage returned to normal on %s: %.2f%% (threshold: %.2f%%)", dataDir, diskUsage, m.thresholds.DiskThreshold),
+			MetricValue: fmt.Sprintf("%.2f", maxUsage),
+			Message:     "All filesystem usages returned to normal",
 			Timestamp:   time.Now().Format(time.RFC3339),
 			Severity:    "info",
 		}
