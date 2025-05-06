@@ -431,7 +431,6 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 
 // GetDiskUsage disk kullanım bilgilerini döndürür
 func (c *MongoCollector) GetDiskUsage() (string, int) {
-	log.Printf("DEBUG: GetDiskUsage başlıyor - Disk kullanım bilgileri toplanıyor...")
 
 	// df komutunu çalıştır
 	cmd := exec.Command("df", "-h")
@@ -441,17 +440,11 @@ func (c *MongoCollector) GetDiskUsage() (string, int) {
 		return "N/A", 0
 	}
 
-	// Raw output logla
-	log.Printf("DEBUG: df raw output:\n%s", string(out))
-
 	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
-		log.Printf("DEBUG: df çıktısı yetersiz satır içeriyor: %d satır", len(lines))
 		return "N/A", 0
 	}
-
-	log.Printf("DEBUG: df çıktısı alındı, %d satır işlenecek", len(lines))
 
 	var maxSize uint64 = 0
 	var selectedFree string

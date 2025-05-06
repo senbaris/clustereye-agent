@@ -1862,6 +1862,50 @@ func (r *Reporter) listenForCommands() {
 				} else if r.platform == "mongo" {
 					// MongoDB platform için sorguysa ve diğer durumlarda işlenmediyse hata bildir
 					log.Printf("MongoDB platformunda geçersiz sorgu: %s", query.Command)
+
+					// MongoDB sorgu açıklama işlevi için kontrol ekleyelim
+					if strings.Contains(query.Command, "explain") || strings.Contains(query.Command, "aggregate") ||
+						strings.Contains(query.Command, "find") || strings.Contains(query.Command, "pipeline") {
+
+						log.Printf("MongoDB sorgu açıklama isteği tespit edildi, ExplainMongoQuery çağrılıyor...")
+
+						// Hostname'den agentID oluştur
+						hostname, _ := os.Hostname()
+						agentID := "agent_" + hostname
+
+						explainReq := &pb.ExplainQueryRequest{
+							AgentId:  agentID,
+							Database: query.Database,
+							Query:    query.Command,
+						}
+
+						explainResp, err := r.ExplainMongoQuery(context.Background(), explainReq)
+						if err != nil {
+							log.Printf("MongoDB sorgu açıklama hatası: %v", err)
+							queryResult := map[string]interface{}{
+								"status":  "error",
+								"message": fmt.Sprintf("MongoDB sorgu açıklama hatası: %v", err),
+							}
+
+							sendQueryResult(r.stream, query.QueryId, queryResult)
+						} else {
+							// Başarılı yanıtı gönder
+							queryResult := map[string]interface{}{
+								"status": explainResp.Status,
+								"plan":   explainResp.Plan,
+							}
+
+							if explainResp.ErrorMessage != "" {
+								queryResult["message"] = explainResp.ErrorMessage
+							}
+
+							sendQueryResult(r.stream, query.QueryId, queryResult)
+						}
+
+						isProcessingQuery = false
+						continue
+					}
+
 					queryResult := map[string]interface{}{
 						"status":  "error",
 						"message": "Bu komut MongoDB platformunda desteklenmiyor",
