@@ -2754,16 +2754,98 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	var explainResult bson.M
 	queryString := req.Query
 
-	// JSON formatını analiz et
+	// JSON formatını analiz et - başta ve sonda olabilecek boşlukları temizle
+	queryString = strings.TrimSpace(queryString)
+
+	// Log JSON string formatını debug etmek için
+	log.Printf("MongoDB sorgu JSON string: %s", queryString)
+
+	// Gelen string'in başında ve sonunda fazladan karakterler olabilir, kontrol et
+	if strings.HasPrefix(queryString, "db.") {
+		// MongoDB shell formatında bir sorgu gelmiş (db.collection.find(...)), bunu işleme
+		log.Printf("MongoDB shell formatında sorgu tespit edildi, dönüştürülüyor...")
+
+		// Shell formatını basit JSON'a dönüştürmeyi dene
+		shellRegex := regexp.MustCompile(`db\.([^\.]+)\.([^(]+)\(([^)]*)\)`)
+		matches := shellRegex.FindStringSubmatch(queryString)
+
+		if len(matches) >= 4 {
+			collection := matches[1]
+			operation := matches[2]
+			params := matches[3]
+
+			if operation == "find" {
+				if params == "" {
+					params = "{}"
+				}
+				queryString = fmt.Sprintf(`{"find": "%s", "filter": %s}`, collection, params)
+			} else if operation == "aggregate" {
+				if params == "" {
+					params = "[]"
+				}
+				queryString = fmt.Sprintf(`{"aggregate": "%s", "pipeline": %s}`, collection, params)
+			}
+
+			log.Printf("Dönüştürülen JSON: %s", queryString)
+		}
+	}
+
+	// JSON formatını temizle ve doğrula
 	var queryDoc bson.M
 	err = json.Unmarshal([]byte(queryString), &queryDoc)
 	if err != nil {
-		errMsg := fmt.Sprintf("Sorgu JSON formatında değil: %v", err)
-		log.Printf("HATA: %s", errMsg)
-		return &pb.ExplainQueryResponse{
-			Status:       "error",
-			ErrorMessage: errMsg,
-		}, nil
+		// Hata var, daha fazla debug bilgisi logla
+		log.Printf("HATA: JSON parse hatası: %v, sorgu: %q", err, queryString)
+
+		// Eğer ilk karakter { değilse, JSON formatına çevirmeyi dene
+		if !strings.HasPrefix(queryString, "{") {
+			log.Printf("JSON formatı değil, uyarlanmaya çalışılıyor...")
+
+			// Sorgunun ne olduğunu anlamaya çalış ve uygun formata çevir
+			if strings.Contains(queryString, "aggregate") || strings.Contains(queryString, "find") {
+				// Muhtemelen bir MongoDB komutu, ama JSON formatında değil
+				parts := strings.Split(queryString, ".")
+				if len(parts) >= 2 {
+					collection := strings.TrimSpace(parts[0])
+					rest := strings.TrimSpace(strings.Join(parts[1:], "."))
+
+					if strings.HasPrefix(rest, "find") {
+						matchFilter := regexp.MustCompile(`find\(([^)]*)\)`)
+						if matches := matchFilter.FindStringSubmatch(rest); len(matches) >= 2 {
+							filter := matches[1]
+							if filter == "" {
+								filter = "{}"
+							}
+							queryString = fmt.Sprintf(`{"find": "%s", "filter": %s}`, collection, filter)
+							log.Printf("Dönüştürülen find komutu: %s", queryString)
+							err = json.Unmarshal([]byte(queryString), &queryDoc)
+						}
+					} else if strings.HasPrefix(rest, "aggregate") {
+						matchPipeline := regexp.MustCompile(`aggregate\(([^)]*)\)`)
+						if matches := matchPipeline.FindStringSubmatch(rest); len(matches) >= 2 {
+							pipeline := matches[1]
+							if pipeline == "" {
+								pipeline = "[]"
+							}
+							queryString = fmt.Sprintf(`{"aggregate": "%s", "pipeline": %s}`, collection, pipeline)
+							log.Printf("Dönüştürülen aggregate komutu: %s", queryString)
+							err = json.Unmarshal([]byte(queryString), &queryDoc)
+						}
+					}
+				}
+			}
+		}
+
+		// Hala hata varsa, doğrudan hata döndür
+		if err != nil {
+			errMsg := fmt.Sprintf("Sorgu JSON formatında değil: %v", err)
+			log.Printf("HATA: %s", errMsg)
+			return &pb.ExplainQueryResponse{
+				Status:       "error",
+				ErrorMessage: errMsg,
+				Plan:         "",
+			}, nil
+		}
 	}
 
 	// Sorgu tipini belirle ve direct yöntem kullan
