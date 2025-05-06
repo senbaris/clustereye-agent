@@ -2833,6 +2833,33 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
 	}
 
+	// Sorgunun içeriğini kontrol et, eğer {"database": "...", "query": ...} formatında ise, iç sorguyu çıkar
+	if strings.Contains(req.Query, "\"database\"") && strings.Contains(req.Query, "\"query\"") {
+		log.Printf("Server JSON wrapper formatı tespit edildi: {database, query} içeren sorgu")
+
+		// JSON'u parse et
+		var wrapper struct {
+			Database string          `json:"database"`
+			Query    json.RawMessage `json:"query"`
+		}
+
+		if err := json.Unmarshal([]byte(req.Query), &wrapper); err == nil {
+			// Database bilgisini güncelle eğer boşsa
+			if wrapper.Database != "" && req.Database == "" {
+				req.Database = wrapper.Database
+				log.Printf("JSON içinden veritabanı alındı: %s", req.Database)
+			}
+
+			// Query içeriğini asıl sorgu olarak kullan
+			if len(wrapper.Query) > 0 {
+				req.Query = string(wrapper.Query)
+				log.Printf("JSON içinden sorgu çıkarıldı (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+			}
+		} else {
+			log.Printf("JSON wrapper parse edilemedi: %v", err)
+		}
+	}
+
 	// MongoDB kolektörünü oluştur
 	mongoCollector := mongo.NewMongoCollector(r.cfg)
 
