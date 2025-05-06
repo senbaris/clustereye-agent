@@ -2760,125 +2760,111 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	// Log JSON string formatını debug etmek için
 	log.Printf("MongoDB sorgu JSON string: %s", queryString)
 
-	// Gelen string'in başında ve sonunda fazladan karakterler olabilir, kontrol et
-	if strings.HasPrefix(queryString, "db.") {
-		// MongoDB shell formatında bir sorgu gelmiş (db.collection.find(...)), bunu işleme
-		log.Printf("MongoDB shell formatında sorgu tespit edildi, dönüştürülüyor...")
+	// BSON/JSON parse etme
+	// Önce MongoDB Extended JSON formatını normal haline getirip decode edelim
+	// Tüm yeni satır ve boşlukları temizleyelim
+	queryString = strings.ReplaceAll(queryString, "\n", " ")
+	queryString = strings.ReplaceAll(queryString, "\r", "")
+	queryString = strings.ReplaceAll(queryString, "\t", " ")
 
-		// Shell formatını basit JSON'a dönüştürmeyi dene
-		shellRegex := regexp.MustCompile(`db\.([^\.]+)\.([^(]+)\(([^)]*)\)`)
-		matches := shellRegex.FindStringSubmatch(queryString)
-
-		if len(matches) >= 4 {
-			collection := matches[1]
-			operation := matches[2]
-			params := matches[3]
-
-			if operation == "find" {
-				if params == "" {
-					params = "{}"
-				}
-				queryString = fmt.Sprintf(`{"find": "%s", "filter": %s}`, collection, params)
-			} else if operation == "aggregate" {
-				if params == "" {
-					params = "[]"
-				}
-				queryString = fmt.Sprintf(`{"aggregate": "%s", "pipeline": %s}`, collection, params)
-			}
-
-			log.Printf("Dönüştürülen JSON: %s", queryString)
-		}
+	// Gereksiz boşlukları temizleyelim
+	// Birden fazla boşluğu tek boşluğa indirgeme
+	for strings.Contains(queryString, "  ") {
+		queryString = strings.ReplaceAll(queryString, "  ", " ")
 	}
 
-	// JSON formatını temizle ve doğrula
+	log.Printf("Temizlenmiş sorgu: %s", queryString)
+
+	// Doğrudan MongoDB sürücüsünün BSON parser'ını kullanalım
 	var queryDoc bson.M
-	err = json.Unmarshal([]byte(queryString), &queryDoc)
+	err = bson.UnmarshalExtJSON([]byte(queryString), true, &queryDoc)
+
 	if err != nil {
-		// Hata var, daha fazla debug bilgisi logla
-		log.Printf("HATA: JSON parse hatası: %v, sorgu: %q", err, queryString)
+		log.Printf("MongoDB Extended JSON parse hatası: %v", err)
 
-		// Eğer sorgu kompleks bir JSON objesi olabilir - gelen sorgu bazen iç içe JSON objesi içinde olabilir
-		// Bu sorunu çözmek için, sorgudaki tüm escape karakterlerini ve newline'ları düzenleyelim
+		// BSON parser başarısız olursa, standart JSON parser'ı deneyelim
+		err = json.Unmarshal([]byte(queryString), &queryDoc)
 
-		// Önce sorguyu tek satıra indir
-		cleanQuery := strings.ReplaceAll(queryString, "\n", " ")
+		if err != nil {
+			log.Printf("Standart JSON parse de başarısız: %v", err)
 
-		// İçteki escapeleri kaldır, tırnakları düzelt
-		cleanQuery = strings.ReplaceAll(cleanQuery, "\\\"", "\"")
+			// Sorgu geldiği gibi MongoDB'ye göndermeyi deneyelim
+			// Önce find ve aggregate komutlarını kontrol edelim
+			if strings.Contains(queryString, "\"find\"") {
+				// Find sorgusu olabilir, basit bir find sorgusu oluşturalım
+				collName := ""
+				if findRegex := regexp.MustCompile(`"find"\s*:\s*"([^"]+)"`); findRegex.MatchString(queryString) {
+					matches := findRegex.FindStringSubmatch(queryString)
+					if len(matches) > 1 {
+						collName = matches[1]
+						log.Printf("Find collection adı: %s", collName)
 
-		// JSON objesini düzgün algılamak için köşeli parantezleri ve çift tırnakları kontrol et
-		if !strings.HasPrefix(cleanQuery, "{") {
-			// Sorgunun başında { yoksa, başlangıç ve bitiş parantezleri ekleyelim
-			cleanQuery = "{" + cleanQuery + "}"
-		}
-
-		// Temizlenmiş sorguyu parse etmeyi dene
-		log.Printf("Düzeltilmiş sorgu formatı: %s", cleanQuery)
-		err = json.Unmarshal([]byte(cleanQuery), &queryDoc)
-
-		// Hala hata varsa, sorgudaki gömülü JSON stringlerini kontrol edelim
-		if err != nil && strings.Contains(cleanQuery, "\"query\":") {
-			// "query" alanı içinde gömülü bir JSON olabilir
-			queryRegex := regexp.MustCompile(`"query":\s*"(.+?)"`)
-			if matches := queryRegex.FindStringSubmatch(cleanQuery); len(matches) >= 2 {
-				embeddedQuery := matches[1]
-				// Embedded JSON stringini gerçek JSON'a dönüştürmeye çalış
-				embeddedQuery = strings.ReplaceAll(embeddedQuery, "\\", "")
-				log.Printf("Gömülü sorgu tespit edildi: %s", embeddedQuery)
-
-				// Eğer bu bir gömülü JSON stringi ise, bunu ana sorgu olarak kullan
-				err = json.Unmarshal([]byte(embeddedQuery), &queryDoc)
-			}
-		}
-
-		// Eğer ilk karakter { değilse, JSON formatına çevirmeyi dene
-		if err != nil && !strings.HasPrefix(queryString, "{") {
-			log.Printf("JSON formatı değil, uyarlanmaya çalışılıyor...")
-
-			// Sorgunun ne olduğunu anlamaya çalış ve uygun formata çevir
-			if strings.Contains(queryString, "aggregate") || strings.Contains(queryString, "find") {
-				// Muhtemelen bir MongoDB komutu, ama JSON formatında değil
-				parts := strings.Split(queryString, ".")
-				if len(parts) >= 2 {
-					collection := strings.TrimSpace(parts[0])
-					rest := strings.TrimSpace(strings.Join(parts[1:], "."))
-
-					if strings.HasPrefix(rest, "find") {
-						matchFilter := regexp.MustCompile(`find\(([^)]*)\)`)
-						if matches := matchFilter.FindStringSubmatch(rest); len(matches) >= 2 {
-							filter := matches[1]
-							if filter == "" {
-								filter = "{}"
-							}
-							queryString = fmt.Sprintf(`{"find": "%s", "filter": %s}`, collection, filter)
-							log.Printf("Dönüştürülen find komutu: %s", queryString)
-							err = json.Unmarshal([]byte(queryString), &queryDoc)
+						// Basit bir find sorgusu oluştur
+						queryDoc = bson.M{
+							"find":   collName,
+							"filter": bson.M{},
 						}
-					} else if strings.HasPrefix(rest, "aggregate") {
-						matchPipeline := regexp.MustCompile(`aggregate\(([^)]*)\)`)
-						if matches := matchPipeline.FindStringSubmatch(rest); len(matches) >= 2 {
-							pipeline := matches[1]
-							if pipeline == "" {
-								pipeline = "[]"
+
+						// Filter varsa onu da almaya çalışalım
+						if filterRegex := regexp.MustCompile(`"filter"\s*:\s*({[^}]+})`); filterRegex.MatchString(queryString) {
+							matches := filterRegex.FindStringSubmatch(queryString)
+							if len(matches) > 1 {
+								filterStr := matches[1]
+								var filterDoc bson.M
+								if err := json.Unmarshal([]byte(filterStr), &filterDoc); err == nil {
+									queryDoc["filter"] = filterDoc
+								}
 							}
-							queryString = fmt.Sprintf(`{"aggregate": "%s", "pipeline": %s}`, collection, pipeline)
-							log.Printf("Dönüştürülen aggregate komutu: %s", queryString)
-							err = json.Unmarshal([]byte(queryString), &queryDoc)
 						}
+
+						// Hata sıfırlayalım
+						err = nil
+					}
+				}
+			} else if strings.Contains(queryString, "\"aggregate\"") {
+				// Aggregate sorgusu olabilir
+				collName := ""
+				if aggRegex := regexp.MustCompile(`"aggregate"\s*:\s*"([^"]+)"`); aggRegex.MatchString(queryString) {
+					matches := aggRegex.FindStringSubmatch(queryString)
+					if len(matches) > 1 {
+						collName = matches[1]
+						log.Printf("Aggregate collection adı: %s", collName)
+
+						// Basit bir aggregate sorgusu oluştur
+						queryDoc = bson.M{
+							"aggregate": collName,
+							"pipeline":  bson.A{},
+							"cursor":    bson.M{},
+						}
+
+						// Pipeline varsa onu da almaya çalışalım
+						if pipelineRegex := regexp.MustCompile(`"pipeline"\s*:\s*(\[[^\]]+\])`); pipelineRegex.MatchString(queryString) {
+							matches := pipelineRegex.FindStringSubmatch(queryString)
+							if len(matches) > 1 {
+								pipelineStr := matches[1]
+								var pipelineArray []interface{}
+								if err := json.Unmarshal([]byte(pipelineStr), &pipelineArray); err == nil {
+									queryDoc["pipeline"] = pipelineArray
+								}
+							}
+						}
+
+						// Hata sıfırlayalım
+						err = nil
 					}
 				}
 			}
-		}
 
-		// Hala hata varsa, doğrudan hata döndür
-		if err != nil {
-			errMsg := fmt.Sprintf("Sorgu JSON formatında değil: %v", err)
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-				Plan:         "",
-			}, nil
+			// Yine başarısız olursa direkt hata dön
+			if err != nil {
+				errMsg := fmt.Sprintf("Sorgu JSON formatında değil: %v", err)
+				log.Printf("HATA: %s", errMsg)
+				return &pb.ExplainQueryResponse{
+					Status:       "error",
+					ErrorMessage: errMsg,
+					Plan:         "",
+				}, nil
+			}
 		}
 	}
 
@@ -2888,165 +2874,102 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 	// Veritabanı bağlantısı
 	database := client.Database(req.Database)
 
+	// Açıklanacak komutun çekirdeğini oluştur
+	// Gereksiz MongoDB bağlantı meta verilerini kaldır
+	coreCmdDoc := bson.M{}
+
+	// Şimdi önemli alanları kopyala
+	for k, v := range queryDoc {
+		// $clusterTime, $db, lsid gibi meta alanları atla
+		if !strings.HasPrefix(k, "$") && k != "lsid" {
+			coreCmdDoc[k] = v
+		}
+	}
+
+	log.Printf("Temizlenmiş komut: %+v", coreCmdDoc)
+
 	// Sorgu tipine göre işlem yap
-	if _, hasAggregate := queryDoc["aggregate"]; hasAggregate {
+	if collName, hasAggregate := coreCmdDoc["aggregate"]; hasAggregate {
 		// Aggregate sorgusu
 		log.Printf("Aggregate sorgusu tespit edildi")
-		collectionName, ok := queryDoc["aggregate"].(string)
-		if !ok {
-			errMsg := "Aggregate collection ismi string değil"
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-			}, nil
-		}
-
-		// Pipeline'ı al
-		pipelineInterface, hasPipeline := queryDoc["pipeline"]
-		if !hasPipeline {
-			errMsg := "Pipeline bulunamadı"
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-			}, nil
-		}
-
-		// Pipeline'ı MongoDB komutuna dönüştür
-		pipelineBson, err := bson.Marshal(pipelineInterface)
-		if err != nil {
-			errMsg := fmt.Sprintf("Pipeline BSON'a dönüştürülemedi: %v", err)
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-			}, nil
-		}
 
 		var pipeline bson.A
-		err = bson.Unmarshal(pipelineBson, &pipeline)
-		if err != nil {
-			errMsg := fmt.Sprintf("Pipeline array'e dönüştürülemedi: %v", err)
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-			}, nil
+		if pipelineInterface, hasPipeline := coreCmdDoc["pipeline"]; hasPipeline {
+			if pipelineArray, ok := pipelineInterface.(bson.A); ok {
+				pipeline = pipelineArray
+			} else if pipelineArray, ok := pipelineInterface.([]interface{}); ok {
+				pipeline = bson.A(pipelineArray)
+			} else {
+				// Pipeline'ı BSON'a çevirmeyi dene
+				pipelineBson, err := bson.Marshal(pipelineInterface)
+				if err != nil {
+					errMsg := fmt.Sprintf("Pipeline BSON'a dönüştürülemedi: %v", err)
+					log.Printf("HATA: %s", errMsg)
+					return &pb.ExplainQueryResponse{
+						Status:       "error",
+						ErrorMessage: errMsg,
+					}, nil
+				}
+
+				err = bson.Unmarshal(pipelineBson, &pipeline)
+				if err != nil {
+					errMsg := fmt.Sprintf("Pipeline array'e dönüştürülemedi: %v", err)
+					log.Printf("HATA: %s", errMsg)
+					return &pb.ExplainQueryResponse{
+						Status:       "error",
+						ErrorMessage: errMsg,
+					}, nil
+				}
+			}
 		}
 
 		// Explain komutunu oluştur
+		cmdDoc := bson.D{
+			{Key: "aggregate", Value: collName},
+			{Key: "pipeline", Value: pipeline},
+			{Key: "cursor", Value: bson.D{}},
+		}
+
+		// Diğer parametreleri (limit, skip vb.) ekle
+		for k, v := range coreCmdDoc {
+			if k != "aggregate" && k != "pipeline" && k != "cursor" {
+				cmdDoc = append(cmdDoc, bson.E{Key: k, Value: v})
+			}
+		}
+
 		explainOpts := bson.D{
-			{Key: "explain", Value: bson.D{
-				{Key: "aggregate", Value: collectionName},
-				{Key: "pipeline", Value: pipeline},
-				{Key: "cursor", Value: bson.D{}},
-			}},
+			{Key: "explain", Value: cmdDoc},
 			{Key: "verbosity", Value: "allPlansExecution"},
 		}
 
 		log.Printf("MongoDB explain komutu: %+v", explainOpts)
 		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
-	} else if _, hasFind := queryDoc["find"]; hasFind {
+	} else if collName, hasFind := coreCmdDoc["find"]; hasFind {
 		// Find sorgusu
 		log.Printf("Find sorgusu tespit edildi")
-		collectionName, ok := queryDoc["find"].(string)
-		if !ok {
-			errMsg := "Find collection ismi string değil"
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-			}, nil
-		}
 
-		// Find filtresi
-		filter := bson.D{}
-		if filterInterface, hasFilter := queryDoc["filter"]; hasFilter {
-			filterBson, err := bson.Marshal(filterInterface)
-			if err != nil {
-				errMsg := fmt.Sprintf("Filter BSON'a dönüştürülemedi: %v", err)
-				log.Printf("HATA: %s", errMsg)
-				return &pb.ExplainQueryResponse{
-					Status:       "error",
-					ErrorMessage: errMsg,
-				}, nil
-			}
+		// Find komutunu oluştur, tüm ek parametreleri de ekle
+		cmdDoc := bson.D{{Key: "find", Value: collName}}
 
-			err = bson.Unmarshal(filterBson, &filter)
-			if err != nil {
-				errMsg := fmt.Sprintf("Filter BSON'dan dönüştürülemedi: %v", err)
-				log.Printf("HATA: %s", errMsg)
-				return &pb.ExplainQueryResponse{
-					Status:       "error",
-					ErrorMessage: errMsg,
-				}, nil
+		// Diğer parametreleri ekle (filter, sort, limit, skip)
+		for k, v := range coreCmdDoc {
+			if k != "find" {
+				cmdDoc = append(cmdDoc, bson.E{Key: k, Value: v})
 			}
 		}
 
-		// Explain komutunu oluştur
+		// Explain komutu
 		explainOpts := bson.D{
-			{Key: "explain", Value: bson.D{
-				{Key: "find", Value: collectionName},
-				{Key: "filter", Value: filter},
-			}},
-			{Key: "verbosity", Value: "allPlansExecution"},
-		}
-
-		// Sort, limit, skip gibi alanları da ekle (varsa)
-		findCommand := bson.D{
-			{Key: "find", Value: collectionName},
-			{Key: "filter", Value: filter},
-		}
-
-		if sortInterface, hasSort := queryDoc["sort"]; hasSort {
-			sortBson, err := bson.Marshal(sortInterface)
-			if err == nil {
-				var sort bson.D
-				if err = bson.Unmarshal(sortBson, &sort); err == nil {
-					findCommand = append(findCommand, bson.E{Key: "sort", Value: sort})
-				}
-			}
-		}
-
-		if limitInterface, hasLimit := queryDoc["limit"]; hasLimit {
-			limit, ok := limitInterface.(map[string]interface{})
-			if ok {
-				if limitNum, hasLimitNum := limit["$numberInt"]; hasLimitNum {
-					if limitStr, ok := limitNum.(string); ok {
-						if limitVal, err := strconv.Atoi(limitStr); err == nil {
-							findCommand = append(findCommand, bson.E{Key: "limit", Value: limitVal})
-						}
-					}
-				}
-			}
-		}
-
-		if skipInterface, hasSkip := queryDoc["skip"]; hasSkip {
-			skip, ok := skipInterface.(map[string]interface{})
-			if ok {
-				if skipNum, hasSkipNum := skip["$numberInt"]; hasSkipNum {
-					if skipStr, ok := skipNum.(string); ok {
-						if skipVal, err := strconv.Atoi(skipStr); err == nil {
-							findCommand = append(findCommand, bson.E{Key: "skip", Value: skipVal})
-						}
-					}
-				}
-			}
-		}
-
-		// Güncellenmiş explain komutu
-		explainOpts = bson.D{
-			{Key: "explain", Value: findCommand},
+			{Key: "explain", Value: cmdDoc},
 			{Key: "verbosity", Value: "allPlansExecution"},
 		}
 
 		log.Printf("MongoDB explain komutu: %+v", explainOpts)
 		err = database.RunCommand(ctx, explainOpts).Decode(&explainResult)
 	} else {
-		// Diğer tip sorgular - orijinal sorguyu doğrudan aç
+		// Diğer tip sorgular - temizlenmiş sorguyu doğrudan aç
 		explainOpts := bson.D{
-			{Key: "explain", Value: queryDoc},
+			{Key: "explain", Value: coreCmdDoc},
 			{Key: "verbosity", Value: "allPlansExecution"},
 		}
 
@@ -3056,26 +2979,42 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 
 	if err != nil {
 		// Son bir şans - doğrudan sorguyu çalıştırmayı dene
-		log.Printf("Direkt explain başarısız oldu, sorguyu doğrudan explain etmeyi deniyorum: %v", err)
-		adminDB := client.Database("admin")
+		log.Printf("Direkt explain başarısız oldu, farklı yaklaşım deneniyor: %v", err)
 
-		// Original sorgu dokümanını explain'e sar
-		explainCmd := bson.D{
-			{Key: "explain", Value: queryDoc},
-			{Key: "verbosity", Value: "allPlansExecution"},
-		}
-
-		log.Printf("Son şans MongoDB explain: %+v", explainCmd)
-		err = adminDB.RunCommand(ctx, explainCmd).Decode(&explainResult)
-
+		// MongoDB'nin native bson formatına dönüştürelim
+		cmdBytes, err := bson.Marshal(coreCmdDoc)
 		if err != nil {
-			errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
-			log.Printf("HATA: %s", errMsg)
-			return &pb.ExplainQueryResponse{
-				Status:       "error",
-				ErrorMessage: errMsg,
-				Plan:         "",
-			}, nil
+			log.Printf("BSON marshal hatası: %v", err)
+		} else {
+			var cmdNative bson.D
+			if err := bson.Unmarshal(cmdBytes, &cmdNative); err != nil {
+				log.Printf("BSON unmarshal hatası: %v", err)
+			} else {
+				// Native formatla explain dene
+				explainCmd := bson.D{
+					{Key: "explain", Value: cmdNative},
+					{Key: "verbosity", Value: "allPlansExecution"},
+				}
+
+				log.Printf("Son şans MongoDB explain (native BSON): %+v", explainCmd)
+				err = database.RunCommand(ctx, explainCmd).Decode(&explainResult)
+
+				if err != nil {
+					// Admin veritabanında dene
+					adminDB := client.Database("admin")
+					err = adminDB.RunCommand(ctx, explainCmd).Decode(&explainResult)
+
+					if err != nil {
+						errMsg := fmt.Sprintf("MongoDB sorgu planı alınamadı: %v", err)
+						log.Printf("HATA: %s", errMsg)
+						return &pb.ExplainQueryResponse{
+							Status:       "error",
+							ErrorMessage: errMsg,
+							Plan:         "",
+						}, nil
+					}
+				}
+			}
 		}
 	}
 
