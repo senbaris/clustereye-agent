@@ -2854,6 +2854,19 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 			if len(wrapper.Query) > 0 {
 				req.Query = string(wrapper.Query)
 				log.Printf("JSON içinden sorgu çıkarıldı (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+
+				// JSON string olabilir, escape karakterlerini temizle
+				if strings.HasPrefix(req.Query, "\"") && strings.HasSuffix(req.Query, "\"") {
+					// String içindeki tırnak işaretlerini kaldırma
+					unquotedStr, err := strconv.Unquote(req.Query)
+					if err == nil {
+						req.Query = unquotedStr
+						log.Printf("JSON string içindeki escape karakterleri temizlendi (ilk 50 karakter): %q",
+							req.Query[:min(len(req.Query), 50)])
+					} else {
+						log.Printf("String unquote hatası: %v", err)
+					}
+				}
 			}
 		} else {
 			log.Printf("JSON wrapper parse edilemedi: %v", err)
