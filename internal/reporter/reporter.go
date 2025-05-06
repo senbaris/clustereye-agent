@@ -3045,18 +3045,23 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 			if findValue, hasFind := explainObject["find"]; hasFind {
 				log.Printf("Find komutu bulundu: %v", findValue)
 
-				// Find komutunu oluştur
-				findCmd := bson.D{{Key: "find", Value: findValue}}
+				// Find komutunu oluştur - tüm parametreleri tek bir map içinde topla
+				findCmd := bson.M{
+					"find": findValue,
+				}
 
 				// Filter varsa ekle
 				if filterValue, hasFilter := explainObject["filter"]; hasFilter {
-					findCmd = append(findCmd, bson.E{Key: "filter", Value: filterValue})
+					findCmd["filter"] = filterValue
+				} else {
+					// MongoDB varsayılan boş filter ekle
+					findCmd["filter"] = bson.M{}
 				}
 
 				// Diğer parametreleri ekle (sort, limit, skip vb.)
 				for k, v := range explainObject {
 					if k != "find" && k != "filter" {
-						findCmd = append(findCmd, bson.E{Key: k, Value: v})
+						findCmd[k] = v
 					}
 				}
 
@@ -3071,26 +3076,31 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 			} else if aggValue, hasAgg := explainObject["aggregate"]; hasAgg {
 				log.Printf("Aggregate komutu bulundu: %v", aggValue)
 
-				// Aggregate komutunu oluştur
-				aggCmd := bson.D{{Key: "aggregate", Value: aggValue}}
+				// Aggregate komutunu oluştur - tüm parametreleri tek bir map içinde topla
+				aggCmd := bson.M{
+					"aggregate": aggValue,
+				}
 
 				// Pipeline varsa ekle
 				if pipelineValue, hasPipeline := explainObject["pipeline"]; hasPipeline {
-					aggCmd = append(aggCmd, bson.E{Key: "pipeline", Value: pipelineValue})
+					aggCmd["pipeline"] = pipelineValue
+				} else {
+					// MongoDB varsayılan boş pipeline ekle
+					aggCmd["pipeline"] = bson.A{}
 				}
 
 				// Cursor varsa ekle
 				if cursorValue, hasCursor := explainObject["cursor"]; hasCursor {
-					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: cursorValue})
+					aggCmd["cursor"] = cursorValue
 				} else {
 					// MongoDB varsayılan cursor ekle
-					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: bson.D{}})
+					aggCmd["cursor"] = bson.M{}
 				}
 
 				// Diğer parametreleri ekle
 				for k, v := range explainObject {
 					if k != "aggregate" && k != "pipeline" && k != "cursor" {
-						aggCmd = append(aggCmd, bson.E{Key: k, Value: v})
+						aggCmd[k] = v
 					}
 				}
 
@@ -3203,18 +3213,23 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		if explainValue, hasExplain := coreCmdDoc["explain"]; hasExplain {
 			if explainMap, ok := explainValue.(map[string]interface{}); ok {
 				if findValue, hasFind := explainMap["find"]; hasFind {
-					// Find komutu
-					findCmd := bson.D{{Key: "find", Value: findValue}}
+					// Find komutu - tüm parametreleri tek bir map içinde topla
+					findCmd := bson.M{
+						"find": findValue,
+					}
 
 					// Filter varsa ekle
 					if filterValue, hasFilter := explainMap["filter"]; hasFilter {
-						findCmd = append(findCmd, bson.E{Key: "filter", Value: filterValue})
+						findCmd["filter"] = filterValue
+					} else {
+						// MongoDB varsayılan boş filter ekle
+						findCmd["filter"] = bson.M{}
 					}
 
 					// Diğer parametreleri ekle
 					for k, v := range explainMap {
 						if k != "find" && k != "filter" {
-							findCmd = append(findCmd, bson.E{Key: k, Value: v})
+							findCmd[k] = v
 						}
 					}
 
@@ -3223,21 +3238,31 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 						{Key: "verbosity", Value: "allPlansExecution"},
 					}
 				} else if aggValue, hasAgg := explainMap["aggregate"]; hasAgg {
-					// Aggregate komutu
-					aggCmd := bson.D{{Key: "aggregate", Value: aggValue}}
+					// Aggregate komutu - tüm parametreleri tek bir map içinde topla
+					aggCmd := bson.M{
+						"aggregate": aggValue,
+					}
 
 					// Pipeline varsa ekle
 					if pipelineValue, hasPipeline := explainMap["pipeline"]; hasPipeline {
-						aggCmd = append(aggCmd, bson.E{Key: "pipeline", Value: pipelineValue})
+						aggCmd["pipeline"] = pipelineValue
+					} else {
+						// MongoDB varsayılan boş pipeline ekle
+						aggCmd["pipeline"] = bson.A{}
 					}
 
 					// Cursor ekle
-					aggCmd = append(aggCmd, bson.E{Key: "cursor", Value: bson.D{}})
+					if cursorValue, hasCursor := explainMap["cursor"]; hasCursor {
+						aggCmd["cursor"] = cursorValue
+					} else {
+						// MongoDB varsayılan cursor ekle
+						aggCmd["cursor"] = bson.M{}
+					}
 
 					// Diğer parametreleri ekle
 					for k, v := range explainMap {
 						if k != "aggregate" && k != "pipeline" && k != "cursor" {
-							aggCmd = append(aggCmd, bson.E{Key: k, Value: v})
+							aggCmd[k] = v
 						}
 					}
 
