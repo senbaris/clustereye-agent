@@ -1865,9 +1865,49 @@ func (r *Reporter) listenForCommands() {
 
 					// MongoDB sorgu açıklama işlevi için kontrol ekleyelim
 					if strings.Contains(query.Command, "explain") || strings.Contains(query.Command, "aggregate") ||
-						strings.Contains(query.Command, "find") || strings.Contains(query.Command, "pipeline") {
+						strings.Contains(query.Command, "find") || strings.Contains(query.Command, "pipeline") ||
+						strings.Contains(query.Command, "MONGODB_EXPLAIN") {
 
-						log.Printf("MongoDB sorgu açıklama isteği tespit edildi, ExplainMongoQuery çağrılıyor...")
+						log.Printf("MongoDB sorgu açıklama isteği tespit edildi, ham sorgu: %s", query.Command)
+
+						// Server protokol formatını kontrol et ve işle (MONGODB_EXPLAIN||<database>||<query_json>)
+						var queryStr string
+						var database string
+
+						if strings.HasPrefix(query.Command, "MONGODB_EXPLAIN") {
+							log.Printf("Server protokol formatı tespit edildi: MONGODB_EXPLAIN")
+
+							// Protokol formatını parse et
+							parts := strings.Split(query.Command, "||")
+							if len(parts) >= 3 {
+								// Format: MONGODB_EXPLAIN||<database>||<query_json>
+								database = parts[1]
+								queryStr = parts[2]
+								log.Printf("Protokol parse edildi: database=%s, sorgu uzunluğu=%d",
+									database, len(queryStr))
+							} else if len(parts) == 2 {
+								// Format: MONGODB_EXPLAIN||<query_json>
+								queryStr = parts[1]
+								database = query.Database // Orijinal database'i kullan
+								log.Printf("Eski protokol parse edildi: database=%s, sorgu uzunluğu=%d",
+									database, len(queryStr))
+							} else {
+								log.Printf("Geçersiz protokol formatı, sorguyu olduğu gibi kullanıyorum")
+								queryStr = query.Command
+								database = query.Database
+							}
+						} else {
+							// Normal sorgu
+							queryStr = query.Command
+							database = query.Database
+						}
+
+						// Sorguyu logla
+						if len(queryStr) > 100 {
+							log.Printf("MongoDB sorgusu (ilk 100 karakter): %s...", queryStr[:100])
+						} else {
+							log.Printf("MongoDB sorgusu: %s", queryStr)
+						}
 
 						// Hostname'den agentID oluştur
 						hostname, _ := os.Hostname()
@@ -1875,8 +1915,8 @@ func (r *Reporter) listenForCommands() {
 
 						explainReq := &pb.ExplainQueryRequest{
 							AgentId:  agentID,
-							Database: query.Database,
-							Query:    query.Command,
+							Database: database, // Protokolden gelen veya orijinal database
+							Query:    queryStr, // Protokolden çıkarılan sorgu
 						}
 
 						explainResp, err := r.ExplainMongoQuery(context.Background(), explainReq)
@@ -2735,6 +2775,23 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		}, nil
 	}
 
+	// Detaylı sorgu incelemesi - sorgu formatı analizi
+	log.Printf("Gelen ham sorgu string (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+	log.Printf("Sorgu uzunluğu: %d bytes", len(req.Query))
+	// İlk 10 byte'ı hex formatında logla
+	if len(req.Query) > 0 {
+		firstBytes := []byte(req.Query[:min(len(req.Query), 20)])
+		log.Printf("İlk 20 karakter hex: %x", firstBytes)
+	}
+
+	// Sorgu protokol kontrol - server'dan gelen protokol formatını kontrol et
+	if strings.HasPrefix(req.Query, "MONGODB_EXPLAIN||") {
+		log.Printf("Server protokol formatı tespit edildi: MONGODB_EXPLAIN|| prefixli sorgu")
+		// Prefix'i kaldır ve asıl sorguyu al
+		req.Query = strings.TrimPrefix(req.Query, "MONGODB_EXPLAIN||")
+		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+	}
+
 	// MongoDB kolektörünü oluştur
 	mongoCollector := mongo.NewMongoCollector(r.cfg)
 
@@ -2781,6 +2838,22 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 
 	if err != nil {
 		log.Printf("MongoDB Extended JSON parse hatası: %v", err)
+		log.Printf("Parse hata detayı: %T - %v", err, err)
+
+		// JSON parse hatasından önce, sorgunun geçerli JSON olup olmadığını kontrol et
+		if !isValidJSON(queryString) {
+			log.Printf("Sorgu geçerli bir JSON değil, server protokol formatı tekrar kontrol ediliyor...")
+
+			// JSON değilse ve server protokol formatı olabilir, başka bir ayrıştırma dene
+			if strings.Contains(queryString, "MONGODB_EXPLAIN") {
+				log.Printf("Sorgu içinde 'MONGODB_EXPLAIN' ifadesi bulundu, protokol formatı olabilir")
+				parts := strings.Split(queryString, "||")
+				if len(parts) > 1 {
+					queryString = parts[1]
+					log.Printf("Protokol ayrıştırması sonrası sorgu: %s", queryString)
+				}
+			}
+		}
 
 		// BSON parser başarısız olursa, standart JSON parser'ı deneyelim
 		err = json.Unmarshal([]byte(queryString), &queryDoc)
@@ -3088,4 +3161,18 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		Status: "success",
 		Plan:   planText,
 	}, nil
+}
+
+// isValidJSON, string'in geçerli bir JSON olup olmadığını kontrol eder
+func isValidJSON(s string) bool {
+	var js interface{}
+	return json.Unmarshal([]byte(s), &js) == nil
+}
+
+// min returns the smaller of x or y.
+func min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
