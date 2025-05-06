@@ -1866,11 +1866,11 @@ func (r *Reporter) listenForCommands() {
 					// MongoDB sorgu açıklama işlevi için kontrol ekleyelim
 					if strings.Contains(query.Command, "explain") || strings.Contains(query.Command, "aggregate") ||
 						strings.Contains(query.Command, "find") || strings.Contains(query.Command, "pipeline") ||
-						strings.Contains(query.Command, "MONGODB_EXPLAIN") {
+						strings.Contains(query.Command, "MONGODB_EXPLAIN") || strings.Contains(query.Command, "MONGO_EXPLAIN") {
 
 						log.Printf("MongoDB sorgu açıklama isteği tespit edildi, ham sorgu: %s", query.Command)
 
-						// Server protokol formatını kontrol et ve işle (MONGODB_EXPLAIN||<database>||<query_json>)
+						// Server protokol formatını kontrol et ve işle (MONGO_EXPLAIN|<database>|<query_json>)
 						var queryStr string
 						var database string
 
@@ -1887,6 +1887,28 @@ func (r *Reporter) listenForCommands() {
 									database, len(queryStr))
 							} else if len(parts) == 2 {
 								// Format: MONGODB_EXPLAIN||<query_json>
+								queryStr = parts[1]
+								database = query.Database // Orijinal database'i kullan
+								log.Printf("Eski protokol parse edildi: database=%s, sorgu uzunluğu=%d",
+									database, len(queryStr))
+							} else {
+								log.Printf("Geçersiz protokol formatı, sorguyu olduğu gibi kullanıyorum")
+								queryStr = query.Command
+								database = query.Database
+							}
+						} else if strings.HasPrefix(query.Command, "MONGO_EXPLAIN") {
+							log.Printf("Server protokol formatı tespit edildi: MONGO_EXPLAIN")
+
+							// Protokol formatını parse et - | ayracını kullanıyor
+							parts := strings.Split(query.Command, "|")
+							if len(parts) >= 3 {
+								// Format: MONGO_EXPLAIN|<database>|<query_json>
+								database = parts[1]
+								queryStr = parts[2]
+								log.Printf("Protokol parse edildi: database=%s, sorgu uzunluğu=%d",
+									database, len(queryStr))
+							} else if len(parts) == 2 {
+								// Format: MONGO_EXPLAIN|<query_json>
 								queryStr = parts[1]
 								database = query.Database // Orijinal database'i kullan
 								log.Printf("Eski protokol parse edildi: database=%s, sorgu uzunluğu=%d",
@@ -2789,6 +2811,25 @@ func (r *Reporter) ExplainMongoQuery(ctx context.Context, req *pb.ExplainQueryRe
 		log.Printf("Server protokol formatı tespit edildi: MONGODB_EXPLAIN|| prefixli sorgu")
 		// Prefix'i kaldır ve asıl sorguyu al
 		req.Query = strings.TrimPrefix(req.Query, "MONGODB_EXPLAIN||")
+		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
+	} else if strings.HasPrefix(req.Query, "MONGO_EXPLAIN|") {
+		log.Printf("Server protokol formatı tespit edildi: MONGO_EXPLAIN| prefixli sorgu")
+		// Protokol formatını parse et
+		parts := strings.Split(req.Query, "|")
+		if len(parts) >= 3 {
+			// Format: MONGO_EXPLAIN|<database>|<query_json>
+			// Database bilgisini güncelle
+			newDatabase := parts[1]
+			if newDatabase != "" && req.Database == "" {
+				req.Database = newDatabase
+				log.Printf("Protokolden veritabanı alındı: %s", req.Database)
+			}
+			// Sorguyu güncelle
+			req.Query = parts[2]
+		} else if len(parts) == 2 {
+			// Format: MONGO_EXPLAIN|<query_json>
+			req.Query = parts[1]
+		}
 		log.Printf("Prefix kaldırıldı, yeni sorgu (ilk 50 karakter): %q", req.Query[:min(len(req.Query), 50)])
 	}
 
