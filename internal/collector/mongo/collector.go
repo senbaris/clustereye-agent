@@ -3,6 +3,7 @@ package mongo
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -1676,4 +1677,77 @@ func (c *MongoCollector) GetClient() (*mongo.Client, error) {
 	}
 
 	return client, nil
+}
+
+// ExplainMongoQuery, MongoDB sorgu planını explain() kullanarak getirir
+func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, error) {
+	// MongoDB bağlantısını al
+	client, err := c.GetClient()
+	if err != nil {
+		log.Printf("MongoDB explain bağlantısı açılamadı: %v", err)
+		return "", fmt.Errorf("MongoDB bağlantısı açılamadı: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	log.Printf("ExplainMongoQuery başlatılıyor. Veritabanı: %s, Sorgu Boyutu: %d bytes",
+		database, len(queryStr))
+
+	// Sorguyu BSON formatına çevir
+	var queryDoc bson.D
+	if err := bson.UnmarshalExtJSON([]byte(queryStr), true, &queryDoc); err != nil {
+		log.Printf("MongoDB sorgusu JSON formatına çevrilemedi: %v", err)
+		return "", fmt.Errorf("sorgu JSON formatına çevrilemedi: %v", err)
+	}
+
+	log.Printf("MongoDB sorgusu başarıyla parse edildi")
+
+	// Veritabanı bağlantısı
+	db := client.Database(database)
+
+	// Sorgu tipi ne olursa olsun, explain komutunu kullan
+	explainOpts := bson.D{
+		{Key: "explain", Value: queryDoc},
+		{Key: "verbosity", Value: "allPlansExecution"},
+	}
+
+	var explainResult bson.M
+	if err := db.RunCommand(context.Background(), explainOpts).Decode(&explainResult); err != nil {
+		// Admin veritabanında tekrar deneyelim
+		log.Printf("Explain sorgu hatası: %v, admin veritabanında tekrar deneniyor", err)
+		adminDB := client.Database("admin")
+		if err := adminDB.RunCommand(context.Background(), explainOpts).Decode(&explainResult); err != nil {
+			log.Printf("Admin veritabanında da explain başarısız: %v", err)
+			return "", fmt.Errorf("MongoDB sorgu planı alınamadı: %v", err)
+		}
+	}
+
+	// Sonucu yapılandırılmış JSON formatına dönüştür
+	var planParts []string
+
+	// queryPlanner bölümü
+	if queryPlanner, exists := explainResult["queryPlanner"]; exists {
+		qpBytes, _ := json.MarshalIndent(queryPlanner, "", "  ")
+		planParts = append(planParts, "## Query Planner\n"+string(qpBytes))
+	}
+
+	// executionStats bölümü
+	if execStats, exists := explainResult["executionStats"]; exists {
+		esBytes, _ := json.MarshalIndent(execStats, "", "  ")
+		planParts = append(planParts, "## Execution Stats\n"+string(esBytes))
+	}
+
+	// serverInfo bölümü
+	if serverInfo, exists := explainResult["serverInfo"]; exists {
+		siBytes, _ := json.MarshalIndent(serverInfo, "", "  ")
+		planParts = append(planParts, "## Server Info\n"+string(siBytes))
+	}
+
+	// Hiçbir bölüm bulunamadıysa tam sonucu kullan
+	if len(planParts) == 0 {
+		resultBytes, _ := json.MarshalIndent(explainResult, "", "  ")
+		return string(resultBytes), nil
+	}
+
+	// Tüm bölümleri birleştir
+	return strings.Join(planParts, "\n\n"), nil
 }
