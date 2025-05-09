@@ -618,6 +618,7 @@ func (m *AlarmMonitor) checkSlowQueries() {
 		FROM pg_stat_activity
 		WHERE state = 'active'
 		AND query NOT ILIKE '%%pg_stat_activity%%'
+		AND query NOT ILIKE '%%START_REPLICATION%%'
 		AND query NOT ILIKE '%%START_REPLICATION SLOT%%'
 		AND query NOT ILIKE '%%autovacuum: %%'   -- Autovacuum sorgularını hariç tut
 		AND query NOT ILIKE '%%VACUUM %%'        -- Manual VACUUM sorgularını da hariç tut
