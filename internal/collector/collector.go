@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 
-	_ "github.com/lib/pq" // PostgreSQL sürücüsü
+	_ "github.com/lib/pq"               // PostgreSQL sürücüsü
+	_ "github.com/microsoft/go-mssqldb" // MSSQL sürücüsü
+	"github.com/senbaris/clustereye-agent/internal/collector/mssql"
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/model"
 )
@@ -36,6 +39,12 @@ func (c *Collector) Collect() (*model.SystemData, error) {
 		return nil, err
 	}
 
+	// MSSQL verilerini topla
+	mssqlData, err := c.collectMSSQLData()
+	if err != nil {
+		return nil, err
+	}
+
 	// Sistem verilerini topla
 	sysData, err := c.collectSystemData()
 	if err != nil {
@@ -46,9 +55,10 @@ func (c *Collector) Collect() (*model.SystemData, error) {
 	return &model.SystemData{
 		AgentKey:   c.cfg.Key,
 		AgentName:  c.cfg.Name,
-		Timestamp:  model.GetCurrentTimestamp(),
+		Timestamp:  time.Now().Unix(),
 		PostgreSQL: pgData,
 		MongoDB:    mongoData,
+		MSSQL:      mssqlData,
 		System:     sysData,
 	}, nil
 }
@@ -147,6 +157,35 @@ func (c *Collector) collectMongoData() (*model.MongoDBData, error) {
 	}, nil
 }
 
+// collectMSSQLData MSSQL verilerini toplar
+func (c *Collector) collectMSSQLData() (*model.MSSQLData, error) {
+	// Şimdilik basit bir durum kontrolü yapalım
+	// MSSQL kolektörünü oluştur
+	collector := mssql.NewMSSQLCollector(c.cfg)
+
+	// Bağlantıyı test et
+	db, err := collector.GetClient()
+	if err != nil {
+		log.Printf("MSSQL bağlantısı açılamadı: %v", err)
+		return &model.MSSQLData{Status: "error"}, nil
+	}
+	defer db.Close()
+
+	// Basit bir sorgu çalıştır - bağlantı sayısı
+	var connections int
+	err = db.QueryRow("SELECT COUNT(*) FROM sys.dm_exec_connections").Scan(&connections)
+	if err != nil {
+		log.Printf("MSSQL bağlantı sayısı alınamadı: %v", err)
+		connections = 0
+	}
+
+	// Basit verileri döndür
+	return &model.MSSQLData{
+		Status:      "running",
+		Connections: connections,
+	}, nil
+}
+
 // TestMongoConnection MongoDB bağlantısını test eder
 func (c *Collector) TestMongoConnection() (string, error) {
 	// MongoDB bağlantı bilgilerini yapılandırma dosyasından al
@@ -171,6 +210,33 @@ func (c *Collector) TestMongoConnection() (string, error) {
 	// Gerçek bağlantı testi için mongo driver kullanılmalı
 	log.Printf("MongoDB bağlantı testi başarılı kabul ediliyor")
 	return "success", nil
+}
+
+// TestMSSQLConnection MSSQL bağlantısını test eder
+func (c *Collector) TestMSSQLConnection() string {
+	// MSSQL kolektörünü oluştur
+	collector := mssql.NewMSSQLCollector(c.cfg)
+
+	// Bağlantıyı test et
+	db, err := collector.GetClient()
+	if err != nil {
+		errMsg := fmt.Sprintf("fail:connection_error:%v", err)
+		log.Printf("MSSQL bağlantısı açılamadı: %v", err)
+		return errMsg
+	}
+	defer db.Close()
+
+	// Basit bir sorgu çalıştır
+	var version string
+	err = db.QueryRow("SELECT @@VERSION").Scan(&version)
+	if err != nil {
+		errMsg := fmt.Sprintf("fail:query_error:%v", err)
+		log.Printf("MSSQL sorgusu başarısız: %v", err)
+		return errMsg
+	}
+
+	log.Printf("MSSQL bağlantısı başarılı. Versiyon: %s", version)
+	return "success"
 }
 
 // collectSystemData sistem verilerini toplar

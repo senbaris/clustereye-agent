@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
+	"github.com/senbaris/clustereye-agent/internal/collector/mssql"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -525,6 +526,73 @@ func (r *Reporter) Report(data *pb.PostgresInfo) error {
 	return nil
 }
 
+// SendMSSQLInfo MSSQL bilgilerini toplar ve sunucuya gönderir
+func (r *Reporter) SendMSSQLInfo() error {
+	// MSSQL kolektörünü oluştur
+	log.Printf("MSSQL bilgileri toplanıyor...")
+	collector := mssql.NewMSSQLCollector(r.cfg)
+
+	// MSSQL bilgilerini al
+	mssqlInfo := collector.GetMSSQLInfo()
+	if mssqlInfo == nil {
+		return fmt.Errorf("MSSQL bilgileri alınamadı")
+	}
+
+	// MSSQL bilgilerini protobuf mesajına dönüştür
+	protoInfo := mssqlInfo.ToProto()
+
+	// MSSQL bilgilerini log'a yaz
+	log.Printf("MSSQL bilgileri: IP=%s, Hostname=%s, NodeStatus=%s, Version=%s, Status=%s, Instance=%s",
+		protoInfo.Ip, protoInfo.Hostname, protoInfo.NodeStatus, protoInfo.Version, protoInfo.Status, protoInfo.Instance)
+
+	// Yeni SendMSSQLInfo RPC'sini kullanarak verileri gönder
+	client := pb.NewAgentServiceClient(r.grpcClient)
+
+	// MSSQLInfoRequest oluştur
+	request := &pb.MSSQLInfoRequest{
+		MssqlInfo: protoInfo,
+	}
+
+	// SendMSSQLInfo RPC'sini çağır
+	response, err := client.SendMSSQLInfo(context.Background(), request)
+	if err != nil {
+		log.Printf("MSSQL bilgileri yeni RPC ile gönderilemedi: %v. Eski yöntem deneniyor...", err)
+
+		// Eski yöntem: Stream üzerinden gönder
+		err = r.ReportMSSQLInfo(protoInfo)
+		if err != nil {
+			log.Printf("MSSQL bilgileri eski yöntemle de gönderilemedi: %v", err)
+			return err
+		}
+
+		log.Println("MSSQL bilgileri başarıyla eski yöntemle gönderildi")
+		return nil
+	}
+
+	log.Printf("MSSQL bilgileri başarıyla gönderildi. Sunucu durumu: %s", response.Status)
+	return nil
+}
+
+// ReportMSSQLInfo MSSQL bilgilerini sunucuya gönderir
+func (r *Reporter) ReportMSSQLInfo(data *pb.MSSQLInfo) error {
+	// Create the complete AgentMessage with MSSQLInfo as the payload
+	message := &pb.AgentMessage{
+		Payload: &pb.AgentMessage_MssqlInfo{
+			MssqlInfo: data,
+		},
+	}
+
+	// Send the complete message
+	err := r.stream.Send(message)
+	if err != nil {
+		return fmt.Errorf("MSSQL bilgileri gönderilemedi: %v", err)
+	}
+
+	log.Printf("MSSQL bilgileri başarıyla raporlandı: %s", data.Hostname)
+	return nil
+}
+
+// AgentRegistration agent bilgilerini sunucuya gönderir
 func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 	hostname, _ := os.Hostname()
 	ip := utils.GetLocalIP()
@@ -627,6 +695,11 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			// İlk MongoDB bilgilerini gönder
 			if err := r.SendMongoInfo(); err != nil {
 				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
+			}
+		} else if platform == "mssql" {
+			// İlk MSSQL bilgilerini gönder
+			if err := r.SendMSSQLInfo(); err != nil {
+				log.Printf("MSSQL bilgileri gönderilemedi: %v", err)
 			}
 		}
 
@@ -2492,32 +2565,44 @@ func (r *Reporter) ListMongoLogs(ctx context.Context, req *pb.MongoLogListReques
 
 // StartPeriodicReporting periyodik raporlamayı başlatır
 func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform string) {
+	// Önceki timer varsa durdur
+	if r.reportTicker != nil {
+		r.reportTicker.Stop()
+	}
+
+	// Yeni bir timer başlat
 	r.reportTicker = time.NewTicker(interval)
 
+	// Timer için dinleme işlemi başlat
 	go func() {
 		for {
 			select {
-			case <-r.stopCh:
-				r.reportTicker.Stop()
-				return
 			case <-r.reportTicker.C:
-				// Platform seçimine göre raporlama yap
+				log.Printf("Periyodik raporlama başlatılıyor (platform: %s)...", platform)
+				var err error
+
+				// Platform tipine göre verileri topla ve gönder
 				if platform == "postgres" {
-					if err := r.SendPostgresInfo(); err != nil {
-						log.Printf("Periyodik PostgreSQL raporlama hatası: %v", err)
-					}
+					err = r.SendPostgresInfo()
 				} else if platform == "mongo" {
-					if err := r.SendMongoInfo(); err != nil {
-						log.Printf("Periyodik MongoDB raporlama hatası: %v", err)
-					}
-				} else {
-					log.Printf("Bilinmeyen platform tipi: %s", platform)
+					err = r.SendMongoInfo()
+				} else if platform == "mssql" {
+					err = r.SendMSSQLInfo()
 				}
+
+				if err != nil {
+					log.Printf("Periyodik raporlama hatası: %v", err)
+				}
+			case <-r.stopCh:
+				if r.reportTicker != nil {
+					r.reportTicker.Stop()
+				}
+				return
 			}
 		}
 	}()
 
-	log.Printf("Periyodik raporlama başlatıldı (aralık: %v, platform: %s)", interval, platform)
+	log.Printf("Periyodik raporlama başlatıldı: Her %v", interval)
 }
 
 // AnalyzeMongoLog, MongoDB log dosyasını analiz eder ve önemli log girdilerini döndürür
@@ -2690,8 +2775,9 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Data Directory kontrolü
 	dataDir := req.DataDirectory
 	if dataDir == "" {
-		// Eğer data directory verilmemişse, konfigürasyon dosyasından bulmaya çalış
 		log.Printf("Data directory belirtilmemiş, PostgreSQL konfigürasyonundan bulmaya çalışılıyor...")
+
+		// Eğer data directory verilmemişse, konfigürasyon dosyasından bulmaya çalış
 		configFile, err := postgres.FindPostgresConfigFile()
 		if err == nil {
 			log.Printf("PostgreSQL konfigürasyon dosyası bulundu: %s", configFile)
@@ -2699,10 +2785,16 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 			if err == nil {
 				lines := strings.Split(string(content), "\n")
 				for _, line := range lines {
-					if strings.Contains(line, "data_directory") {
-						parts := strings.Split(line, "'")
+					line = strings.TrimSpace(line)
+					// Yorumları kaldır
+					if idx := strings.Index(line, "#"); idx >= 0 {
+						line = line[:idx]
+					}
+					if strings.HasPrefix(line, "data_directory") {
+						parts := strings.SplitN(line, "=", 2)
 						if len(parts) >= 2 {
-							dataDir = strings.TrimSpace(parts[1])
+							// Tırnak işaretlerini ve boşlukları kaldır
+							dataDir = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 							log.Printf("Konfigürasyondan data directory bulundu: %s", dataDir)
 							break
 						}
@@ -2713,6 +2805,30 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 			}
 		} else {
 			log.Printf("PostgreSQL konfigürasyon dosyası bulunamadı: %v", err)
+		}
+
+		// Yine bulunamadıysa ps çıktısını kontrol et
+		if dataDir == "" {
+			log.Printf("Data directory konfigürasyondan bulunamadı, process çıktısı kontrol ediliyor...")
+			cmd := exec.Command("ps", "aux")
+			output, err := cmd.Output()
+			if err == nil {
+				lines := strings.Split(string(output), "\n")
+				for _, line := range lines {
+					if strings.Contains(line, "postgres") || strings.Contains(line, "postmaster") {
+						if idx := strings.Index(line, "-D"); idx >= 0 {
+							fields := strings.Fields(line[idx:])
+							if len(fields) >= 2 {
+								dataDir = fields[1]
+								log.Printf("Data directory process çıktısından bulundu: %s", dataDir)
+								break
+							}
+						}
+					}
+				}
+			} else {
+				log.Printf("Process listesi alınamadı: %v", err)
+			}
 		}
 
 		// Yine bulunamadıysa varsayılan değeri kullan

@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -213,37 +212,6 @@ func getDataDirectoryFromConfig() (string, error) {
 	}
 
 	return "", fmt.Errorf("data_directory parametresi bulunamadı")
-}
-
-// GetDiskUsage disk kullanım bilgilerini döndürür
-func GetDiskUsage() (string, int) {
-	// PostgreSQL veri dizinini bul
-	dataDir, err := getDataDirectoryFromConfig()
-	if err != nil {
-		log.Printf("PostgreSQL veri dizini bulunamadı: %v", err)
-		return "N/A", 0
-	}
-
-	// Disk kullanım bilgilerini al
-	var stat syscall.Statfs_t
-	err = syscall.Statfs(dataDir, &stat)
-	if err != nil {
-		log.Printf("Disk kullanım bilgileri alınamadı: %v", err)
-		return "N/A", 0
-	}
-
-	// Boş alanı hesapla
-	freeBytes := stat.Bfree * uint64(stat.Bsize)
-	totalBytes := stat.Blocks * uint64(stat.Bsize)
-	usedBytes := totalBytes - freeBytes
-
-	// Yüzdeyi hesapla
-	percent := int((float64(usedBytes) / float64(totalBytes)) * 100)
-
-	// Boş alanı okunabilir formata çevir
-	freeDisk := convertSize(freeBytes)
-
-	return freeDisk, percent
 }
 
 // GetReplicationLagSec replication lag'i saniye cinsinden döndürür

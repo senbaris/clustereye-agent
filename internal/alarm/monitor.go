@@ -166,9 +166,18 @@ func (m *AlarmMonitor) checkAlarms() {
 		m.checkMemoryUsage()
 		// Disk kullanımını kontrol et
 		m.checkDiskUsage()
+	} else if m.platform == "mssql" {
+		// MSSQL kontrolleri
+		m.checkDiskUsage()
+
+		// Yavaş sorgu kontrolünü şimdilik basit tutuyoruz
+		log.Printf("MSSQL alarm kontrolleri yapılıyor...")
 	} else {
 		log.Printf("Bilinmeyen platform: %s", m.platform)
 	}
+
+	// Sistem kaynaklarını kontrol etme fonksiyonu şimdilik kapalı
+	// m.checkSystemResources()
 }
 
 // checkPostgreSQLServiceStatus PostgreSQL servis durumunu kontrol eder
@@ -1275,4 +1284,10 @@ func getOSVersion() string {
 		return "unknown"
 	}
 	return strings.TrimSpace(string(output))
+}
+
+// checkMSSQLSlowQueries yavaş MSSQL sorgularını kontrol eder ve alarm üretir
+func (m *AlarmMonitor) checkMSSQLSlowQueries() {
+	// Şimdilik sadece log mesajı basalım
+	log.Printf("MSSQL yavaş sorgu kontrolü şimdilik devre dışı")
 }

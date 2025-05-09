@@ -14,7 +14,7 @@ import (
 
 func main() {
 	// Command line argümanlarını analiz etmek için flag'ler tanımla
-	platformFlag := flag.String("platform", "postgres", "Hangi platform için izleme yapılacak (postgres veya mongo)")
+	platformFlag := flag.String("platform", "postgres", "Hangi platform için izleme yapılacak (postgres, mongo veya mssql)")
 	helpFlag := flag.Bool("help", false, "Yardım mesajını görüntüle")
 	versionFlag := flag.Bool("version", false, "Versiyon bilgisini görüntüle")
 
@@ -29,7 +29,7 @@ func main() {
 		fmt.Println("  agent [flags]")
 		fmt.Println("")
 		fmt.Println("Flags:")
-		fmt.Println("  -platform string    Hangi platform için izleme yapılacak (postgres veya mongo) (default \"postgres\")")
+		fmt.Println("  -platform string    Hangi platform için izleme yapılacak (postgres, mongo veya mssql) (default \"postgres\")")
 		fmt.Println("  -help               Yardım mesajını görüntüle")
 		fmt.Println("  -version            Versiyon bilgisini görüntüle")
 		return
@@ -37,7 +37,7 @@ func main() {
 
 	// Versiyon flag'i kontrol et
 	if *versionFlag {
-		fmt.Println("ClusterEye Agent v1.0.9")
+		fmt.Println("ClusterEye Agent v1.0.23")
 		return
 	}
 
@@ -45,8 +45,8 @@ func main() {
 	log.Printf("ClusterEye Agent başlatılıyor... Platform: %s", *platformFlag)
 
 	// Platform değerini kontrol et
-	if *platformFlag != "postgres" && *platformFlag != "mongo" {
-		log.Fatalf("Geçersiz platform değeri '%s'. 'postgres' veya 'mongo' kullanın.", *platformFlag)
+	if *platformFlag != "postgres" && *platformFlag != "mongo" && *platformFlag != "mssql" {
+		log.Fatalf("Geçersiz platform değeri '%s'. 'postgres', 'mongo' veya 'mssql' kullanın.", *platformFlag)
 	}
 
 	// Agent yapılandırmasını yükle

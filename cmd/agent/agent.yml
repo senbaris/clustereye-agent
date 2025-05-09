@@ -16,3 +16,13 @@ mongo:
   port: 27017
   replset: rs0
   location: istanbul
+mssql:
+  host: localhost
+  user: sa
+  pass: YourPassword123!
+  port: 1433
+  instance: MSSQLSERVER
+  database: master
+  location: istanbul
+  trust_cert: true
+  windows_auth: false

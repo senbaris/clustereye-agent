@@ -17,7 +17,7 @@ type Agent struct {
 	collector *collector.Collector
 	reporter  *reporter.Reporter
 	stopCh    chan struct{}
-	platform  string // Hangi platform için çalışıyor (postgres veya mongo)
+	platform  string // Hangi platform için çalışıyor (postgres, mongo veya mssql)
 }
 
 // NewAgent yeni bir Agent örneği oluşturur
@@ -55,6 +55,9 @@ func (a *Agent) Start() error {
 	} else if a.platform == "mongo" {
 		testResult = a.testMongoConnection()
 		log.Printf("MongoDB bağlantı testi sonucu: %s", testResult)
+	} else if a.platform == "mssql" {
+		testResult = a.testMSSQLConnection()
+		log.Printf("MSSQL bağlantı testi sonucu: %s", testResult)
 	}
 
 	// Agent bilgilerini stream üzerinden gönder
@@ -88,6 +91,16 @@ func (a *Agent) testMongoConnection() string {
 	return mongoStatus
 }
 
+// testMSSQLConnection MSSQL bağlantısını test eder
+func (a *Agent) testMSSQLConnection() string {
+	// MSSQL bağlantı testi yap
+	log.Printf("MSSQL bağlantısı test ediliyor...")
+
+	// MSSQL bağlantısı test et
+	result := a.collector.TestMSSQLConnection()
+	return result
+}
+
 // Stop agent'ı durdurur
 func (a *Agent) Stop() {
 	log.Printf("Agent durduruluyor: %s", a.cfg.Name)
@@ -118,6 +131,9 @@ func (a *Agent) collectData() {
 	} else if a.platform == "mongo" {
 		// MongoDB bilgilerini topla ve raporla
 		a.reportMongoInfo()
+	} else if a.platform == "mssql" {
+		// MSSQL bilgilerini topla ve raporla
+		a.reportMSSQLInfo()
 	}
 }
 
@@ -132,5 +148,19 @@ func (a *Agent) reportMongoInfo() {
 		log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
 	} else {
 		log.Printf("MongoDB bilgileri başarıyla raporlandı")
+	}
+}
+
+// reportMSSQLInfo MSSQL bilgilerini toplar ve raporlar
+func (a *Agent) reportMSSQLInfo() {
+	// MSSQL bilgilerini topla
+	log.Printf("MSSQL bilgileri toplanıyor...")
+
+	// MSSQL bilgilerini raporla
+	err := a.reporter.SendMSSQLInfo()
+	if err != nil {
+		log.Printf("MSSQL bilgileri gönderilemedi: %v", err)
+	} else {
+		log.Printf("MSSQL bilgileri başarıyla raporlandı")
 	}
 }

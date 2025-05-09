@@ -15,4 +15,14 @@ mongo:
   pass: your-password
   port: 27017
   replset: rs0
-  location: your-location 
+  location: your-location
+mssql:
+  host: localhost
+  user: sa
+  pass: your-password
+  port: 1433
+  instance: MSSQLSERVER
+  database: master
+  location: your-location
+  trust_cert: true
+  windows_auth: false 

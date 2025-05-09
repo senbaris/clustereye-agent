@@ -37,6 +37,20 @@ type AgentConfig struct {
 		Location string `yaml:"location"`
 	} `yaml:"mongo"`
 
+	// MSSQL Bağlantı Bilgileri
+	MSSQL struct {
+		Host        string `yaml:"host"`
+		User        string `yaml:"user"`
+		Pass        string `yaml:"pass"`
+		Port        string `yaml:"port"`
+		Instance    string `yaml:"instance"`
+		Database    string `yaml:"database"`
+		Auth        bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
+		Location    string `yaml:"location"`
+		TrustCert   bool   `yaml:"trust_cert"`
+		WindowsAuth bool   `yaml:"windows_auth"`
+	} `yaml:"mssql"`
+
 	// GRPC Ayarları
 	GRPC struct {
 		ServerAddress string `yaml:"server_address"`
@@ -69,6 +83,7 @@ func LoadAgentConfig() (*AgentConfig, error) {
 	// Auth değerlerini belirle
 	config.PostgreSQL.Auth = config.PostgreSQL.User != "" && config.PostgreSQL.Pass != ""
 	config.Mongo.Auth = config.Mongo.User != "" && config.Mongo.Pass != ""
+	config.MSSQL.Auth = config.MSSQL.User != "" && config.MSSQL.Pass != "" && !config.MSSQL.WindowsAuth
 
 	return &config, nil
 }
@@ -88,6 +103,11 @@ func createDefaultAgentConfig(configPath string) (*AgentConfig, error) {
 	// MongoDB varsayılan ayarları
 	config.Mongo.Replset = "rs0"
 	config.Mongo.Port = "27017"
+
+	// MSSQL varsayılan ayarları
+	config.MSSQL.Port = "1433"
+	config.MSSQL.Database = "master"
+	config.MSSQL.TrustCert = true
 
 	// Konfigürasyonu YAML olarak dönüştür
 	data, err := yaml.Marshal(config)

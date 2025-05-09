@@ -16,9 +16,10 @@ type Response struct {
 type SystemData struct {
 	AgentKey   string          `json:"agent_key"`
 	AgentName  string          `json:"agent_name"`
-	Timestamp  string          `json:"timestamp"`
+	Timestamp  int64           `json:"timestamp"`
 	PostgreSQL *PostgreSQLData `json:"postgresql,omitempty"`
 	MongoDB    *MongoDBData    `json:"mongodb,omitempty"`
+	MSSQL      *MSSQLData      `json:"mssql,omitempty"`
 	System     *SystemMetrics  `json:"system"`
 }
 
@@ -40,9 +41,17 @@ type MongoDBData struct {
 	// Diğer MongoDB metrikleri
 }
 
+// MSSQLData MSSQL veritabanı verilerini içerir
+type MSSQLData struct {
+	Status      string `json:"status"`
+	Connections int    `json:"connections"`
+	// Diğer MSSQL metrikleri
+}
+
 // SystemMetrics sistem kaynak kullanım metriklerini içerir
 type SystemMetrics struct {
 	CPUUsage    float64 `json:"cpu_usage"`
+	CPUCores    int32   `json:"cpu_cores"`
 	MemoryUsage float64 `json:"memory_usage"`
 	DiskUsage   float64 `json:"disk_usage"`
 	// Diğer sistem metrikleri

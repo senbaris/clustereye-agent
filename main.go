@@ -4,15 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq" // PostgreSQL sürücüsü
+	_ "github.com/lib/pq"               // PostgreSQL sürücüsü
+	_ "github.com/microsoft/go-mssqldb" // MSSQL sürücüsü
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/reporter"
@@ -37,7 +40,65 @@ type AgentService struct {
 	reporter *reporter.Reporter
 }
 
+func setupLogging() (*os.File, error) {
+	var logPath string
+
+	// İşletim sistemine göre log dosyası yolunu belirle
+	if runtime.GOOS == "windows" {
+		// Windows için C:\Clustereye klasörünü oluştur
+		logPath = filepath.Join("C:", "Clustereye")
+		err := os.MkdirAll(logPath, 0755)
+		if err != nil {
+			// Ana klasör oluşturulamazsa, geçici klasöre yazalım
+			logPath = os.TempDir()
+		}
+		logPath = filepath.Join(logPath, "clustereye-agent.log")
+	} else {
+		// Linux/macOS için
+		logPath = "/var/log/clustereye-agent.log"
+
+		// Eğer dizine yazma hakkımız yoksa home klasörüne yazalım
+		if _, err := os.Stat("/var/log"); os.IsPermission(err) || os.IsNotExist(err) {
+			homeDir, err := os.UserHomeDir()
+			if err == nil {
+				logPath = filepath.Join(homeDir, ".clustereye", "agent.log")
+				// Klasörü oluştur
+				os.MkdirAll(filepath.Dir(logPath), 0755)
+			} else {
+				// Son çare olarak geçici dizini kullan
+				logPath = filepath.Join(os.TempDir(), "clustereye-agent.log")
+			}
+		}
+	}
+
+	// Log dosyasını aç (mevcut değilse oluştur, mevcutsa ekle)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	// Log kütüphanesine dosyaya yazmayı söyle
+	multiWriter := struct{ io.Writer }{io.MultiWriter(os.Stdout, f)}
+	log.SetOutput(multiWriter)
+
+	// Zaman damgası ve dosya bilgisi içeren log formatı
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	log.Printf("Logger başlatıldı. Log dosyası: %s", logPath)
+
+	return f, nil
+}
+
 func main() {
+	// Log dosyasını kur
+	logFile, err := setupLogging()
+	if err != nil {
+		log.Printf("UYARI: Log dosyası açılamadı: %v", err)
+	} else {
+		defer logFile.Close()
+		log.Printf("ClusterEye Agent başlatılıyor, versiyon 1.0.23")
+	}
+
 	// Konfigürasyonu yükle
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
@@ -61,6 +122,8 @@ func main() {
 		),
 	}
 
+	log.Printf("gRPC sunucusuna bağlanılıyor: %s", cfg.GRPC.ServerAddress)
+
 	conn, err := grpc.Dial(cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
 		log.Fatalf("gRPC sunucusuna bağlanılamadı: %v", err)
@@ -80,11 +143,58 @@ func main() {
 	hostname, _ := os.Hostname()
 	ip := getLocalIP()
 
-	// Kimlik doğrulama ayarlarını al
-	postgreAuth := cfg.PostgreSQL.Auth
+	// Test all database connections and select the platform
+	var platform string
+	var testResult string
+	var auth bool
 
-	// PostgreSQL bağlantı testi yap
-	testResult := testDBConnection(cfg)
+	// Test PostgreSQL
+	pgResult := testDBConnection(cfg)
+	if strings.HasPrefix(pgResult, "success") {
+		platform = "postgres"
+		testResult = pgResult
+		auth = cfg.PostgreSQL.Auth
+		log.Printf("PostgreSQL bağlantısı başarılı, bu platform ile devam ediliyor")
+	} else {
+		log.Printf("PostgreSQL bağlantısı başarısız, MongoDB deneniyor")
+
+		// Test MongoDB
+		mongoResult := "fail:not_tested"
+		mongoURI := fmt.Sprintf("mongodb://%s:%s@%s:%s/?authSource=admin",
+			cfg.Mongo.User, cfg.Mongo.Pass, cfg.Mongo.Host, cfg.Mongo.Port)
+
+		if !cfg.Mongo.Auth {
+			mongoURI = fmt.Sprintf("mongodb://%s:%s", cfg.Mongo.Host, cfg.Mongo.Port)
+		}
+
+		log.Printf("MongoDB bağlantısı test ediliyor: %s", mongoURI)
+		// Burada basit bir ağ bağlantısı kontrolü yap
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", cfg.Mongo.Host, cfg.Mongo.Port), 2*time.Second)
+		if err == nil {
+			conn.Close()
+			mongoResult = "success"
+			platform = "mongo"
+			testResult = mongoResult
+			auth = cfg.Mongo.Auth
+			log.Printf("MongoDB bağlantısı başarılı, bu platform ile devam ediliyor")
+		} else {
+			log.Printf("MongoDB bağlantısı başarısız, MSSQL deneniyor")
+
+			// Test MSSQL
+			mssqlResult := testMSSQLConnection(cfg)
+			if strings.HasPrefix(mssqlResult, "success") {
+				platform = "mssql"
+				testResult = mssqlResult
+				auth = cfg.MSSQL.Auth
+				log.Printf("MSSQL bağlantısı başarılı, bu platform ile devam ediliyor")
+			} else {
+				log.Printf("MSSQL bağlantısı da başarısız, varsayılan olarak PostgreSQL seçiliyor")
+				platform = "postgres" // Varsayılan olarak PostgreSQL kullan
+				testResult = pgResult
+				auth = cfg.PostgreSQL.Auth
+			}
+		}
+	}
 
 	// Agent bilgilerini gönder
 	agentInfo := &pb.AgentMessage{
@@ -94,8 +204,8 @@ func main() {
 				AgentId:      "agent_" + hostname,
 				Hostname:     hostname,
 				Ip:           ip,
-				Platform:     cfg.PostgreSQL.Cluster,
-				Auth:         postgreAuth,
+				Platform:     platform,
+				Auth:         auth,
 				Test:         testResult,
 				PostgresUser: cfg.PostgreSQL.User,
 				PostgresPass: cfg.PostgreSQL.Pass,
@@ -362,6 +472,69 @@ func testDBConnection(cfg *config.AgentConfig) string {
 	}
 
 	log.Printf("PostgreSQL bağlantısı başarılı. Versiyon: %s", version)
+	return "success"
+}
+
+// testMSSQLConnection tests the MSSQL connection and returns a status string
+func testMSSQLConnection(cfg *config.AgentConfig) string {
+	var connStr string
+
+	// Windows auth veya SQL auth
+	if cfg.MSSQL.WindowsAuth {
+		if cfg.MSSQL.Instance != "" {
+			connStr = fmt.Sprintf("server=%s\\%s;database=%s;trusted_connection=yes",
+				cfg.MSSQL.Host, cfg.MSSQL.Instance, cfg.MSSQL.Database)
+		} else {
+			connStr = fmt.Sprintf("server=%s,%s;database=%s;trusted_connection=yes",
+				cfg.MSSQL.Host, cfg.MSSQL.Port, cfg.MSSQL.Database)
+		}
+	} else {
+		if cfg.MSSQL.Instance != "" {
+			connStr = fmt.Sprintf("server=%s\\%s;user id=%s;password=%s;database=%s",
+				cfg.MSSQL.Host, cfg.MSSQL.Instance, cfg.MSSQL.User, cfg.MSSQL.Pass, cfg.MSSQL.Database)
+		} else {
+			connStr = fmt.Sprintf("server=%s,%s;user id=%s;password=%s;database=%s",
+				cfg.MSSQL.Host, cfg.MSSQL.Port, cfg.MSSQL.User, cfg.MSSQL.Pass, cfg.MSSQL.Database)
+		}
+	}
+
+	// Add TrustServerCertificate if needed
+	if cfg.MSSQL.TrustCert {
+		connStr += ";trustservercertificate=true"
+	}
+
+	connStr += ";connection timeout=5"
+
+	// Bağlantıyı açmayı dene
+	db, err := sql.Open("sqlserver", connStr)
+	if err != nil {
+		errMsg := fmt.Sprintf("fail:connection_error:%v", err)
+		log.Printf("MSSQL bağlantısı açılamadı: %v", err)
+		return errMsg
+	}
+	defer db.Close()
+
+	// Ping ile bağlantıyı test et
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		errMsg := fmt.Sprintf("fail:ping_error:%v", err)
+		log.Printf("MSSQL bağlantı testi başarısız: %v", err)
+		return errMsg
+	}
+
+	// Version bilgisini al
+	var version string
+	err = db.QueryRow("SELECT @@VERSION").Scan(&version)
+	if err != nil {
+		errMsg := fmt.Sprintf("fail:query_error:%v", err)
+		log.Printf("MSSQL sorgusu başarısız: %v", err)
+		return errMsg
+	}
+
+	log.Printf("MSSQL bağlantısı başarılı. Versiyon: %s", version)
 	return "success"
 }
 
