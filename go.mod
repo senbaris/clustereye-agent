@@ -6,7 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.10.9
 	github.com/microsoft/go-mssqldb v1.8.0
-	github.com/sefaphlvn/clustereye-test v1.0.15-0.20250509084008-745b6f3b312b
+	github.com/sefaphlvn/clustereye-test v1.0.21
 	go.mongodb.org/mongo-driver v1.17.3
 	google.golang.org/grpc v1.72.0
 	google.golang.org/protobuf v1.36.6

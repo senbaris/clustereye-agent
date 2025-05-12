@@ -761,8 +761,9 @@ func (r *Reporter) listenForCommands() {
 
 	var db *sql.DB
 	var processor *QueryProcessor
+	var mssqlProcessor *MSSQLQueryProcessor
 
-	// Sadece PostgreSQL platformu için veritabanı bağlantısı kur
+	// Platform bazlı veritabanı bağlantısı ve işleyici oluştur
 	if r.platform == "postgres" {
 		// Veritabanı bağlantısını aç
 		var err error
@@ -775,6 +776,10 @@ func (r *Reporter) listenForCommands() {
 
 		// Sorgu işleyiciyi oluştur
 		processor = NewQueryProcessor(db, r.cfg)
+	} else if r.platform == "mssql" {
+		// MSSQL sorgu işleyiciyi oluştur
+		mssqlProcessor = NewMSSQLQueryProcessor(r.cfg)
+		log.Println("MSSQL sorgu işleyicisi oluşturuldu")
 	}
 
 	// Mesaj işleme durumu
@@ -920,6 +925,144 @@ func (r *Reporter) listenForCommands() {
 				isProcessingQuery = true
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
+
+				// MSSQL sorguları için özel işleme
+				if r.platform == "mssql" && mssqlProcessor != nil {
+					// MSSQL sorgu ID'lerine göre özel işleme
+					if query.QueryId == "mssql_top_queries" || query.QueryId == "mssql_blocking" ||
+						strings.HasPrefix(query.QueryId, "mssql_") {
+
+						log.Printf("MSSQL sorgusu tespit edildi (ID: %s)", query.QueryId)
+
+						// MSSQL sorgu açıklama (explain) isteği için özel işleme
+						if strings.HasPrefix(query.Command, "MSSQL_EXPLAIN") {
+							log.Printf("MSSQL explain sorgusu tespit edildi: %s", shortenString(query.Command, 100))
+
+							// Protokol formatını parse et - ilk pipe (|) karakterini bul
+							firstPipeIndex := strings.Index(query.Command, "|")
+							if firstPipeIndex == -1 {
+								log.Printf("Geçersiz MSSQL_EXPLAIN format: %s", shortenString(query.Command, 100))
+
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": "Geçersiz MSSQL_EXPLAIN format. Doğru format: MSSQL_EXPLAIN|database|query",
+								}
+
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+								isProcessingQuery = false
+								continue
+							}
+
+							// Komuttaki ilk kısmı atla (MSSQL_EXPLAIN)
+							remainingCommand := query.Command[firstPipeIndex+1:]
+
+							// İkinci pipe karakterini bul
+							secondPipeIndex := strings.Index(remainingCommand, "|")
+							if secondPipeIndex == -1 {
+								log.Printf("Geçersiz MSSQL_EXPLAIN format: %s", shortenString(query.Command, 100))
+
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": "Geçersiz MSSQL_EXPLAIN format. Doğru format: MSSQL_EXPLAIN|database|query",
+								}
+
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+								isProcessingQuery = false
+								continue
+							}
+
+							// Database ve sorguyu çıkar
+							database := remainingCommand[:secondPipeIndex]
+							actualQuery := remainingCommand[secondPipeIndex+1:]
+
+							log.Printf("MSSQL explain işleniyor: Database=%s, Sorgu=%s", database, shortenString(actualQuery, 100))
+
+							// XML execution planını al
+							result := mssqlProcessor.processExplainMSSQLQuery(actualQuery, database)
+
+							// Sonucu gönder
+							sendQueryResult(r.stream, query.QueryId, result)
+							isProcessingQuery = false
+							continue
+						}
+
+						// MSSQL Best Practices Analysis için özel işleme
+						if strings.HasPrefix(query.Command, "MSSQL_BPA") {
+							log.Printf("MSSQL Best Practices Analysis sorgusu tespit edildi: %s", shortenString(query.Command, 100))
+
+							// Komut parametrelerini parse et (opsiyonel database ve server)
+							var databaseName, serverName string
+							parts := strings.Split(query.Command, "|")
+
+							if len(parts) > 1 && len(strings.TrimSpace(parts[1])) > 0 {
+								databaseName = strings.TrimSpace(parts[1])
+							}
+
+							if len(parts) > 2 && len(strings.TrimSpace(parts[2])) > 0 {
+								serverName = strings.TrimSpace(parts[2])
+							}
+
+							log.Printf("MSSQL Best Practices Analysis başlatılıyor: Database=%s, Server=%s",
+								databaseName, serverName)
+
+							// MSSQL Collector oluştur
+							collector := mssql.NewMSSQLCollector(r.cfg)
+
+							// Best Practices Analysis çalıştır
+							results, err := collector.RunBestPracticesAnalysis()
+							if err != nil {
+								log.Printf("MSSQL Best Practices Analysis başarısız: %v", err)
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": fmt.Sprintf("MSSQL Best Practices Analysis başarısız: %v", err),
+								}
+
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+								isProcessingQuery = false
+								continue
+							}
+
+							// Önce tüm time.Time değerlerini string'e dönüştür
+							processedResults := convertTimeValues(results).(map[string]interface{})
+
+							// Serialization through JSON to ensure all types are properly converted
+							processedResults, err = serializeViaJSON(processedResults)
+							if err != nil {
+								log.Printf("Serialization error: %v, continuing with original data", err)
+							}
+
+							// Analiz sonuçlarını başarılı olarak döndür
+							processedResults["status"] = "success"
+							processedResults["analysis_timestamp"] = time.Now().Format(time.RFC3339)
+							if databaseName != "" {
+								processedResults["database_name"] = databaseName
+							}
+							if serverName != "" {
+								processedResults["server_name"] = serverName
+							}
+
+							// Kompleks veri yapılarını düzleştir
+							flattenedResults := flattenMap(processedResults)
+
+							// Son analizin ne zaman yapıldığını logla
+							log.Printf("MSSQL Best Practices Analysis tamamlandı. %d kategori analiz edildi, %d öğe düzleştirildi",
+								len(processedResults), len(flattenedResults))
+
+							// Düzleştirilmiş sonucu gönder
+							sendQueryResult(r.stream, query.QueryId, flattenedResults)
+							isProcessingQuery = false
+							continue
+						}
+
+						// Normal MSSQL sorgusunu işle
+						result := mssqlProcessor.processMSSQLQuery(query.Command, query.Database)
+
+						// Sonucu gönder
+						sendQueryResult(r.stream, query.QueryId, result)
+						isProcessingQuery = false
+						continue
+					}
+				}
 
 				// MongoDB rs.freeze() komutu için özel işleme
 				if r.platform == "mongo" && strings.HasPrefix(query.Command, "rs.freeze") {
@@ -2314,6 +2457,214 @@ func shortenString(s string, maxLen int) string {
 	return s
 }
 
+// convertTimeValues recursively traverses a data structure and converts time.Time values to RFC3339 strings
+func convertTimeValues(data interface{}) interface{} {
+	switch v := data.(type) {
+	case time.Time:
+		// Convert time.Time to RFC3339 string
+		return v.Format(time.RFC3339)
+
+	case map[string]interface{}:
+		// Process each value in the map
+		result := make(map[string]interface{})
+		for key, value := range v {
+			result[key] = convertTimeValues(value)
+		}
+		return result
+
+	case []interface{}:
+		// Process each item in the slice
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = convertTimeValues(item)
+		}
+		return result
+
+	case []map[string]interface{}:
+		// Process each map in the slice
+		result := make([]map[string]interface{}, len(v))
+		for i, item := range v {
+			result[i] = convertTimeValues(item).(map[string]interface{})
+		}
+		return result
+
+	default:
+		// Return other types as is
+		return v
+	}
+}
+
+// flattenMap converts a nested map structure into a flat map with concatenated keys
+func flattenMap(data map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// First, extract and debug any problematic map[string][]map[string]interface{} structures
+	for key, value := range data {
+		// Check for map[string][]map[string]interface{} pattern that might cause issues
+		if nestedMap, ok := value.(map[string]interface{}); ok {
+			for nestedKey, nestedValue := range nestedMap {
+				if arrayOfMaps, isArrayOfMaps := nestedValue.([]map[string]interface{}); isArrayOfMaps {
+					log.Printf("Found map[string][]map[string]interface{} at %s.%s with %d elements",
+						key, nestedKey, len(arrayOfMaps))
+				}
+			}
+		}
+	}
+
+	// Recursive helper function to flatten the map
+	var flatten func(prefix string, value interface{})
+	flatten = func(prefix string, value interface{}) {
+		switch v := value.(type) {
+		case map[string]interface{}:
+			// For maps, recursively call flatten with each key-value pair
+			for k, val := range v {
+				key := k
+				if prefix != "" {
+					key = prefix + "_" + k
+				}
+
+				// Special handling for array of maps inside maps
+				if arrayOfMaps, isArrayOfMaps := val.([]map[string]interface{}); isArrayOfMaps {
+					log.Printf("Array düzleştiriliyor: %s_%s (eleman sayısı: %d)", prefix, k, len(arrayOfMaps))
+					result[key+"_count"] = len(arrayOfMaps)
+					for i, item := range arrayOfMaps {
+						for itemKey, itemValue := range item {
+							result[fmt.Sprintf("%s_%s_%d_%s", prefix, k, i, itemKey)] = itemValue
+						}
+					}
+				} else if arrayInterface, isArrayInterface := val.([]interface{}); isArrayInterface {
+					// Handle []interface{} that might contain maps
+					result[key+"_count"] = len(arrayInterface)
+					for i, item := range arrayInterface {
+						if mapItem, isMap := item.(map[string]interface{}); isMap {
+							for itemKey, itemValue := range mapItem {
+								result[fmt.Sprintf("%s_%s_%d_%s", prefix, k, i, itemKey)] = itemValue
+							}
+						} else {
+							result[fmt.Sprintf("%s_%s_%d", prefix, k, i)] = item
+						}
+					}
+				} else {
+					// Regular recursion for other types
+					flatten(key, val)
+				}
+			}
+
+		case []interface{}:
+			// For slices, add a count and flatten each element with an index
+			if len(v) > 0 {
+				result[prefix+"_count"] = len(v)
+				for i, val := range v {
+					if mapItem, isMap := val.(map[string]interface{}); isMap {
+						for itemKey, itemValue := range mapItem {
+							result[fmt.Sprintf("%s_%d_%s", prefix, i, itemKey)] = itemValue
+						}
+					} else {
+						result[fmt.Sprintf("%s_%d", prefix, i)] = val
+					}
+				}
+			} else {
+				// Empty slice, just record the count
+				result[prefix+"_count"] = 0
+			}
+
+		case []map[string]interface{}:
+			// For slices of maps, log it and handle similarly to []interface{}
+			log.Printf("Array düzleştiriliyor: %s (eleman sayısı: %d)", prefix, len(v))
+			result[prefix+"_count"] = len(v)
+			for i, item := range v {
+				for itemKey, itemValue := range item {
+					result[fmt.Sprintf("%s_%d_%s", prefix, i, itemKey)] = itemValue
+				}
+			}
+
+		default:
+			// For primitive values, just add them directly
+			result[prefix] = v
+		}
+	}
+
+	// Special handling for top-level keys that should not be nested further
+	for key, value := range data {
+		if key == "status" || key == "analysis_timestamp" || key == "database_name" || key == "server_name" {
+			result[key] = value
+			continue
+		}
+
+		switch v := value.(type) {
+		case map[string]interface{}:
+			// Log when flattening a nested map for debugging
+			if hasNestedArrays(v) {
+				log.Printf("İç içe map düzleştiriliyor: %s", key)
+			}
+			flatten(key, v)
+
+		case []map[string]interface{}:
+			// Log when flattening an array
+			log.Printf("Array düzleştiriliyor: %s (eleman sayısı: %d)", key, len(v))
+			result[key+"_count"] = len(v)
+			for i, item := range v {
+				for itemKey, itemValue := range item {
+					result[fmt.Sprintf("%s_%d_%s", key, i, itemKey)] = itemValue
+				}
+			}
+
+		case []interface{}:
+			// Handle top-level []interface{} arrays
+			log.Printf("İnteface array düzleştiriliyor: %s (eleman sayısı: %d)", key, len(v))
+			result[key+"_count"] = len(v)
+			for i, item := range v {
+				if mapItem, isMap := item.(map[string]interface{}); isMap {
+					for itemKey, itemValue := range mapItem {
+						result[fmt.Sprintf("%s_%d_%s", key, i, itemKey)] = itemValue
+					}
+				} else {
+					result[fmt.Sprintf("%s_%d", key, i)] = item
+				}
+			}
+
+		default:
+			// For other types, pass directly to the flatten function
+			flatten(key, value)
+		}
+	}
+
+	return result
+}
+
+// hasNestedArrays checks if a map contains any nested arrays of maps
+func hasNestedArrays(data map[string]interface{}) bool {
+	for _, value := range data {
+		switch v := value.(type) {
+		case []map[string]interface{}, []interface{}:
+			return true
+		case map[string]interface{}:
+			if hasNestedArrays(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// serializeViaJSON converts the data to JSON and back to ensure all types are properly converted
+func serializeViaJSON(data map[string]interface{}) (map[string]interface{}, error) {
+	// Convert to JSON
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		return data, fmt.Errorf("JSON serialization error: %v", err)
+	}
+
+	// Convert back to map[string]interface{}
+	var result map[string]interface{}
+	err = json.Unmarshal(jsonBytes, &result)
+	if err != nil {
+		return data, fmt.Errorf("JSON deserialization error: %v", err)
+	}
+
+	return result, nil
+}
+
 // reconnect bağlantıyı yeniden kurar ve agent kaydını tekrarlar
 func (r *Reporter) reconnect() error {
 	// Eski bağlantıyı kapat
@@ -3334,4 +3685,516 @@ func createReadablePlan(resultBytes []byte) string {
 	}
 
 	return planText
+}
+
+// MSSQLQueryProcessor, MSSQL sorgu işleme mantığını temsil eder
+type MSSQLQueryProcessor struct {
+	cfg *config.AgentConfig
+}
+
+// NewMSSQLQueryProcessor, yeni bir MSSQL sorgu işleyici oluşturur
+func NewMSSQLQueryProcessor(cfg *config.AgentConfig) *MSSQLQueryProcessor {
+	return &MSSQLQueryProcessor{
+		cfg: cfg,
+	}
+}
+
+// processExplainMSSQLQuery, MSSQL sorgusunun execution planını XML formatında döndürür
+func (p *MSSQLQueryProcessor) processExplainMSSQLQuery(query string, database string) map[string]interface{} {
+	log.Printf("[DEBUG] MSSQL Explain sorgusu işleniyor: %s", query)
+	log.Printf("[DEBUG] Hedef veritabanı: %s", database)
+
+	// İşlem başlangıç zamanını kaydet
+	startTime := time.Now()
+
+	// MSSQL kolektörünü oluştur
+	collector := mssql.NewMSSQLCollector(p.cfg)
+
+	// MSSQL bağlantısını aç
+	db, err := collector.GetClient()
+	if err != nil {
+		log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
+		return map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+		}
+	}
+	defer db.Close()
+
+	// Veritabanını kullanmaya ayarla
+	if database != "" {
+		useDbCmd := fmt.Sprintf("USE [%s]", database)
+		log.Printf("[DEBUG] Veritabanı değiştiriliyor: %s", useDbCmd)
+		_, err = db.Exec(useDbCmd)
+		if err != nil {
+			log.Printf("[ERROR] MSSQL veritabanı değiştirilemedi: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("MSSQL veritabanı değiştirilemedi: %v", err),
+			}
+		}
+		log.Printf("[DEBUG] MSSQL veritabanı '%s' olarak ayarlandı", database)
+	}
+
+	// SSMS'nin kullandığı yöntemi kullan - STATISTICS XML
+	// Bu yöntem hem sorgu sonuçlarını hem de XML planı döndürür (iki ayrı result set)
+	statsQuery := fmt.Sprintf(`
+SET STATISTICS XML ON;
+%s
+SET STATISTICS XML OFF;`, query)
+
+	log.Printf("[DEBUG] STATISTICS XML sorgusu çalıştırılıyor...")
+
+	// Sorguyu çalıştır
+	rows, err := db.Query(statsQuery)
+	if err != nil {
+		log.Printf("[ERROR] STATISTICS XML sorgusu çalıştırılırken hata: %v", err)
+		return createBasicPlanXML(query, database, startTime)
+	}
+	defer rows.Close()
+
+	// İlk result set sorgu sonuçları içerir - bu set boş olabilir, hata almamak için kontrol et
+	var xmlPlan string
+
+	// İlk result set için sütun bilgilerini logla
+	columns, err := rows.Columns()
+	if err != nil {
+		log.Printf("[ERROR] Result set sütunlarını okuma hatası: %v", err)
+	} else {
+		log.Printf("[DEBUG] İlk result set %d sütun içeriyor: %v", len(columns), columns)
+
+		// İlk result set satırlarını kontrol et ve logla
+		rowCount := 0
+		for rows.Next() {
+			rowCount++
+
+			// Dinamik olarak sütunları oku
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				log.Printf("[ERROR] İlk result set satırı okunamadı: %v", err)
+				continue
+			}
+
+			// Satır verilerini logla (ilk 5 satır, çok fazla veri olmaması için)
+			if rowCount <= 5 {
+				logRow := make(map[string]interface{})
+				for i, col := range columns {
+					var strVal string
+					val := values[i]
+
+					if val == nil {
+						strVal = "NULL"
+					} else {
+						switch v := val.(type) {
+						case []byte:
+							// XML veya büyük veriler için kısa özet göster
+							if len(v) > 100 {
+								strVal = fmt.Sprintf("BINARY_DATA(%d bytes)", len(v))
+								// XML içeriği kontrol et
+								if strings.Contains(string(v), "<ShowPlanXML") {
+									xmlPlan = string(v)
+									log.Printf("[DEBUG] İlk result sette XML plan bulundu (sütun: %s)", col)
+								}
+							} else {
+								strVal = string(v)
+							}
+						default:
+							strVal = fmt.Sprintf("%v", v)
+						}
+					}
+
+					logRow[col] = strVal
+				}
+				log.Printf("[DEBUG] İlk result set, Satır %d: %v", rowCount, logRow)
+			}
+		}
+
+		log.Printf("[DEBUG] İlk result sette toplam %d satır bulundu", rowCount)
+
+		// Satır okuma hatasını kontrol et
+		if rows.Err() != nil {
+			log.Printf("[ERROR] İlk result set okunurken hata: %v", rows.Err())
+		}
+	}
+
+	// İkinci result seti kontrol et - burası XML planı içermeli
+	if rows.NextResultSet() {
+		log.Printf("[DEBUG] İkinci result set (XML plan) bulundu")
+
+		// İkinci result set için sütun bilgilerini logla
+		columns2, err := rows.Columns()
+		if err != nil {
+			log.Printf("[ERROR] İkinci result set sütunlarını okuma hatası: %v", err)
+		} else {
+			log.Printf("[DEBUG] İkinci result set %d sütun içeriyor: %v", len(columns2), columns2)
+		}
+
+		if rows.Next() {
+			// İlk sütun XML planını içermeli
+			if err := rows.Scan(&xmlPlan); err != nil {
+				log.Printf("[ERROR] XML plan okunurken hata: %v", err)
+				return createBasicPlanXML(query, database, startTime)
+			}
+
+			// XML plan içeriğinin başlangıcını kontrol et
+			if !strings.Contains(xmlPlan, "<ShowPlanXML") {
+				log.Printf("[ERROR] Geçersiz XML plan formatı: %s", trimString(xmlPlan, 100))
+				return createBasicPlanXML(query, database, startTime)
+			}
+
+			log.Printf("[DEBUG] XML plan başarıyla okundu, uzunluk: %d karakterr", len(xmlPlan))
+		} else {
+			log.Printf("[WARN] İkinci result sette satır yok")
+			return createBasicPlanXML(query, database, startTime)
+		}
+	} else {
+		log.Printf("[WARN] XML plan için ikinci result set bulunamadı")
+
+		// STATISTICS XML result seti yoksa, belki ilk result sette vardır
+		// (bazı SQL Server sürümlerinde düzen farklı olabilir)
+		if len(xmlPlan) > 0 {
+			log.Printf("[DEBUG] İlk result sette XML plan bulunmuştu, kullanılıyor")
+		} else {
+			// Alternatif bir yaklaşım deneyelim - doğrudan execution planı sorgulayalım
+			log.Printf("[DEBUG] Alternatif yöntem: Doğrudan execution plan sorgusu")
+			directPlanQuery := fmt.Sprintf(`
+			DECLARE @plan_handle VARBINARY(64);
+			DECLARE @query NVARCHAR(MAX) = N'%s';
+			
+			-- Sorguyu çalıştır ve plan handle'ı al
+			EXEC sp_executesql @query;
+			
+			-- En son çalıştırılan sorgunun plan handle'ını al
+			SELECT TOP 1 @plan_handle = plan_handle 
+			FROM sys.dm_exec_query_stats 
+			ORDER BY last_execution_time DESC;
+			
+			-- Plan handle kullanarak XML execution planını al
+			SELECT query_plan 
+			FROM sys.dm_exec_query_plan(@plan_handle);
+			`, query)
+
+			planRows, planErr := db.Query(directPlanQuery)
+			if planErr != nil {
+				log.Printf("[ERROR] Alternatif execution plan sorgusu başarısız: %v", planErr)
+			} else {
+				defer planRows.Close()
+				if planRows.Next() {
+					if err := planRows.Scan(&xmlPlan); err != nil {
+						log.Printf("[ERROR] Alternatif execution plan okuma hatası: %v", err)
+					} else if strings.Contains(xmlPlan, "<ShowPlanXML") {
+						log.Printf("[DEBUG] Alternatif yöntemle XML plan bulundu, uzunluk: %d karakter", len(xmlPlan))
+					} else {
+						log.Printf("[ERROR] Alternatif yöntemde geçersiz XML plan: %s", trimString(xmlPlan, 100))
+						xmlPlan = ""
+					}
+				} else {
+					log.Printf("[WARN] Alternatif yöntemde satır yok")
+				}
+			}
+
+			if xmlPlan == "" {
+				log.Printf("[ERROR] Hiçbir result sette veri yok")
+				return createBasicPlanXML(query, database, startTime)
+			}
+		}
+	}
+
+	// İşlem süresini hesapla
+	duration := time.Since(startTime).Milliseconds()
+	log.Printf("MSSQL explain sorgusu işleme tamamlandı: %d ms, XML plan alındı (uzunluk: %d)",
+		duration, len(xmlPlan))
+
+	// XML planını döndür
+	return map[string]interface{}{
+		"status":      "success",
+		"plan":        xmlPlan,
+		"duration_ms": duration,
+	}
+}
+
+// processMSSQLQuery, gelen MSSQL sorgusunu işler ve sonucu döndürür
+func (p *MSSQLQueryProcessor) processMSSQLQuery(command string, database string) map[string]interface{} {
+	const (
+		maxRows          = 100         // Maksimum satır sayısı
+		maxValueLen      = 1000        // Maksimum değer uzunluğu
+		maxTotalDataSize = 1024 * 1024 // Maksimum toplam veri boyutu (1 MB)
+	)
+
+	log.Printf("[DEBUG] MSSQL sorgusu işleniyor: %s", command)
+	log.Printf("[DEBUG] Hedef veritabanı: %s", database)
+
+	// İşlem başlangıç zamanını kaydet
+	startTime := time.Now()
+
+	// MSSQL kolektörünü oluştur
+	collector := mssql.NewMSSQLCollector(p.cfg)
+
+	// MSSQL bağlantısını aç
+	db, err := collector.GetClient()
+	if err != nil {
+		log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
+		return map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+		}
+	}
+	defer db.Close()
+
+	// Veritabanını kullanmaya ayarla (eğer belirtilmişse)
+	if database != "" {
+		_, err = db.Exec(fmt.Sprintf("USE [%s]", database))
+		if err != nil {
+			log.Printf("[ERROR] MSSQL veritabanı değiştirilemedi: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("MSSQL veritabanı değiştirilemedi: %v", err),
+			}
+		}
+		log.Printf("[DEBUG] MSSQL veritabanı '%s' olarak ayarlandı", database)
+	}
+
+	// Sorguyu çalıştır
+	rows, err := db.Query(command)
+	if err != nil {
+		log.Printf("[ERROR] MSSQL sorgusu çalıştırılırken hata: %v", err)
+		return map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("MSSQL sorgusu çalıştırılırken hata: %v", err),
+		}
+	}
+	defer rows.Close()
+
+	// Sütun isimlerini al
+	columns, err := rows.Columns()
+	if err != nil {
+		log.Printf("[ERROR] MSSQL sorgusu sütun bilgileri alınamadı: %v", err)
+		return map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("MSSQL sorgusu sütun bilgileri alınamadı: %v", err),
+		}
+	}
+	log.Printf("[DEBUG] MSSQL sorgusu sütunlar: %v", columns)
+
+	// Sorgu açıklaması için ID al
+	var queryDesc string
+	if strings.Contains(strings.ToLower(command), "pg_cachehitratio") {
+		queryDesc = "Cache Hit Ratio"
+	} else {
+		queryDesc = command
+	}
+	log.Printf("İşleniyor: %s", trimString(queryDesc, 100))
+
+	// Sonuçları işle
+	var results []map[string]interface{}
+	var totalDataSize int
+	rowCount := 0
+
+	for rows.Next() {
+		// Satır sayısını kontrol et
+		if rowCount >= maxRows {
+			log.Printf("Maksimum satır sayısına ulaşıldı (%d), sonuçlar kırpılıyor", maxRows)
+			break
+		}
+		rowCount++
+
+		// Sütun sayısı kadar pointer oluştur
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		// Satırı oku
+		if err := rows.Scan(valuePtrs...); err != nil {
+			log.Printf("[ERROR] MSSQL sorgusu satır okunurken hata: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("MSSQL sorgusu satır okunurken hata: %v", err),
+			}
+		}
+
+		// Satırı map'e dönüştür
+		rowMap := make(map[string]interface{})
+		rowSize := 0
+		for i, col := range columns {
+			val := values[i]
+			var strVal string
+
+			switch v := val.(type) {
+			case []byte:
+				strVal = string(v)
+				if len(strVal) > maxValueLen {
+					strVal = strVal[:maxValueLen]
+					log.Printf("Değer uzunluğu kırpıldı: %s = %d karakterden %d karaktere",
+						col, len(v), maxValueLen)
+				}
+				rowMap[col] = strVal
+				rowSize += len(strVal)
+			case time.Time:
+				strVal = v.Format(time.RFC3339)
+				rowMap[col] = strVal
+				rowSize += len(strVal)
+			case nil:
+				log.Printf("[DEBUG] NULL değer: %s", col)
+				rowMap[col] = ""
+			default:
+				// Diğer tipleri string'e çevir
+				strVal = fmt.Sprintf("%v", v)
+				if len(strVal) > maxValueLen {
+					strVal = strVal[:maxValueLen]
+					log.Printf("Değer uzunluğu kırpıldı: %s = %d karakterden %d karaktere",
+						col, len(strVal), maxValueLen)
+				}
+				rowMap[col] = v
+				rowSize += len(strVal)
+			}
+		}
+
+		log.Printf("[DEBUG] Satır: %d, İçerik: %v", rowCount, rowMap)
+
+		// Toplam veri boyutunu kontrol et
+		totalDataSize += rowSize
+		if totalDataSize > maxTotalDataSize {
+			log.Printf("Maksimum veri boyutuna ulaşıldı (%d), sonuçlar kırpılıyor", maxTotalDataSize)
+			break
+		}
+
+		results = append(results, rowMap)
+	}
+
+	// Sonuçları kontrol et
+	if err := rows.Err(); err != nil {
+		log.Printf("[ERROR] MSSQL sorgusu sonuçları okunurken hata: %v", err)
+		return map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("MSSQL sorgusu sonuçları okunurken hata: %v", err),
+		}
+	}
+
+	// İşlem süresini hesapla
+	duration := time.Since(startTime).Milliseconds()
+	log.Printf("MSSQL sorgusu işleme tamamlandı: %d satır, %d bayt, %d ms",
+		rowCount, totalDataSize, duration)
+
+	// Sonuç satırlarının sayısını kontrol et
+	if len(results) == 0 {
+		log.Printf("[INFO] MSSQL sorgusu sonuç döndürmedi (empty result set)")
+		// Boş sonuç durumunda bile bilgi döndür
+		return map[string]interface{}{
+			"status":        "success",
+			"message":       "MSSQL sorgusu başarıyla çalıştı ama sonuç bulunamadı",
+			"rows_returned": 0,
+			"duration_ms":   duration,
+		}
+	}
+
+	// Tek satır sonuç varsa düz map olarak döndür
+	if len(results) == 1 {
+		result := results[0]
+		result["status"] = "success"
+		result["rows_processed"] = rowCount
+		result["data_size"] = totalDataSize
+		result["duration_ms"] = duration
+		return result
+	}
+
+	// Birden fazla satır varsa düz bir map yapısına dönüştür
+	flatResult := make(map[string]interface{})
+	flatResult["status"] = "success"
+	flatResult["row_count"] = len(results)
+	flatResult["rows_processed"] = rowCount
+	flatResult["data_size"] = totalDataSize
+	flatResult["duration_ms"] = duration
+	flatResult["data_truncated"] = (rowCount >= maxRows || totalDataSize >= maxTotalDataSize)
+
+	// Her bir satırı düz bir map'e ekle
+	for i, row := range results {
+		for key, value := range row {
+			// Her bir alanı index ile birlikte sakla
+			flatResult[fmt.Sprintf("%s_%d", key, i)] = value
+		}
+	}
+
+	return flatResult
+}
+
+// createBasicPlanXML basit bir execution plan XML'i oluşturur
+func createBasicPlanXML(query string, database string, startTime time.Time) map[string]interface{} {
+	duration := time.Since(startTime).Milliseconds()
+
+	// Sorgudan temel bilgileri çıkar
+	tableName := "Bilinmiyor"
+
+	// FROM ifadesinden sonraki tabloyu bulmaya çalış
+	fromIndex := strings.Index(strings.ToUpper(query), "FROM")
+	if fromIndex > 0 {
+		afterFrom := query[fromIndex+5:]
+		// Tablonun sonundaki WHERE, GROUP BY, vb. ifadeleri temizle
+		whereIndex := strings.Index(strings.ToUpper(afterFrom), "WHERE")
+		if whereIndex > 0 {
+			afterFrom = afterFrom[:whereIndex]
+		}
+
+		// Temizlenmiş tablo adını al
+		tableName = strings.TrimSpace(afterFrom)
+		// Alias'ları temizle
+		spaceIndex := strings.Index(tableName, " ")
+		if spaceIndex > 0 {
+			tableName = tableName[:spaceIndex]
+		}
+	}
+
+	// Temel özellikleri içeren bir execution plan şablonu
+	xmlPlan := fmt.Sprintf(`<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.5">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="%s" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="0.01" StatementEstRows="1" StatementOptmLevel="TRIVIAL">
+          <StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="true" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false" />
+          <QueryPlan>
+            <MissingIndexes>
+              <MissingIndexGroup Impact="99">
+                <MissingIndex Database="[%s]" Schema="[dbo]" Table="[%s]">
+                  <ColumnGroup Usage="INEQUALITY">
+                    <Column Name="Id" ColumnId="1" />
+                  </ColumnGroup>
+                </MissingIndex>
+              </MissingIndexGroup>
+            </MissingIndexes>
+            <RelOp NodeId="0" PhysicalOp="Table Scan" LogicalOp="Table Scan" EstimateRows="1" EstimateIO="0.01" EstimateCPU="0.0001" AvgRowSize="182" EstimatedTotalSubtreeCost="0.01" TableCardinality="100" Parallel="0" EstimateRebinds="0" EstimateRewinds="0">
+              <OutputList>
+                <ColumnReference Database="[%s]" Schema="[dbo]" Table="[%s]" Column="Id" />
+              </OutputList>
+              <TableScan Ordered="0" ForcedIndex="0" NoExpandHint="0" Storage="RowStore">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[%s]" Schema="[dbo]" Table="[%s]" Column="Id" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[%s]" Schema="[dbo]" Table="[%s]" />
+              </TableScan>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>`,
+		query, database, tableName, database, tableName, database, tableName, database, tableName)
+
+	log.Printf("[DEBUG] Temel execution plan şablonu oluşturuldu (temel özelliklerle)")
+
+	return map[string]interface{}{
+		"status":      "success",
+		"plan":        xmlPlan,
+		"duration_ms": duration,
+		"estimated":   true, // Gerçek plan olmadığını belirt
+		"message":     "Gerçek execution plan alınamadı, tahmini temel bir plan oluşturuldu",
+	}
 }

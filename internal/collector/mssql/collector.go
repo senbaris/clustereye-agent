@@ -182,28 +182,53 @@ func (c *MSSQLCollector) GetMSSQLVersion() (string, string) {
 		return "Unknown", "Unknown"
 	}
 
-	// Extract version number like "SQL Server 2019 (15.0.4102.2)"
-	re := regexp.MustCompile(`SQL Server (\d+)\s+\((\d+\.\d+\.\d+\.\d+)\)`)
+	// Log version değerinin tam içeriğini
+	log.Printf("SQL Server versiyon ham verisi: %s", version)
+
+	// Daha geniş bir regex pattern ile versiyonu algıla
+	re := regexp.MustCompile(`Microsoft SQL Server\s+(\d+)(?:\s+\(RTM\))?.*?(\d+\.\d+\.\d+\.\d+)`)
 	matches := re.FindStringSubmatch(version)
 	if len(matches) > 2 {
 		return matches[2], edition
 	}
 
-	// Try alternative format
-	re = regexp.MustCompile(`Microsoft SQL Server (\d+\.\d+\.\d+\.\d+)`)
+	// Alternatif regex pattern dene - direkt olarak sürüm numarasını bul
+	re = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)`)
 	matches = re.FindStringSubmatch(version)
 	if len(matches) > 1 {
 		return matches[1], edition
 	}
 
+	// Eğer bu da bulamazsa, en azından SQL Server sürümünü al (2019, 2022 gibi)
+	re = regexp.MustCompile(`Microsoft SQL Server\s+(\d{4})`)
+	matches = re.FindStringSubmatch(version)
+	if len(matches) > 1 {
+		return matches[1], edition
+	}
+
+	// Hiçbir şey bulunamazsa, en kötü durum
 	return "Unknown", edition
 }
 
 // GetNodeStatus returns the node's role in HA configuration
 func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
+	// Önce önbellekteki bilgileri kontrol et
+	haStateKey := "mssql_ha_state"
+
+	// Alarm monitor cache'e erişim için bu fonksiyonu oluşturuyoruz
+	haState, hasHAState := c.getHAStateFromCache(haStateKey)
+
+	// Bağlantı dene
 	db, err := c.GetClient()
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+
+		// Önbellekte HA bilgisi varsa onu kullan
+		if hasHAState {
+			log.Printf("Servis kapalı ama önbellekte HA durumu mevcut: %s, önbellekteki bilgiler kullanılıyor", haState.role)
+			return haState.role, true
+		}
+
 		return "STANDALONE", false
 	}
 	defer db.Close()
@@ -218,41 +243,107 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 	`).Scan(&isHAEnabled)
 
 	if err != nil || isHAEnabled == 0 {
+		log.Printf("AlwaysOn özelliği etkin değil veya kontrol edilemiyor: %v", err)
 		return "STANDALONE", false
 	}
 
-	// If AlwaysOn is enabled, check if this is a primary or secondary replica
+	log.Printf("AlwaysOn özelliği etkin, node rolü tespit ediliyor...")
+
+	// If AlwaysOn is enabled, check if this is a primary or secondary replica with a more reliable query
 	var role string
 	err = db.QueryRow(`
 		SELECT
-			CASE 
-				WHEN ars.role_desc = 'PRIMARY' THEN 'PRIMARY'
-				WHEN ars.role_desc = 'SECONDARY' THEN 'SECONDARY'
-				ELSE ars.role_desc
+			CASE WHEN dm_hadr_availability_replica_states.role_desc IS NULL THEN 'UNKNOWN'
+			     ELSE dm_hadr_availability_replica_states.role_desc 
 			END AS role
-		FROM sys.dm_hadr_availability_replica_states ars
-		JOIN sys.availability_replicas ar 
-			ON ars.replica_id = ar.replica_id
-		WHERE ar.replica_server_name = @@SERVERNAME
+		FROM sys.dm_hadr_availability_replica_states 
+		JOIN sys.availability_replicas 
+			ON dm_hadr_availability_replica_states.replica_id = availability_replicas.replica_id
+		WHERE availability_replicas.replica_server_name = @@SERVERNAME
 	`).Scan(&role)
 
 	if err != nil {
 		log.Printf("Node role could not be determined: %v", err)
-		return "UNKNOWN", true
+
+		// Fallback için alternatif sorgu
+		err = db.QueryRow(`
+			SELECT CASE 
+				WHEN EXISTS (
+					SELECT 1 FROM sys.dm_hadr_availability_replica_states ars
+					WHERE ars.role_desc = 'SECONDARY'
+				) THEN 'SECONDARY'
+				ELSE 'UNKNOWN'
+			END
+		`).Scan(&role)
+
+		if err != nil {
+			log.Printf("Fallback node role query failed: %v", err)
+			return "UNKNOWN", true
+		}
 	}
 
+	log.Printf("Node rolü tespit edildi: %s", role)
 	return role, true
+}
+
+// getHAStateFromCache is a helper to get HA information from alarm cache
+func (c *MSSQLCollector) getHAStateFromCache(key string) (struct{ role, group string }, bool) {
+	// Boş durumu hazırla
+	emptyState := struct{ role, group string }{"", ""}
+
+	// alarm.go dosyasında tanımlı alarmCache gibi bir cache sistemi olmadığından
+	// geçici bir dosya kullanarak son durumu saklayalım
+	cacheFile := filepath.Join(os.TempDir(), "mssql_ha_state.txt")
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return emptyState, false
+	}
+
+	parts := strings.Split(string(data), "|")
+	if len(parts) >= 2 {
+		return struct{ role, group string }{parts[0], parts[1]}, true
+	}
+
+	return emptyState, false
+}
+
+// saveHAStateToCache saves HA information to a cache file
+func (c *MSSQLCollector) saveHAStateToCache(role, group string) {
+	cacheFile := filepath.Join(os.TempDir(), "mssql_ha_state.txt")
+	data := fmt.Sprintf("%s|%s", role, group)
+
+	err := os.WriteFile(cacheFile, []byte(data), 0644)
+	if err != nil {
+		log.Printf("HA durumu önbelleğe kaydedilemedi: %v", err)
+	} else {
+		log.Printf("HA durumu önbelleğe kaydedildi: %s, %s", role, group)
+	}
 }
 
 // GetHAClusterName returns the AlwaysOn Availability Group name
 func (c *MSSQLCollector) GetHAClusterName() string {
+	// Önce önbellekteki bilgileri kontrol et
+	haState, hasHAState := c.getHAStateFromCache("mssql_ha_state")
+
+	// Bağlantı dene
 	db, err := c.GetClient()
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+
+		// Önbellekte HA bilgisi varsa onu kullan
+		if hasHAState && haState.group != "" {
+			log.Printf("Servis kapalı ama önbellekte cluster adı mevcut: %s, önbellekteki bilgiler kullanılıyor", haState.group)
+			return haState.group
+		}
+
 		return ""
 	}
 	defer db.Close()
 
+	log.Printf("AlwaysOn Availability Group ismi tespit ediliyor...")
+
+	// Try to get AG name from availability groups
 	var clusterName string
 	err = db.QueryRow(`
 		SELECT TOP 1 ag.name
@@ -265,8 +356,37 @@ func (c *MSSQLCollector) GetHAClusterName() string {
 	`).Scan(&clusterName)
 
 	if err != nil {
-		log.Printf("Cluster name could not be determined: %v", err)
-		return ""
+		log.Printf("İlk metod ile AG ismi tespit edilemedi: %v", err)
+
+		// Alternatif yöntem dene - daha basit sorgu
+		err = db.QueryRow(`
+			SELECT TOP 1 ag.name 
+			FROM sys.availability_groups ag
+			JOIN sys.dm_hadr_availability_replica_states ars 
+				ON ag.group_id = ars.group_id
+		`).Scan(&clusterName)
+
+		if err != nil {
+			log.Printf("İkinci metod ile AG ismi tespit edilemedi: %v", err)
+
+			// Son çare olarak "cluster_name" sistem bilgisini almayı dene
+			err = db.QueryRow(`
+				SELECT TOP 1 cluster_name 
+				FROM sys.dm_hadr_cluster
+			`).Scan(&clusterName)
+
+			if err != nil {
+				log.Printf("Cluster name could not be determined: %v", err)
+				return ""
+			}
+		}
+	}
+
+	log.Printf("Tespit edilen Availability Group ismi: %s", clusterName)
+
+	// Bilgileri önbelleğe kaydet
+	if nodeRole, isHA := c.GetNodeStatus(); isHA {
+		c.saveHAStateToCache(nodeRole, clusterName)
 	}
 
 	return clusterName
@@ -434,24 +554,57 @@ func (c *MSSQLCollector) GetConfigPath() string {
 
 // GetMSSQLInfo collects SQL Server information
 func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
+	log.Printf("MSSQL bilgileri toplamaya başlanıyor...")
+
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
+	log.Printf("Hostname: %s, IP: %s", hostname, ip)
+
+	// Disk kullanımı al
+	log.Printf("Disk kullanımı alınıyor...")
 	freeDisk, usagePercent := c.GetDiskUsage()
+	log.Printf("Disk kullanımı: %s boş, %d%% kullanımda", freeDisk, usagePercent)
 
 	// Get version and edition
+	log.Printf("SQL Server versiyon ve sürümü alınıyor...")
 	version, edition := c.GetMSSQLVersion()
+	log.Printf("SQL Server versiyon: %s, sürüm: %s", version, edition)
 
 	// Get HA status
+	log.Printf("High Availability durumu kontrol ediliyor...")
 	nodeStatus, isHAEnabled := c.GetNodeStatus()
+	log.Printf("HA durumu: %s, HA etkin: %v", nodeStatus, isHAEnabled)
+
 	clusterName := ""
 	if isHAEnabled {
+		log.Printf("AlwaysOn Availability Group ismi alınıyor...")
 		clusterName = c.GetHAClusterName()
+		log.Printf("Cluster adı: %s", clusterName)
+	} else {
+		// Önbellekteki bilgileri kontrol et (service down olsa bile)
+		haState, hasHAState := c.getHAStateFromCache("mssql_ha_state")
+		if hasHAState && haState.group != "" {
+			clusterName = haState.group
+			log.Printf("Servis kapalı, önbellekteki cluster adı kullanılıyor: %s", clusterName)
+			isHAEnabled = true
+			nodeStatus = haState.role
+		}
 	}
 
 	// System information
+	log.Printf("Sistem bilgileri alınıyor...")
 	totalvCpu := c.getTotalvCpu()
 	totalMemory := c.getTotalMemory()
+	log.Printf("vCPU: %d, Toplam Bellek: %d bayt", totalvCpu, totalMemory)
+
+	log.Printf("Yapılandırma dosya yolu alınıyor...")
 	configPath := c.GetConfigPath()
+	log.Printf("Yapılandırma yolu: %s", configPath)
+
+	// MSSQL servis durumu
+	log.Printf("SQL Server servis durumu kontrol ediliyor...")
+	serviceStatus := c.GetMSSQLStatus()
+	log.Printf("SQL Server servis durumu: %s", serviceStatus)
 
 	info := &MSSQLInfo{
 		ClusterName: clusterName,
@@ -460,7 +613,7 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 		NodeStatus:  nodeStatus,
 		Version:     version,
 		Location:    c.cfg.MSSQL.Location,
-		Status:      c.GetMSSQLStatus(),
+		Status:      serviceStatus,
 		Instance:    c.cfg.MSSQL.Instance,
 		FreeDisk:    freeDisk,
 		FdPercent:   int32(usagePercent),
@@ -474,8 +627,8 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 		Edition:     edition,
 	}
 
-	log.Printf("DEBUG: MSSQL bilgileri hazırlandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
-		info.Port, info.Status, info.Version, info.TotalvCpu, info.TotalMemory, info.ConfigPath)
+	log.Printf("MSSQL bilgileri toplandı: ClusterName=%s, NodeStatus=%s, Version=%s, HAEnabled=%v",
+		info.ClusterName, info.NodeStatus, info.Version, info.IsHAEnabled)
 
 	return info
 }
@@ -910,4 +1063,21 @@ func (c *MSSQLCollector) FindMSSQLLogFiles() ([]*pb.MSSQLLogFile, error) {
 	}
 
 	return logFiles, nil
+}
+
+// GetBestPracticesCollector bir BestPracticesCollector oluşturur ve döndürür
+func (c *MSSQLCollector) GetBestPracticesCollector() *BestPracticesCollector {
+	return NewBestPracticesCollector(c)
+}
+
+// RunBestPracticesAnalysis SQL Server best practices analizini başlatır ve sonuçları döndürür
+func (c *MSSQLCollector) RunBestPracticesAnalysis() (map[string]interface{}, error) {
+	// BestPracticesCollector oluştur
+	bpc := c.GetBestPracticesCollector()
+
+	// Analizi çalıştır
+	results := bpc.GetBestPracticesAnalysis()
+
+	// Sonuç başarılı
+	return results, nil
 }
