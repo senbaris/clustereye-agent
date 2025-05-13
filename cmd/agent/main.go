@@ -5,76 +5,127 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
+	"path/filepath"
+	"runtime"
 
+	"github.com/kardianos/service"
 	"github.com/senbaris/clustereye-agent/internal/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
 )
 
-func main() {
-	// Command line argümanlarını analiz etmek için flag'ler tanımla
-	platformFlag := flag.String("platform", "postgres", "Hangi platform için izleme yapılacak (postgres, mongo veya mssql)")
-	helpFlag := flag.Bool("help", false, "Yardım mesajını görüntüle")
-	versionFlag := flag.Bool("version", false, "Versiyon bilgisini görüntüle")
+type program struct {
+	agent    *agent.Agent
+	cfg      *config.AgentConfig
+	platform string
+}
 
-	// Flag'leri analiz et
+func (p *program) Start(s service.Service) error {
+	go p.run()
+	return nil
+}
+
+func (p *program) run() {
+	log.Printf("ClusterEye Agent starting... Platform: %s", p.platform)
+
+	a := agent.NewAgent(p.cfg)
+	a.SetPlatform(p.platform)
+	p.agent = a
+
+	if err := p.agent.Start(); err != nil {
+		log.Fatalf("Agent could not start: %v", err)
+	}
+
+	// Block until killed
+	select {}
+}
+
+func (p *program) Stop(s service.Service) error {
+	if p.agent != nil {
+		p.agent.Stop()
+		log.Println("Agent stopped.")
+	}
+	return nil
+}
+
+func main() {
+	initLogging()
+
+	platformFlag := flag.String("platform", "mssql", "Target platform (postgres, mongo, mssql)")
+	helpFlag := flag.Bool("help", false, "Show help")
+	versionFlag := flag.Bool("version", false, "Show version")
+	svcFlag := flag.String("service", "", "Control the system service: install, uninstall, start, stop")
+
 	flag.Parse()
 
-	// Yardım flag'i kontrol et
 	if *helpFlag {
-		fmt.Println("ClusterEye Agent - Database monitoring tool")
-		fmt.Println("")
-		fmt.Println("Kullanım:")
-		fmt.Println("  agent [flags]")
-		fmt.Println("")
-		fmt.Println("Flags:")
-		fmt.Println("  -platform string    Hangi platform için izleme yapılacak (postgres, mongo veya mssql) (default \"postgres\")")
-		fmt.Println("  -help               Yardım mesajını görüntüle")
-		fmt.Println("  -version            Versiyon bilgisini görüntüle")
+		flag.Usage()
 		return
 	}
 
-	// Versiyon flag'i kontrol et
 	if *versionFlag {
 		fmt.Println("ClusterEye Agent v1.0.23")
 		return
 	}
 
-	// Başlangıç mesajı
-	log.Printf("ClusterEye Agent başlatılıyor... Platform: %s", *platformFlag)
-
-	// Platform değerini kontrol et
-	if *platformFlag != "postgres" && *platformFlag != "mongo" && *platformFlag != "mssql" {
-		log.Fatalf("Geçersiz platform değeri '%s'. 'postgres', 'mongo' veya 'mssql' kullanın.", *platformFlag)
-	}
-
-	// Agent yapılandırmasını yükle
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
-		log.Fatalf("Agent yapılandırması yüklenemedi: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Agent'ı oluştur
-	a := agent.NewAgent(cfg)
-
-	// Platform bilgisini agent'a kaydet
-	a.SetPlatform(*platformFlag)
-
-	// Agent'ı başlat
-	if err := a.Start(); err != nil {
-		log.Fatalf("Agent başlatılamadı: %v", err)
+	prg := &program{
+		cfg:      cfg,
+		platform: *platformFlag,
 	}
 
-	// Graceful shutdown için sinyal yakalama
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	svcConfig := &service.Config{
+		Name:        "ClusterEyeAgent",
+		DisplayName: "ClusterEye Agent",
+		Description: "Database monitoring agent for ClusterEye platform.",
+	}
 
-	// Sinyal bekle
-	sig := <-sigCh
-	log.Printf("Sinyal alındı: %v, agent kapatılıyor...", sig)
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// Agent'ı durdur
-	a.Stop()
-	log.Println("Agent başarıyla kapatıldı.")
+	if len(*svcFlag) > 0 {
+		err := service.Control(s, *svcFlag)
+		if err != nil {
+			log.Fatalf("Service command failed: %v", err)
+		}
+		return
+	}
+
+	err = s.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+const maxLogSize = 10 * 1024 * 1024 // 10 MB
+
+func initLogging() {
+	if runtime.GOOS != "windows" {
+		// Linux'ta log dosyasına yazma
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Failed to get executable path: %v", err)
+	}
+	logDir := filepath.Dir(exePath)
+	logFile := filepath.Join(logDir, "agent.log")
+
+	// Eğer log dosyası çok büyükse eski logu .old olarak taşı
+	if info, err := os.Stat(logFile); err == nil && info.Size() > maxLogSize {
+		_ = os.Rename(logFile, logFile+".old")
+	}
+
+	// Dosyayı aç ve log çıktısını yönlendir
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	log.SetOutput(f)
 }

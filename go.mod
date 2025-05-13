@@ -4,6 +4,7 @@ go 1.24.1
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/kardianos/service v1.2.2
 	github.com/lib/pq v1.10.9
 	github.com/microsoft/go-mssqldb v1.8.0
 	github.com/sefaphlvn/clustereye-test v1.0.21
@@ -16,7 +17,6 @@ require (
 require (
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
 	github.com/golang-sql/sqlexp v0.1.0 // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/klauspost/compress v1.16.7 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect

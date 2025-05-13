@@ -27,7 +27,7 @@ func NewAgent(cfg *config.AgentConfig) *Agent {
 		collector: collector.NewCollector(cfg),
 		reporter:  reporter.NewReporter(cfg),
 		stopCh:    make(chan struct{}),
-		platform:  "postgres", // Varsayılan olarak postgres
+		platform:  "mssql", // Varsayılan olarak postgres
 	}
 }
 

@@ -96,13 +96,15 @@ func (m *AlarmMonitor) updateThresholds() {
 		}
 
 		m.thresholds = resp.Settings
-		log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d",
+		log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d, BlockingQuery=%dms",
 			m.thresholds.CpuThreshold,
 			m.thresholds.MemoryThreshold,
 			m.thresholds.DiskThreshold,
 			m.thresholds.SlowQueryThresholdMs,
 			m.thresholds.ConnectionThreshold,
-			m.thresholds.ReplicationLagThreshold)
+			m.thresholds.ReplicationLagThreshold,
+			m.thresholds.BlockingQueryThresholdMs,
+		)
 		return
 	}
 
@@ -176,6 +178,7 @@ func (m *AlarmMonitor) checkAlarms() {
 		m.checkMSSQLBlockingQueries()
 		m.checkMSSQLCPUUsage()
 		m.checkMSSQLSlowQueries()
+		m.checkMSSQLDeadlocks()
 
 		log.Printf("MSSQL alarm kontrolleri yapılıyor...")
 	} else {
@@ -191,26 +194,10 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 	status := postgres.GetPGServiceStatus()
 	alarmKey := "postgresql_service_status"
 
-	// Rate limiting için zaman kontrolü ekle
+	// Rate limiting için kontrol ekle
 	m.alarmCacheLock.RLock()
 	prevAlarm, exists := m.alarmCache[alarmKey]
 	m.alarmCacheLock.RUnlock()
-
-	// Önceki alarm varsa ve son 15 saniye içinde gönderilmişse, tekrar gönderme
-	if exists {
-		// Önceki alarmın zamanını parse et
-		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
-		if err == nil {
-			timeSinceLastAlarm := time.Since(prevTimestamp)
-			// Son 15 saniye içinde gönderilmişse ve durum değişmemişse tekrar gönderme
-			if timeSinceLastAlarm < 15*time.Second &&
-				((status == "FAIL!" && prevAlarm.Status == "triggered") ||
-					(status == "RUNNING" && prevAlarm.Status == "resolved")) {
-				log.Printf("PostgreSQL servis durumu son %v önce raporlandı, tekrar gönderilmeyecek.", timeSinceLastAlarm)
-				return
-			}
-		}
-	}
 
 	if status == "FAIL!" {
 		// Önceki bir alarm varsa ve aynı durumda ise tekrar gönderme
@@ -271,6 +258,24 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 
 				log.Printf("PostgreSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
+		} else if !exists {
+			// İlk çalıştırma durumu - servis durumunu kaydet
+			initialEvent := &pb.AlarmEvent{
+				Id:          uuid.New().String(),
+				AlarmId:     alarmKey,
+				AgentId:     m.agentID,
+				Status:      "initial",
+				MetricName:  "postgresql_service_status",
+				MetricValue: status,
+				Message:     "PostgreSQL service is running (RUNNING)",
+				Timestamp:   time.Now().Format(time.RFC3339),
+				Severity:    "info",
+			}
+
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = initialEvent
+			m.alarmCacheLock.Unlock()
+			log.Printf("PostgreSQL servis durumu kaydedildi: %s", status)
 		}
 	}
 }
@@ -1056,15 +1061,13 @@ func (m *AlarmMonitor) checkDiskUsage() {
 	prevAlarm, exists := m.alarmCache[alarmKey]
 	m.alarmCacheLock.RUnlock()
 
-	// Önceki alarm varsa ve son 5 dakika içinde gönderilmişse, tekrar gönderme
+	// Önceki alarm varsa ve disk kullanımı durumu değişmemişse, tekrar gönderme
 	if exists {
-		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
-		if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
-			prevTriggered := prevAlarm.Status == "triggered"
-			currentHigh := len(highUsageFilesystems) > 0
-			if prevTriggered == currentHigh {
-				return
-			}
+		prevTriggered := prevAlarm.Status == "triggered"
+		currentHigh := len(highUsageFilesystems) > 0
+		if prevTriggered == currentHigh {
+			log.Printf("Disk kullanımı durumu değişmedi. Alarm zaten gönderildi (%s)", prevAlarm.Id)
+			return
 		}
 	}
 
@@ -1442,6 +1445,9 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 		AND r.command NOT IN ('BACKUP DATABASE', 'BACKUP LOG', 'RESTORE DATABASE', 'RESTORE LOG')
 		AND r.command NOT LIKE '%%BACKUP%%'
 		AND r.command NOT LIKE '%%RESTORE%%'
+		AND t.text NOT LIKE '%%sp_server_diagnostics%%' -- Sistem tanılama prosedürünü hariç tut
+		AND r.wait_type NOT LIKE 'SP_SERVER_DIAGNOSTICS_SLEEP%%' -- SP_SERVER_DIAGNOSTICS_SLEEP beklemelerini hariç tut
+		AND (s.program_name IS NULL OR s.program_name NOT LIKE '%%SQL Server Agent%%') -- SQL Agent işlerini hariç tut
 	ORDER BY 
 		execution_time_ms DESC`, m.thresholds.SlowQueryThresholdMs)
 
@@ -2278,23 +2284,14 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 	haStateInfo, hasHAState := m.alarmCache[haStateKey]
 	m.alarmCacheLock.RUnlock()
 
-	// Önceki alarm varsa ve son 5 dakika içinde gönderilmişse, tekrar gönderme
-	if exists {
-		prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
-		if err == nil {
-			timeSinceLastAlarm := time.Since(prevTimestamp)
-			// Son 1 dakika içinde gönderilmişse ve durum değişmemişse tekrar gönderme
-			if timeSinceLastAlarm < 1*time.Minute {
-				if (isRunning && prevAlarm.Status == "resolved") ||
-					(!isRunning && prevAlarm.Status == "triggered") {
-					return
-				}
-			}
-		}
-	}
-
 	if !isRunning {
 		// Servis durumu alarmı oluştur (triggered)
+		// Eğer önceki alarm varsa ve aynı durumda ise tekrar gönderme
+		if exists && prevAlarm.Status == "triggered" {
+			log.Printf("MSSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
+			return
+		}
+
 		// AlwaysOn bilgilerini ekleyip status'u güncelleyelim
 		additionalInfo := ""
 		metricValue := "FAIL!_STANDALONE"
@@ -2645,4 +2642,167 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 			}
 		}
 	}
+}
+
+// checkMSSQLDeadlocks SQL Server'da deadlock oluşumlarını kontrol eder ve alarm üretir
+func (m *AlarmMonitor) checkMSSQLDeadlocks() {
+	alarmKey := "mssql_deadlocks"
+
+	// Bağlantı bilgilerini al
+	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
+		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
+
+	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
+	if m.config.MSSQL.WindowsAuth {
+		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
+			m.config.MSSQL.Host, m.config.MSSQL.Port)
+	}
+
+	// Veritabanı bağlantısını aç
+	db, err := sql.Open("sqlserver", dsn)
+	if err != nil {
+		log.Printf("[ERROR] MSSQL deadlock kontrolü için bağlantı açılamadı: %v", err)
+		return
+	}
+	defer db.Close()
+
+	// Bağlantıyı test et
+	if err = db.Ping(); err != nil {
+		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		return
+	}
+
+	log.Printf("MSSQL deadlock kontrolü başlıyor...")
+
+	// Son 1 saat içindeki deadlock olaylarını sorgula
+	// system_health XEvent oturumundan deadlock bilgilerini çek
+	query := `
+	SELECT
+		CAST(event_data AS XML) AS DeadlockGraph,
+		DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) AS LocalTimeStamp
+	FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL)
+	WHERE object_name = 'xml_deadlock_report'
+	AND DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) > DATEADD(HOUR, -1, GETDATE())
+	ORDER BY timestamp_utc DESC`
+
+	// Sorgu sonucunu okumak için hazırla
+	rows, err := db.Query(query)
+	if err != nil {
+		log.Printf("[ERROR] MSSQL deadlock sorgusu çalıştırılamadı: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type deadlockInfo struct {
+		TimeStamp     time.Time
+		DeadlockGraph string // XML içeriği
+	}
+
+	var deadlocks []deadlockInfo
+	var databaseName string
+
+	for rows.Next() {
+		var dl deadlockInfo
+		err := rows.Scan(
+			&dl.DeadlockGraph,
+			&dl.TimeStamp,
+		)
+
+		if err != nil {
+			log.Printf("[ERROR] Deadlock bilgisi okunamadı: %v", err)
+			continue
+		}
+
+		deadlocks = append(deadlocks, dl)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("[ERROR] Deadlock satırları okunurken hata: %v", err)
+	}
+
+	// Eğer deadlock bulunmuşsa alarm oluştur
+	if len(deadlocks) > 0 {
+		log.Printf("Son 1 saat içinde %d deadlock bulundu", len(deadlocks))
+
+		// Rate limiting kontrolü
+		m.alarmCacheLock.RLock()
+		prevAlarm, exists := m.alarmCache[alarmKey]
+		m.alarmCacheLock.RUnlock()
+
+		// Sadece son deadlock durumundan farklıysa veya 30 dakikadan uzun süre geçtiyse bildir
+		shouldSendAlarm := true
+		if exists {
+			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
+			if err == nil {
+				// Benzer deadlock 30 dakikadan kısa süredir bildirilmişse tekrar alarm gönderme
+				if time.Since(prevTimestamp) < 30*time.Minute &&
+					strings.Contains(prevAlarm.Message, fmt.Sprintf("Found %d deadlocks", len(deadlocks))) {
+					shouldSendAlarm = false
+				}
+			}
+		}
+
+		if shouldSendAlarm {
+			// Deadlock detaylarını hazırla
+			var deadlockDetails []string
+
+			for i, dl := range deadlocks {
+				if i >= 5 { // Sadece ilk 5 deadlock hakkında detay göster
+					deadlockDetails = append(deadlockDetails, fmt.Sprintf("(Fazla deadlock nedeniyle diğer %d deadlock detayı gizlendi)", len(deadlocks)-5))
+					break
+				}
+
+				// Deadlock detayı - sadece XML ve zaman bilgisi
+				deadlockDetail := fmt.Sprintf("Deadlock #%d (at %s):\n%s",
+					i+1,
+					dl.TimeStamp.Format("2006-01-02 15:04:05"),
+					dl.DeadlockGraph)
+
+				deadlockDetails = append(deadlockDetails, deadlockDetail)
+			}
+
+			// Alarm mesajı oluştur
+			message := fmt.Sprintf("Found %d deadlocks in SQL Server in the last hour.\n\n%s",
+				len(deadlocks), strings.Join(deadlockDetails, "\n\n"))
+
+			alarmEvent := &pb.AlarmEvent{
+				Id:          uuid.New().String(),
+				AlarmId:     alarmKey,
+				AgentId:     m.agentID,
+				Status:      "triggered",
+				MetricName:  "mssql_deadlocks",
+				MetricValue: fmt.Sprintf("%d", len(deadlocks)),
+				Message:     message,
+				Timestamp:   time.Now().Format(time.RFC3339),
+				Severity:    "critical", // Deadlock'lar kritik seviyededir
+				Database:    databaseName,
+			}
+
+			if err := m.reportAlarm(alarmEvent); err != nil {
+				log.Printf("MSSQL deadlock alarmı gönderilemedi: %v", err)
+			} else {
+				m.alarmCacheLock.Lock()
+				m.alarmCache[alarmKey] = alarmEvent
+				m.alarmCacheLock.Unlock()
+				log.Printf("MSSQL deadlock alarmı gönderildi (ID: %s, %d deadlock)", alarmEvent.Id, len(deadlocks))
+			}
+		}
+	} else {
+		log.Printf("Son 1 saat içinde deadlock bulunmadı")
+	}
+}
+
+// Yardımcı fonksiyonlar
+func getStringOrDefault(s sql.NullString, defaultValue string) string {
+	if s.Valid {
+		return s.String
+	}
+	return defaultValue
+}
+
+func getIntOrDefault(n sql.NullInt32, defaultValue int32) int32 {
+	if n.Valid {
+		return n.Int32
+	}
+	return defaultValue
 }

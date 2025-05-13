@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"gopkg.in/yaml.v2"
 )
@@ -129,19 +131,36 @@ func createDefaultAgentConfig(configPath string) (*AgentConfig, error) {
 	return config, nil
 }
 
-// getConfigPath, konfigürasyon dosyasının tam yolunu döndürür
+// getConfigPath returns the absolute config file path based on OS.
 func getConfigPath(filename string) string {
-	// Önce çalışma dizinine bakar, sonra /etc/clustereye dizinine bakar
+	// 2. Windows: executable dir
+	if runtime.GOOS == "windows" {
+		log.Printf("Windows OS detected")
+		exePath, err := os.Executable()
+		log.Printf("exePath: %s", exePath)
+		if err == nil {
+			exeDir := filepath.Dir(exePath)
+			winPath := filepath.Join(exeDir, filename)
+			log.Printf("winPath: %s", winPath)
+			if _, err := os.Stat(winPath); err == nil {
+				log.Printf("Found config near executable: %s", winPath)
+				return winPath
+			}
+			log.Printf("Config not found in: %s", winPath)
+		}
+	}
+	// 1. Current dir
 	if _, err := os.Stat(filename); err == nil {
 		return filename
 	}
 
-	// /etc/clustereye dizinine bak
+	// 3. Linux fallback
 	etcPath := filepath.Join("/etc", "clustereye", filename)
 	if _, err := os.Stat(etcPath); err == nil {
+		log.Printf("Found config in: %s", etcPath)
 		return etcPath
 	}
 
-	// Dosya bulunamadıysa, çalışma dizinine yaz
+	log.Printf("Config not found, fallback to working dir: %s", filename)
 	return filename
 }

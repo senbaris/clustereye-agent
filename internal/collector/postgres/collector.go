@@ -455,65 +455,209 @@ func getWindowsCPUCores() (int32, error) {
 
 // Windows için RAM kullanımı
 func getWindowsRAMUsage() (map[string]interface{}, error) {
-	// PowerShell kullanarak bellek bilgilerini al
-	cmd := exec.Command("powershell", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory")
-	out, err := cmd.Output()
-	if err != nil {
-		// Alternatif yöntem
-		return map[string]interface{}{
-			"total_mb":      int64(16384), // 16GB varsayılan değer
-			"free_mb":       int64(4096),  // 4GB varsayılan değer
-			"used_mb":       int64(12288), // 12GB varsayılan değer
-			"usage_percent": 75.0,         // %75 varsayılan kullanım
-		}, nil
+	var totalMB, freeMB, usedMB int64
+	var usagePercent float64
+
+	// PowerShell komutlarının çalışması için birden fazla yöntem deneyin
+	methods := []func() (int64, int64, error){
+		// Yöntem 1: Get-CimInstance kullanma
+		func() (int64, int64, error) {
+			cmd := exec.Command("powershell", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory")
+			out, err := cmd.Output()
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// PowerShell çıktısını parse et
+			lines := strings.Split(string(out), "\n")
+			if len(lines) < 3 {
+				return 0, 0, fmt.Errorf("Geçersiz bellek bilgisi çıktısı")
+			}
+
+			var totalMemKB, freeMemKB int64
+
+			// İlk satır başlık, ikinci satır boş, üçüncü satır değerler
+			valueLines := lines[2:]
+			for _, line := range valueLines {
+				if line == "" {
+					continue
+				}
+
+				// Değerleri ayır
+				values := strings.Fields(line)
+				if len(values) >= 2 {
+					totalMemKB, _ = strconv.ParseInt(values[0], 10, 64)
+					freeMemKB, _ = strconv.ParseInt(values[1], 10, 64)
+					break
+				}
+			}
+
+			// KB'den MB'ye çevir
+			totalMB := totalMemKB / 1024
+			freeMB := freeMemKB / 1024
+
+			// Sıfır kontrolü
+			if totalMB <= 0 || freeMB <= 0 {
+				return 0, 0, fmt.Errorf("Geçersiz bellek değerleri")
+			}
+
+			return totalMB, freeMB, nil
+		},
+		// Yöntem 2: WMIC ComputerSystem kullanma
+		func() (int64, int64, error) {
+			// Toplam fiziksel bellek
+			cmd := exec.Command("wmic", "ComputerSystem", "get", "TotalPhysicalMemory")
+			out, err := cmd.Output()
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Çıktıyı parse et
+			lines := strings.Split(string(out), "\n")
+			if len(lines) < 2 {
+				return 0, 0, fmt.Errorf("Geçersiz bellek bilgisi çıktısı")
+			}
+
+			// İkinci satırı al (ilk satır başlık)
+			memStr := strings.TrimSpace(lines[1])
+			totalBytes, err := strconv.ParseInt(memStr, 10, 64)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Boş bellek için OS kullanma
+			cmd = exec.Command("wmic", "OS", "get", "FreePhysicalMemory")
+			out, err = cmd.Output()
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Çıktıyı parse et
+			lines = strings.Split(string(out), "\n")
+			if len(lines) < 2 {
+				return 0, 0, fmt.Errorf("Geçersiz boş bellek bilgisi çıktısı")
+			}
+
+			// İkinci satırı al
+			freeStr := strings.TrimSpace(lines[1])
+			freeKB, err := strconv.ParseInt(freeStr, 10, 64)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Byte'dan MB'ye ve KB'den MB'ye çevir
+			totalMB := totalBytes / (1024 * 1024)
+			freeMB := freeKB / 1024
+
+			// Sıfır kontrolü
+			if totalMB <= 0 || freeMB <= 0 {
+				return 0, 0, fmt.Errorf("Geçersiz bellek değerleri")
+			}
+
+			return totalMB, freeMB, nil
+		},
+		// Yöntem 3: memory çiplerini toplama
+		func() (int64, int64, error) {
+			// Toplam RAM'i hafıza çiplerinden hesapla
+			cmd := exec.Command("wmic", "memorychip", "get", "Capacity")
+			out, err := cmd.Output()
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Çıktıyı parse et
+			lines := strings.Split(string(out), "\n")
+			if len(lines) < 2 {
+				return 0, 0, fmt.Errorf("Geçersiz memorychip çıktısı")
+			}
+
+			var totalBytes int64
+			// İlk satır başlık, diğer satırlar RAM modülleri
+			for i := 1; i < len(lines); i++ {
+				line := strings.TrimSpace(lines[i])
+				if line == "" {
+					continue
+				}
+
+				bytes, err := strconv.ParseInt(line, 10, 64)
+				if err != nil {
+					continue
+				}
+				totalBytes += bytes
+			}
+
+			if totalBytes <= 0 {
+				return 0, 0, fmt.Errorf("Geçersiz toplam bellek değeri")
+			}
+
+			// Boş bellek tahmini (genellikle toplam belleğin %25'i kadar)
+			// Daha doğru değer için OS'dan FreePhysicalMemory değerini almalıyız
+			totalMB := totalBytes / (1024 * 1024)
+			freeMB := totalMB / 4 // Yaklaşık tahmin
+
+			return totalMB, freeMB, nil
+		},
+		// Yöntem 4: Systeminformation kullanma (daha yeni PowerShell sürümleri için)
+		func() (int64, int64, error) {
+			cmd := exec.Command("powershell", "-Command", "Get-CimInstance -ClassName Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum | Select-Object -ExpandProperty Sum")
+			out, err := cmd.Output()
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Toplam RAM
+			totalBytes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			// Boş RAM
+			cmd = exec.Command("powershell", "-Command", "[math]::Round((Get-Counter '\\Memory\\Available MBytes').CounterSamples.CookedValue)")
+			out, err = cmd.Output()
+			if err != nil {
+				// Sadece toplam RAM biliniyorsa, yaklaşık değer kullan
+				totalMB := totalBytes / (1024 * 1024)
+				freeMB := totalMB / 4 // Yaklaşık tahmin
+				return totalMB, freeMB, nil
+			}
+
+			freeMB, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+			if err != nil {
+				// Sadece toplam RAM biliniyorsa, yaklaşık değer kullan
+				totalMB := totalBytes / (1024 * 1024)
+				freeMB := totalMB / 4 // Yaklaşık tahmin
+				return totalMB, freeMB, nil
+			}
+
+			totalMB := totalBytes / (1024 * 1024)
+			return totalMB, freeMB, nil
+		},
 	}
 
-	// PowerShell çıktısını parse et
-	lines := strings.Split(string(out), "\n")
-	if len(lines) < 3 {
-		return nil, fmt.Errorf("Geçersiz bellek bilgisi çıktısı")
-	}
-
-	var totalMemKB, freeMemKB int64
-
-	// İlk satır başlık, ikinci satır boş, üçüncü satır değerler
-	valueLines := lines[2:]
-	for _, line := range valueLines {
-		if line == "" {
-			continue
-		}
-
-		// Değerleri ayır
-		values := strings.Fields(line)
-		if len(values) >= 2 {
-			totalMemKB, _ = strconv.ParseInt(values[0], 10, 64)
-			freeMemKB, _ = strconv.ParseInt(values[1], 10, 64)
+	// Tüm yöntemleri dene
+	var methodSuccess bool
+	for _, method := range methods {
+		total, free, methodErr := method()
+		if methodErr == nil && total > 0 && free > 0 {
+			totalMB = total
+			freeMB = free
+			methodSuccess = true
+			log.Printf("RAM bilgisi başarıyla alındı: %d MB toplam, %d MB boş", totalMB, freeMB)
 			break
 		}
 	}
 
-	// KB'den MB'ye çevir
-	totalMB := totalMemKB / 1024
-	freeMB := freeMemKB / 1024
-	usedMB := totalMB - freeMB
-
-	// Kullanım yüzdesini hesapla
-	var usagePercent float64
-	if totalMB > 0 {
-		usagePercent = (float64(usedMB) / float64(totalMB)) * 100
-	} else {
-		// Hata durumunda varsayılan değer
+	// Tüm yöntemler başarısız olursa, düşük varsayılan değerler kullan
+	if !methodSuccess || totalMB <= 0 || freeMB <= 0 {
+		log.Printf("Windows RAM bilgisi alınamadı, varsayılan değerler kullanılıyor (4GB)")
+		totalMB = 4096 // 4GB
+		freeMB = 1024  // 1GB
+		usedMB = 3072  // 3GB
 		usagePercent = 75.0
-	}
-
-	// Sıfır kontrolü
-	if totalMB == 0 || freeMB == 0 {
-		return map[string]interface{}{
-			"total_mb":      int64(16384), // 16GB varsayılan değer
-			"free_mb":       int64(4096),  // 4GB varsayılan değer
-			"used_mb":       int64(12288), // 12GB varsayılan değer
-			"usage_percent": 75.0,         // %75 varsayılan kullanım
-		}, nil
+	} else {
+		// Kullanılan bellek ve yüzde hesapla
+		usedMB = totalMB - freeMB
+		usagePercent = (float64(usedMB) / float64(totalMB)) * 100
 	}
 
 	return map[string]interface{}{

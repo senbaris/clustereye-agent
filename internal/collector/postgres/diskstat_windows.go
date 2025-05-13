@@ -72,9 +72,8 @@ func GetDiskUsage() (string, int) {
 		return "N/A", 0
 	}
 
-	// Kullanım yüzdesini hesapla
-	usedBytes := totalBytes - freeBytes
-	percent := int((float64(usedBytes) / float64(totalBytes)) * 100)
+	// Boş disk yüzdesini hesapla (Free Disk Percent)
+	percent := int((float64(freeBytes) / float64(totalBytes)) * 100)
 
 	// Boş alanı okunabilir formata çevir
 	freeDisk := convertSize(freeBytes)
