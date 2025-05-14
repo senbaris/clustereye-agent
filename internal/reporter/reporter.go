@@ -926,6 +926,95 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
 
+				// PostgreSQL promotion özel işleme:
+				// Format: postgres_promote|<data_directory>|<query_id>
+				if strings.HasPrefix(query.Command, "postgres_promote") {
+					log.Printf("PostgreSQL promotion komutu tespit edildi: %s", query.Command)
+
+					// Komuttan parametreleri çıkar
+					parts := strings.Split(query.Command, "|")
+					if len(parts) >= 2 {
+						// Extract data directory (ikinci parametre)
+						dataDir := parts[1]
+
+						// Extract job ID (üçüncü parametre, varsa)
+						jobID := query.QueryId // Varsayılan olarak mevcut sorgu ID'sini kullan
+						if len(parts) >= 3 && parts[2] != "" {
+							jobID = parts[2] // Özel job ID kullan
+						}
+
+						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s", dataDir, jobID)
+
+						// Hostname'i al
+						hostname, _ := os.Hostname()
+						agentID := "agent_" + hostname
+
+						// RPC isteği oluştur
+						promoteReq := &pb.PostgresPromoteMasterRequest{
+							JobId:         jobID,
+							AgentId:       agentID,
+							NodeHostname:  hostname,
+							DataDirectory: dataDir,
+						}
+
+						// PromotePostgresToMaster RPC'sini çağır
+						go func() {
+							// Bu işlemi arka planda çalıştır, yoksa uzun sürebilir
+							promoteResp, err := r.PromotePostgresToMaster(context.Background(), promoteReq)
+							if err != nil {
+								log.Printf("PostgreSQL promotion RPC işlemi başarısız: %v", err)
+								// Hata durumunda sonucu gönder
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": fmt.Sprintf("PostgreSQL promotion RPC işlemi başarısız: %v", err),
+								}
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+							} else {
+								// RPC yanıtını dönüştür
+								var statusStr string
+								if promoteResp.Status == pb.JobStatus_JOB_STATUS_COMPLETED {
+									statusStr = "success"
+								} else {
+									statusStr = "error"
+								}
+
+								// Sonucu gönder
+								result := map[string]interface{}{
+									"status":  statusStr,
+									"message": promoteResp.Result,
+									"job_id":  jobID,
+								}
+
+								if promoteResp.ErrorMessage != "" {
+									result["error"] = promoteResp.ErrorMessage
+								}
+
+								sendQueryResult(r.stream, query.QueryId, result)
+							}
+						}()
+
+						// Hemen başlatıldı bilgisi dön
+						initialResult := map[string]interface{}{
+							"status":  "accepted",
+							"message": fmt.Sprintf("PostgreSQL promotion işlemi başlatıldı (JobID: %s, DataDir: %s)", jobID, dataDir),
+							"job_id":  jobID,
+						}
+						sendQueryResult(r.stream, query.QueryId, initialResult)
+
+						isProcessingQuery = false
+						continue
+					} else {
+						// Eksik parametre
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]",
+						}
+						sendQueryResult(r.stream, query.QueryId, errorResult)
+						isProcessingQuery = false
+						continue
+					}
+				}
+
 				// MSSQL sorguları için özel işleme
 				if r.platform == "mssql" && mssqlProcessor != nil {
 					// MSSQL sorgu ID'lerine göre özel işleme
@@ -3154,6 +3243,18 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// İlk log mesajı
 	logger.LogMessage(fmt.Sprintf("PostgreSQL Master Promotion işlemi başlatılıyor. Data directory: %s", req.DataDirectory))
 
+	// Metadata olarak hostname, data directory ve node status ekle
+	logger.AddMetadata("hostname", req.NodeHostname)
+	logger.AddMetadata("data_directory", req.DataDirectory)
+
+	// Mevcut PostgreSQL sürümünü metadata'ya ekle
+	currentPgVersion := postgres.GetPGVersion()
+	logger.AddMetadata("pg_version", currentPgVersion)
+
+	// Başlangıç node durumunu metadata'ya ekle
+	initialNodeStatus := postgres.GetNodeStatus()
+	logger.AddMetadata("initial_node_status", initialNodeStatus)
+
 	// Data Directory kontrolü
 	dataDir := req.DataDirectory
 	if dataDir == "" {
@@ -3238,10 +3339,11 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Node'un çalışıp çalışmadığını kontrol et
 	pgStatus := postgres.GetPGServiceStatus()
 	logger.LogMessage(fmt.Sprintf("PostgreSQL servis durumu: %s", pgStatus))
+	logger.AddMetadata("service_status", pgStatus)
 
 	if pgStatus != "RUNNING" {
 		errMsg := "PostgreSQL servisi çalışmıyor, promotion yapılamaz"
-		logger.LogMessage(errMsg)
+		logger.LogError(errMsg, nil)
 
 		// Logger'ı durdur
 		logger.Stop("failed")
