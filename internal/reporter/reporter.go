@@ -2747,6 +2747,14 @@ func (r *Reporter) SendPostgresInfo() error {
 	// PostgreSQL konfigürasyon dosyasının yolunu al
 	configPath, _ := postgres.FindPostgresConfigFile()
 
+	// PostgreSQL data directory yolunu al
+	dataPath, err := postgres.GetDataDirectory()
+	if err != nil {
+		log.Printf("PostgreSQL veri dizini bulunamadı: %v, varsayılan değer boş kullanılacak", err)
+		dataPath = ""
+	}
+	log.Printf("PostgreSQL veri dizini: %s", dataPath)
+
 	// PostgreSQL bilgilerini oluştur
 	pgInfo := &pb.PostgresInfo{
 		ClusterName:       r.cfg.PostgreSQL.Cluster,
@@ -2763,6 +2771,7 @@ func (r *Reporter) SendPostgresInfo() error {
 		TotalVcpu:         totalvCpu,
 		TotalMemory:       totalMemory,
 		ConfigPath:        configPath,
+		DataPath:          dataPath,
 	}
 
 	// PostgreSQL bilgilerini logla

@@ -215,6 +215,11 @@ func getDataDirectoryFromConfig() (string, error) {
 	return "", fmt.Errorf("data_directory parametresi bulunamadı")
 }
 
+// GetDataDirectory postgresql.conf dosyasından data_directory parametresini okur (public wrapper)
+func GetDataDirectory() (string, error) {
+	return getDataDirectoryFromConfig()
+}
+
 // GetReplicationLagSec replication lag'i saniye cinsinden döndürür
 func GetReplicationLagSec() float64 {
 	db, err := OpenDB()

@@ -635,39 +635,100 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 
 // getLocalIP returns the local IP address
 func (c *MSSQLCollector) getLocalIP() string {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("powershell", "-Command", "(Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias Ethernet).IPAddress")
-		out, err := cmd.Output()
-		if err == nil {
-			return strings.TrimSpace(string(out))
-		}
-
-		// Try alternative
-		cmd = exec.Command("powershell", "-Command", "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.AddressState -eq 'Preferred' -and $_.PrefixOrigin -ne 'WellKnown' })[0].IPAddress")
-		out, err = cmd.Output()
-		if err == nil {
-			return strings.TrimSpace(string(out))
-		}
-	}
-
-	// Try common approach for Unix-like systems
-	cmd := exec.Command("sh", "-c", "hostname -I | awk '{print $1}'")
-	out, err := cmd.Output()
-	if err != nil {
-		// Fallback to interface enumeration
-		addrs, err := net.InterfaceAddrs()
-		if err == nil {
-			for _, addr := range addrs {
-				if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-					if ipnet.IP.To4() != nil {
-						return ipnet.IP.String()
-					}
+	// İlk olarak standart kütüphaneyi kullanarak IP hesaplamayı dene - platform bağımsız çalışır
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					ipStr := ipnet.IP.String()
+					log.Printf("Go stdlib ile bulunan IP adresi: %s", ipStr)
+					return ipStr
 				}
 			}
 		}
-		return "Unknown"
 	}
-	return strings.TrimSpace(string(out))
+
+	// Standart kütüphaneyle bulamazsak işletim sistemine özgü komutları dene
+	if runtime.GOOS == "windows" {
+		// Windows'ta IP adresini almak için birden fazla yöntem dene
+
+		// 1. Sadece ipconfig/ifconfig kullanarak tüm adaptörleri kontrol et
+		cmd := exec.Command("powershell", "-Command", "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.0.0.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress")
+		out, err := cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("PowerShell ile bulunan IP (yöntem 1): %s", ipStr)
+			return ipStr
+		}
+
+		// 2. İkinci bir yaklaşım dene
+		cmd = exec.Command("powershell", "-Command", "(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne 'Disconnected' }).IPv4Address.IPAddress")
+		out, err = cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("PowerShell ile bulunan IP (yöntem 2): %s", ipStr)
+			return ipStr
+		}
+
+		// 3. Daha temel bir IPConfig kullanımı dene
+		cmd = exec.Command("powershell", "-Command", "ipconfig | Select-String -Pattern 'IPv4 Address' | ForEach-Object { $_.ToString().Trim().Split(':')[1].Trim() } | Select-Object -First 1")
+		out, err = cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("IPConfig ile bulunan IP: %s", ipStr)
+			return ipStr
+		}
+
+		// 4. En temel yöntem olarak IP yapılandırmasını doğrudan al
+		cmd = exec.Command("ipconfig")
+		out, err = cmd.Output()
+		if err == nil {
+			// IPV4 adresini bul
+			re := regexp.MustCompile(`IPv4 Address[^:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)`)
+			matches := re.FindAllStringSubmatch(string(out), -1)
+			for _, match := range matches {
+				if len(match) > 1 && match[1] != "127.0.0.1" {
+					ipStr := match[1]
+					log.Printf("IPConfig regex ile bulunan IP: %s", ipStr)
+					return ipStr
+				}
+			}
+		}
+	} else {
+		// Unix/Linux sistemleri
+
+		// 1. İlk yöntem: hostname -I
+		cmd := exec.Command("sh", "-c", "hostname -I | awk '{print $1}'")
+		out, err := cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("hostname -I ile bulunan IP: %s", ipStr)
+			return ipStr
+		}
+
+		// 2. İkinci yöntem: ip addr (modern Linux sistemleri)
+		cmd = exec.Command("sh", "-c", "ip addr show | grep 'inet ' | grep -v '127.0.0.1' | head -n1 | awk '{print $2}' | cut -d/ -f1")
+		out, err = cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("ip addr ile bulunan IP: %s", ipStr)
+			return ipStr
+		}
+
+		// 3. Üçüncü yöntem: ifconfig (eski Unix sistemleri)
+		cmd = exec.Command("sh", "-c", "ifconfig | grep 'inet ' | grep -v '127.0.0.1' | head -n1 | awk '{print $2}' | cut -d: -f2")
+		out, err = cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			ipStr := strings.TrimSpace(string(out))
+			log.Printf("ifconfig ile bulunan IP: %s", ipStr)
+			return ipStr
+		}
+	}
+
+	// Hiçbir yöntemle bulunamazsa
+	log.Printf("IP adresi bulunamadı, bütün yöntemler başarısız oldu")
+	return "Unknown"
 }
 
 // getTotalvCpu returns the total number of vCPUs

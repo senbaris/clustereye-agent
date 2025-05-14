@@ -1928,11 +1928,7 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 			s.host_name,
 			s.program_name,
 			DB_NAME(r.database_id) AS database_name,
-			SUBSTRING(
-				t.text, 
-				(r.statement_start_offset/2) + 1,
-				((CASE r.statement_end_offset WHEN -1 THEN DATALENGTH(t.text) ELSE r.statement_end_offset END - r.statement_start_offset)/2) + 1
-			) AS current_statement,
+			t.text AS full_statement,
 			s.last_request_start_time
 		FROM 
 			sys.dm_os_waiting_tasks w
@@ -1952,17 +1948,13 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 		b.host_name AS blocked_host,
 		b.program_name AS blocked_program,
 		b.database_name AS blocked_db,
-		b.current_statement AS blocked_statement,
+		b.full_statement AS blocked_statement,
 		DATEDIFF(second, b.last_request_start_time, GETDATE()) AS blocked_request_seconds,
 		s.login_name AS blocking_login,
 		s.host_name AS blocking_host,
 		s.program_name AS blocking_program,
 		DB_NAME(r.database_id) AS blocking_db,
-		SUBSTRING(
-			t.text, 
-			(r.statement_start_offset/2) + 1,
-			((CASE r.statement_end_offset WHEN -1 THEN DATALENGTH(t.text) ELSE r.statement_end_offset END - r.statement_start_offset)/2) + 1
-		) AS blocking_statement
+		t.text AS blocking_statement
 	FROM 
 		BlockingTree b
 		LEFT JOIN sys.dm_exec_sessions s ON b.blocking_session_id = s.session_id
@@ -2041,16 +2033,16 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 		blockedStmtStr := "unknown"
 		if blockedStatement.Valid && len(blockedStatement.String) > 0 {
 			blockedStmtStr = blockedStatement.String
-			if len(blockedStmtStr) > 200 {
-				blockedStmtStr = blockedStmtStr[:200] + "..."
+			if len(blockedStmtStr) > 2000 {
+				blockedStmtStr = blockedStmtStr[:2000] + "..."
 			}
 		}
 
 		blockingStmtStr := "unknown"
 		if blockingStatement.Valid && len(blockingStatement.String) > 0 {
 			blockingStmtStr = blockingStatement.String
-			if len(blockingStmtStr) > 200 {
-				blockingStmtStr = blockingStmtStr[:200] + "..."
+			if len(blockingStmtStr) > 2000 {
+				blockingStmtStr = blockingStmtStr[:2000] + "..."
 			}
 		}
 
