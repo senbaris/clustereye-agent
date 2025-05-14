@@ -50,6 +50,8 @@ github.com/sefaphlvn/clustereye-test v1.0.21 h1:n3WVlqs/mlJCTs0cMM79XRZ2lbN2uUYk
 github.com/sefaphlvn/clustereye-test v1.0.21/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
 github.com/sefaphlvn/clustereye-test v1.0.26 h1:dShRtRacq9snWTXmsmzydkV0/zSw+e5TQRnmLSCYVTE=
 github.com/sefaphlvn/clustereye-test v1.0.26/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.27 h1:5yPfPS42fgQgvPTUl4qcnbRlRUEK5RSAz8bEH1r9ImA=
+github.com/sefaphlvn/clustereye-test v1.0.27/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
 github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsTg=
 github.com/stretchr/testify v1.9.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
