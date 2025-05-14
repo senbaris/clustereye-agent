@@ -59,6 +59,13 @@ func (pl *ProcessLogger) Start() {
 func (pl *ProcessLogger) Stop(finalStatus string) {
 	pl.logMutex.Lock()
 
+	// Eğer zaten tamamlanmış veya başarısız olmuşsa, tekrar durdurmaya çalışma
+	if pl.status == "completed" || pl.status == "failed" {
+		pl.logMutex.Unlock()
+		log.Printf("Process logger zaten durmuş durumda: ProcessID=%s, Status=%s", pl.processID, pl.status)
+		return
+	}
+
 	// Hata varsa ve status completed ise, failed'a çevir
 	if pl.hasError && finalStatus == "completed" {
 		pl.LogMessage(fmt.Sprintf("İşlem sırasında %d hata oluştu, durum 'failed' olarak işaretleniyor", pl.errorCount))
@@ -74,13 +81,28 @@ func (pl *ProcessLogger) Stop(finalStatus string) {
 	// Bitiş zamanını da ekle
 	pl.metadata["end_time"] = time.Now().Format(time.RFC3339)
 
+	// Kanalı güvenli bir şekilde kapatmak için bir değişken
+	needToCloseChannel := true
+
+	// Kanal zaten kapalı olabilir, kontrol et
+	select {
+	case <-pl.stopCh:
+		// Kanal zaten kapalı
+		needToCloseChannel = false
+	default:
+		// Kanal hala açık
+	}
+
 	pl.logMutex.Unlock()
 
 	// Son logları gönder
 	pl.sendLogs()
 
-	// Periyodik görevleri durdur
-	close(pl.stopCh)
+	// Periyodik görevleri durdur - güvenli bir şekilde
+	if needToCloseChannel {
+		close(pl.stopCh)
+	}
+
 	log.Printf("Process logger durduruldu: ProcessID=%s, Son durum=%s", pl.processID, finalStatus)
 }
 
@@ -178,18 +200,6 @@ func (pl *ProcessLogger) sendLogs() {
 	metadataProto["error_count"] = fmt.Sprintf("%d", pl.errorCount)
 	metadataProto["elapsed_time_s"] = fmt.Sprintf("%.2f", elapsedTime)
 
-	// NOTLAR:
-	// 1. ProcessLogUpdate ve ProcessLogRequest yapıları henüz proto dosyasında tanımlanmadı
-	// 2. Bu kısım proto tanımları eklendikten sonra güncellenecek
-	// 3. Şimdilik sadece logları yerel olarak tutuyoruz
-
-	// Logları şimdilik yerel olarak logla
-	log.Printf("Process %s (%s) logları (Proto tanımları henüz eklenmediği için server'a gönderilmiyor):",
-		pl.processID, pl.processType)
-	for _, logMsg := range logsCopy {
-		log.Printf("  %s", logMsg)
-	}
-
 	// ProcessLogUpdate mesajı oluştur
 	logUpdate := &pb.ProcessLogUpdate{
 		AgentId:      pl.agentID,
@@ -219,8 +229,6 @@ func (pl *ProcessLogger) sendLogs() {
 		log.Printf("Process logları başarıyla gönderildi: %s", response.Status)
 		pl.lastUpdateTime = time.Now()
 	}
-
-	pl.lastUpdateTime = time.Now()
 }
 
 // CreateProcessLogger belirtilen işlem için yeni bir log izleyici oluşturur ve başlatır

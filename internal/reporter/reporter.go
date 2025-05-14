@@ -3228,16 +3228,20 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	logger.Start()
 
 	// Fonksiyon sonlandığında logger'ı durdur
+	var loggerStopped bool = false
 	defer func() {
 		// İşlem başarısız olursa "failed", başarılı olursa "completed" olarak işaretle
-		// Not: Bu defer içinde erişilebilmesi için burada tanımlanıyor
 		var finalStatus string = "completed" // Varsayılan olarak başarılı
 		// Fonksiyon içinde return ile çıkılmışsa, yani bir hata durumu varsa, "failed" olarak ayarla
 		if r := recover(); r != nil {
 			finalStatus = "failed"
 			logger.LogMessage(fmt.Sprintf("İşlem sırasında beklenmeyen bir hata oluştu: %v", r))
 		}
-		logger.Stop(finalStatus)
+
+		// Eğer logger daha önce durdurulmuş ise tekrar durdurma
+		if !loggerStopped {
+			logger.Stop(finalStatus)
+		}
 	}()
 
 	// İlk log mesajı
@@ -3328,6 +3332,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Logger için durumu güncelle ve durdur
 		logger.Stop("failed")
+		loggerStopped = true
 
 		return &pb.PostgresPromoteMasterResponse{
 			JobId:        req.JobId,
@@ -3347,6 +3352,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Logger'ı durdur
 		logger.Stop("failed")
+		loggerStopped = true
 
 		return &pb.PostgresPromoteMasterResponse{
 			JobId:        req.JobId,
@@ -3358,6 +3364,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Node durumunu kontrol et - standby olup olmadığı
 	nodeStatus := postgres.GetNodeStatus()
 	logger.LogMessage(fmt.Sprintf("PostgreSQL node durumu: %s", nodeStatus))
+	logger.AddMetadata("initial_node_status", nodeStatus)
 
 	if nodeStatus != "SLAVE" && nodeStatus != "STANDBY" {
 		errMsg := fmt.Sprintf("Bu node zaten master/primary durumunda (%s), promotion gerekmez", nodeStatus)
@@ -3365,6 +3372,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Logger'ı durdur
 		logger.Stop("completed") // Zaten master durumunda olduğu için başarılı sayılır
+		loggerStopped = true
 
 		return &pb.PostgresPromoteMasterResponse{
 			JobId:        req.JobId,
@@ -3569,6 +3577,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 				// Logger'ı durdur
 				logger.Stop("failed")
+				loggerStopped = true
 
 				// Her iki yöntem de başarısız, hata yanıtı döndür
 				return &pb.PostgresPromoteMasterResponse{
@@ -3608,6 +3617,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Logger'ı durdur
 		logger.Stop("failed")
+		loggerStopped = true
 
 		return &pb.PostgresPromoteMasterResponse{
 			JobId:        req.JobId,
@@ -3626,6 +3636,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Logger'ı durdur
 		logger.Stop("failed")
+		loggerStopped = true
 
 		return &pb.PostgresPromoteMasterResponse{
 			JobId:        req.JobId,
@@ -3640,6 +3651,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 	// Logger'ı başarılı olarak durdur
 	logger.Stop("completed")
+	loggerStopped = true
 
 	return &pb.PostgresPromoteMasterResponse{
 		JobId:  req.JobId,
