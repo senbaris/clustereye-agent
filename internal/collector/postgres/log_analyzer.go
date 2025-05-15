@@ -87,6 +87,7 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	defer file.Close()
 
 	var logEntries []*pb.PostgresLogEntry        // Tüm geçerli girdiler
+	var slowQueryEntries []*pb.PostgresLogEntry  // Yavaş sorgu eşiğini geçen girdiler
 	var last24HourEntries []*pb.PostgresLogEntry // Son 24 saatlik loglar
 	scanner := bufio.NewScanner(file)
 	totalLines := 0
@@ -116,7 +117,7 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 				entry := processBufferedEntry(buffer)
 				if entry != nil {
 					validEntries++
-					processEntry(entry, &logEntries, &last24HourEntries, last24Hours, slowQueryThresholdMs, &slowQueries)
+					processEntry(entry, &logEntries, &last24HourEntries, &slowQueryEntries, last24Hours, slowQueryThresholdMs, &slowQueries)
 				}
 				buffer.Reset()
 			}
@@ -154,7 +155,7 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 		entry := processBufferedEntry(buffer)
 		if entry != nil {
 			validEntries++
-			processEntry(entry, &logEntries, &last24HourEntries, last24Hours, slowQueryThresholdMs, &slowQueries)
+			processEntry(entry, &logEntries, &last24HourEntries, &slowQueryEntries, last24Hours, slowQueryThresholdMs, &slowQueries)
 		}
 	}
 
@@ -165,8 +166,37 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	log.Printf("PostgreSQL log analizi tamamlandı: Toplam satır=%d, Geçerli girdiler=%d, Yavaş sorgular=%d, Çok satırlı sorgular=%d",
 		totalLines, validEntries, slowQueries, multiLineQueries)
 
+	// Yanıt olarak hangi log girdilerini döndüreceğimize karar ver
+	var resultEntries []*pb.PostgresLogEntry
+
+	// Eğer yavaş sorgu eşiği belirlenmişse ve yavaş sorgular varsa, onları döndür
+	if slowQueryThresholdMs > 0 && len(slowQueryEntries) > 0 {
+		resultEntries = slowQueryEntries
+		log.Printf("Yavaş sorgu eşiğini (%d ms) geçen %d adet girdi döndürülüyor", slowQueryThresholdMs, len(resultEntries))
+	} else if slowQueryThresholdMs > 0 && len(slowQueryEntries) == 0 {
+		// Yavaş sorgu eşiği belirlenmişse ama yavaş sorgu yoksa, son 24 saatlik logları döndür
+		if len(last24HourEntries) > 0 {
+			resultEntries = last24HourEntries
+			log.Printf("Yavaş sorgu bulunamadı, son 24 saate ait %d adet log kaydı döndürülüyor", len(resultEntries))
+		} else {
+			// Son 24 saate ait log yoksa, tüm loglardan örnek bir grup döndür (en fazla 100 girdi)
+			maxSample := 100
+			if len(logEntries) > maxSample {
+				// Son 100 girdiyi al
+				resultEntries = logEntries[len(logEntries)-maxSample:]
+			} else {
+				resultEntries = logEntries
+			}
+			log.Printf("Yavaş sorgu ve son 24 saatlik log bulunamadı, örnek %d adet log kaydı döndürülüyor", len(resultEntries))
+		}
+	} else {
+		// Yavaş sorgu eşiği belirtilmemişse, tüm geçerli girdileri döndür
+		resultEntries = logEntries
+		log.Printf("Tüm geçerli girdiler döndürülüyor (%d adet)", len(resultEntries))
+	}
+
 	return &pb.PostgresLogAnalyzeResponse{
-		LogEntries: logEntries, // Tüm geçerli girdileri döndür
+		LogEntries: resultEntries,
 	}, nil
 }
 
@@ -249,7 +279,7 @@ func processBufferedEntry(buffer *LogBuffer) *pb.PostgresLogEntry {
 }
 
 // processEntry handles a single log entry and updates the relevant collections
-func processEntry(entry *pb.PostgresLogEntry, logEntries, last24HourEntries *[]*pb.PostgresLogEntry, last24Hours int64, slowQueryThresholdMs int64, slowQueries *int) {
+func processEntry(entry *pb.PostgresLogEntry, logEntries, last24HourEntries, slowQueryEntries *[]*pb.PostgresLogEntry, last24Hours int64, slowQueryThresholdMs int64, slowQueries *int) {
 	// Tüm geçerli girdileri logEntries'e ekle
 	*logEntries = append(*logEntries, entry)
 
@@ -259,9 +289,10 @@ func processEntry(entry *pb.PostgresLogEntry, logEntries, last24HourEntries *[]*
 		log.Printf("Son 24 saat logu bulundu: %s", entry.Message)
 	}
 
-	// Yavaş sorguları say
+	// Yavaş sorguları ayrı bir slice'da tut
 	if entry.DurationMs > 0 && entry.DurationMs >= slowQueryThresholdMs {
 		*slowQueries++
+		*slowQueryEntries = append(*slowQueryEntries, entry)
 		log.Printf("Yavaş sorgu bulundu (%d ms): %s", entry.DurationMs, entry.InternalQuery)
 	}
 }

@@ -1945,6 +1945,29 @@ func (r *Reporter) listenForCommands() {
 						continue
 					}
 
+					log.Printf("PostgreSQL log analizi tamamlandı. %d kayıt bulundu", len(analyzeResponse.LogEntries))
+
+					// Log a few sample entries
+					log.Printf("Sunucuya gönderilen ilk girişler (maksimum 5):")
+					for i, entry := range analyzeResponse.LogEntries {
+						if i >= 5 {
+							break
+						}
+
+						log.Printf("  Girdi #%d: %s %s (PID: %s) (%dms) - %s",
+							i+1,
+							time.Unix(entry.Timestamp, 0).Format("2006-01-02 15:04:05"),
+							entry.LogLevel,
+							entry.ProcessId,
+							entry.DurationMs,
+							trimString(entry.Message, 80))
+					}
+
+					// If we have more than 5 entries, show a summary
+					if len(analyzeResponse.LogEntries) > 5 {
+						log.Printf("... ve %d girdi daha", len(analyzeResponse.LogEntries)-5)
+					}
+
 					// Convert log entries to a map for structpb
 					logEntriesData := make([]interface{}, 0, len(analyzeResponse.LogEntries))
 					for _, entry := range analyzeResponse.LogEntries {
