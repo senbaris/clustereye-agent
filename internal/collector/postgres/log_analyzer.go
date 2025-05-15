@@ -23,6 +23,10 @@ var (
 	// 2025-04-19 13:08:29.513 [99940] LOG:  starting PostgreSQL 15.12 ...
 	logLineAltRegex = regexp.MustCompile(`^([\d-]+ [\d:.]+(?:\.\d+)?)\s+\[(\d+)\]\s+(\w+):\s+(.*)$`)
 
+	// PostgreSQL format with UTC timezone and user/db details
+	// 2025-05-14 00:00:09 UTC [1737736] user=,db=,app=,client= LOG:  restartpoint complete...
+	postgresUTCRegex = regexp.MustCompile(`^([\d-]+ [\d:.]+(?:\.\d+)?)\s+UTC\s+\[(\d+)\]\s+(?:user=([^,]*),db=([^,]*),app=[^,]*,client=[^=]*\s+)?(\w+):\s+(.*)$`)
+
 	// Syslog format
 	// May 15 10:49:45 hostname postgresql[12345]: LOG:  message
 	syslogRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}).*?(?:postgresql|postgres).*?\[(\d+)\](?::|.*?:)\s+(\w+):\s+(.*)$`)
@@ -49,6 +53,10 @@ var (
 	// Connection info pattern
 	// connection authorized: user=ossec_user database=ossecdb
 	connectionRegex = regexp.MustCompile(`user=(\S+)\s+database=(\S+)`)
+
+	// Alternative connection info pattern
+	// user=postgres,db=postgres,app=psql
+	connectionAltRegex = regexp.MustCompile(`user=([^,]*),db=([^,]*)`)
 
 	// Statement type patterns
 	statementStartRegex = regexp.MustCompile(`(?i)^(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|ALTER|DROP|TRUNCATE|BEGIN|COMMIT|ROLLBACK)`)
@@ -116,13 +124,14 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	multiLineQueries := 0
 	unparsedLines := 0
 	formatStats := map[string]int{
-		"standard": 0,
-		"notz":     0,
-		"syslog":   0,
-		"generic":  0,
-		"csv":      0,
-		"fallback": 0,
-		"unknown":  0,
+		"standard":    0,
+		"notz":        0,
+		"postgresUTC": 0,
+		"syslog":      0,
+		"generic":     0,
+		"csv":         0,
+		"fallback":    0,
+		"unknown":     0,
 	}
 
 	// Log dosyası formatı hakkında teşhis bilgisi için ilk birkaç satırı logla
@@ -154,8 +163,12 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 		var matches []string
 		var formatMatched string
 
-		// Try the original timezone format
-		if matchesStd := logLineRegex.FindStringSubmatch(line); matchesStd != nil {
+		// Try the PostgreSQL specific format with UTC and user details first (most specific)
+		if matchesPgUTC := postgresUTCRegex.FindStringSubmatch(line); matchesPgUTC != nil {
+			matches = matchesPgUTC
+			formatMatched = "postgresUTC"
+			formatStats["postgresUTC"]++
+		} else if matchesStd := logLineRegex.FindStringSubmatch(line); matchesStd != nil {
 			matches = matchesStd
 			formatMatched = "standard"
 			formatStats["standard"]++
@@ -306,8 +319,8 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	}
 
 	// Log file format diagnostic information
-	log.Printf("PostgreSQL log formatı istatistikleri: Standart=%d, TimezoneYok=%d, Syslog=%d, Generic=%d, CSV=%d, Fallback=%d, Bilinmeyen=%d",
-		formatStats["standard"], formatStats["notz"], formatStats["syslog"], formatStats["generic"],
+	log.Printf("PostgreSQL log formatı istatistikleri: Standart=%d, TimezoneYok=%d, PostgresUTC=%d, Syslog=%d, Generic=%d, CSV=%d, Fallback=%d, Bilinmeyen=%d",
+		formatStats["standard"], formatStats["notz"], formatStats["postgresUTC"], formatStats["syslog"], formatStats["generic"],
 		formatStats["csv"], formatStats["fallback"], formatStats["unknown"])
 
 	if len(sampleLines) > 0 {
@@ -410,10 +423,24 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 		}
 	} else if strings.Contains(timestampStr, "-") && strings.Contains(timestampStr, ":") {
 		// Format without timezone: 2025-04-19 13:08:29.513
-		timestamp, err = time.Parse("2006-01-02 15:04:05.000", timestampStr)
-		if err != nil {
-			// Try without milliseconds
-			timestamp, err = time.Parse("2006-01-02 15:04:05", timestampStr)
+		// Try with UTC timezone if line contained "UTC"
+		if strings.Contains(line, " UTC ") {
+			timestamp, err = time.Parse("2006-01-02 15:04:05.000", timestampStr)
+			if err != nil {
+				// Try without milliseconds
+				timestamp, err = time.Parse("2006-01-02 15:04:05", timestampStr)
+			}
+			// Set timezone to UTC
+			if err == nil {
+				timestamp = timestamp.UTC()
+			}
+		} else {
+			// Regular timestamp without timezone
+			timestamp, err = time.Parse("2006-01-02 15:04:05.000", timestampStr)
+			if err != nil {
+				// Try without milliseconds
+				timestamp, err = time.Parse("2006-01-02 15:04:05", timestampStr)
+			}
 		}
 	} else {
 		// Syslog format: May 15 10:49:45
@@ -444,14 +471,27 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 		return false
 	}
 
-	// Fill the buffer
+	// Fill the buffer with common fields
 	buffer.timestamp = timestamp
 	buffer.processId = matches[2]
-	buffer.logLevel = matches[3]
-	message := strings.TrimSpace(matches[4])
-	buffer.message = append(buffer.message, message)
+
+	// Check if this is from the PostgreSQL UTC format with user/db details (postgresUTCRegex)
+	if len(matches) > 5 && matches[3] != "" {
+		// PostgreSQL UTC format has user and db in matches[3] and matches[4]
+		buffer.userName = matches[3]
+		buffer.database = matches[4]
+		buffer.logLevel = matches[5]
+		message := strings.TrimSpace(matches[6])
+		buffer.message = append(buffer.message, message)
+	} else {
+		// Standard format
+		buffer.logLevel = matches[3]
+		message := strings.TrimSpace(matches[4])
+		buffer.message = append(buffer.message, message)
+	}
 
 	// Check if this is a statement
+	message := buffer.message[0]
 	if strings.Contains(message, "statement:") {
 		parts := strings.SplitN(message, "statement:", 2)
 		if len(parts) > 1 {
@@ -501,10 +541,21 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 		}
 	}
 
-	// Parse connection info if present
-	if connMatch := connectionRegex.FindStringSubmatch(message); connMatch != nil {
-		buffer.userName = connMatch[1]
-		buffer.database = connMatch[2]
+	// If user and database are not set yet, try to parse from the message
+	if buffer.userName == "" || buffer.database == "" {
+		// Try standard connection format
+		if connMatch := connectionRegex.FindStringSubmatch(message); connMatch != nil {
+			buffer.userName = connMatch[1]
+			buffer.database = connMatch[2]
+		} else if connAltMatch := connectionAltRegex.FindStringSubmatch(message); connAltMatch != nil {
+			// Try alternative connection format
+			if buffer.userName == "" && connAltMatch[1] != "" {
+				buffer.userName = connAltMatch[1]
+			}
+			if buffer.database == "" && connAltMatch[2] != "" {
+				buffer.database = connAltMatch[2]
+			}
+		}
 	}
 
 	return true
