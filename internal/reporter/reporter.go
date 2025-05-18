@@ -706,7 +706,17 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 		// Alarm izleme sistemini başlat
 		agentID := "agent_" + hostname
 		client := pb.NewAgentServiceClient(r.grpcClient)
-		r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform)
+
+		// Client yenileme callback'i tanımla
+		clientRefreshCallback := func() (pb.AgentServiceClient, error) {
+			// Client'ı yenilemek için önce bağlantıyı yenileyip sonra yeni bir client oluştur
+			if err := r.reconnect(); err != nil {
+				return nil, fmt.Errorf("client yenilenemedi: %v", err)
+			}
+			return pb.NewAgentServiceClient(r.grpcClient), nil
+		}
+
+		r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform, clientRefreshCallback)
 		r.alarmMonitor.Start()
 
 		return nil // Başarılı

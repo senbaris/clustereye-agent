@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger" // New logger package
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -31,27 +31,29 @@ const (
 
 // AlarmMonitor alarm durumlarını izleyen ve raporlayan birim
 type AlarmMonitor struct {
-	client         pb.AgentServiceClient
-	agentID        string
-	stopCh         chan struct{}
-	alarmCache     map[string]*pb.AlarmEvent // Gönderilen son alarmları saklar
-	alarmCacheLock sync.RWMutex
-	checkInterval  time.Duration
-	config         *config.AgentConfig
-	platform       string                // "postgres" veya "mongo"
-	thresholds     *pb.ThresholdSettings // Threshold değerleri
+	client                pb.AgentServiceClient
+	agentID               string
+	stopCh                chan struct{}
+	alarmCache            map[string]*pb.AlarmEvent // Gönderilen son alarmları saklar
+	alarmCacheLock        sync.RWMutex
+	checkInterval         time.Duration
+	config                *config.AgentConfig
+	platform              string                                // "postgres" veya "mongo"
+	thresholds            *pb.ThresholdSettings                 // Threshold değerleri
+	clientRefreshCallback func() (pb.AgentServiceClient, error) // Client yenilemek için callback
 }
 
 // NewAlarmMonitor yeni bir alarm monitörü oluşturur
-func NewAlarmMonitor(client pb.AgentServiceClient, agentID string, cfg *config.AgentConfig, platform string) *AlarmMonitor {
+func NewAlarmMonitor(client pb.AgentServiceClient, agentID string, cfg *config.AgentConfig, platform string, refreshCallback func() (pb.AgentServiceClient, error)) *AlarmMonitor {
 	monitor := &AlarmMonitor{
-		client:        client,
-		agentID:       agentID,
-		stopCh:        make(chan struct{}),
-		alarmCache:    make(map[string]*pb.AlarmEvent),
-		checkInterval: 30 * time.Second, // Varsayılan kontrol aralığı 30 saniye
-		config:        cfg,
-		platform:      platform,
+		client:                client,
+		agentID:               agentID,
+		stopCh:                make(chan struct{}),
+		alarmCache:            make(map[string]*pb.AlarmEvent),
+		checkInterval:         30 * time.Second, // Varsayılan kontrol aralığı 30 saniye
+		config:                cfg,
+		platform:              platform,
+		clientRefreshCallback: refreshCallback,
 	}
 
 	// İlk threshold değerlerini al
@@ -65,38 +67,68 @@ func (m *AlarmMonitor) updateThresholds() {
 	maxRetries := 5
 	backoff := time.Second * 2 // başlangıç bekleme süresi
 
+	// Bağlantı yenileme sayacı
+	connectionRefreshCount := 0
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Her denemede yeni bir context oluştur (30 saniye zaman aşımı)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		// İstek gönder
 		req := &pb.GetThresholdSettingsRequest{
 			AgentId: m.agentID,
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		resp, err := m.client.GetThresholdSettings(ctx, req)
-		cancel()
+		cancel() // Context'i hemen temizle
 
 		if err != nil {
-			// Bağlantı hatalarını kontrol et
+			// Daha kapsamlı hata kontrol mekanizması
 			isConnectionError := strings.Contains(err.Error(), "connection") ||
 				strings.Contains(err.Error(), "transport") ||
 				strings.Contains(err.Error(), "Canceled") ||
 				strings.Contains(err.Error(), "Deadline") ||
-				strings.Contains(err.Error(), "context")
+				strings.Contains(err.Error(), "context") ||
+				strings.Contains(err.Error(), "closing")
 
 			if attempt < maxRetries-1 && isConnectionError {
 				waitTime := backoff * time.Duration(attempt+1) // exponential backoff
-				log.Printf("Threshold değerleri alınamadı (deneme %d/%d): %v. %v sonra tekrar denenecek...",
+				logger.Warning("Threshold değerleri alınamadı (deneme %d/%d): %v. %v sonra tekrar denenecek...",
 					attempt+1, maxRetries, err, waitTime)
+
+				// Her 2 denemede bir client'ı yenilemeyi dene
+				if connectionRefreshCount == 0 {
+					logger.Info("Bağlantı hatası nedeniyle gRPC client yenileniyor...")
+
+					// Gerçek client yenileme işlemi
+					if m.clientRefreshCallback != nil {
+						newClient, refreshErr := m.clientRefreshCallback()
+						if refreshErr == nil && newClient != nil {
+							logger.Info("gRPC client başarıyla yenilendi")
+							m.client = newClient
+						} else {
+							logger.Warning("gRPC client yenilenemedi: %v", refreshErr)
+						}
+					} else {
+						logger.Warning("Client yenileme callback'i tanımlanmamış, yenileme yapılamıyor")
+					}
+
+					connectionRefreshCount++
+				} else {
+					connectionRefreshCount = (connectionRefreshCount + 1) % 2 // Her 2 denemede bir sıfırla
+				}
+
 				time.Sleep(waitTime)
 				continue
 			}
 
-			log.Printf("Threshold değerleri alınamadı (son deneme %d/%d): %v",
+			logger.Warning("Threshold değerleri alınamadı (son deneme %d/%d): %v",
 				attempt+1, maxRetries, err)
 			return
 		}
 
 		m.thresholds = resp.Settings
-		log.Printf("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d, BlockingQuery=%dms",
+		logger.Info("Threshold değerleri güncellendi: CPU=%.2f%%, Memory=%.2f%%, Disk=%.2f%%, SlowQuery=%dms, Connection=%d, ReplicationLag=%d, BlockingQuery=%dms",
 			m.thresholds.CpuThreshold,
 			m.thresholds.MemoryThreshold,
 			m.thresholds.DiskThreshold,
@@ -108,20 +140,20 @@ func (m *AlarmMonitor) updateThresholds() {
 		return
 	}
 
-	log.Printf("Threshold değerleri %d deneme sonrasında alınamadı", maxRetries)
+	logger.Warning("Threshold değerleri %d deneme sonrasında alınamadı", maxRetries)
 }
 
 // Start alarm kontrol işlemini başlatır
 func (m *AlarmMonitor) Start() {
 	go m.monitorLoop()
 	go m.reportAgentVersion() // Version raporlama işlemini başlat
-	log.Println("Alarm monitörü başlatıldı")
+	logger.Info("Alarm monitörü başlatıldı")
 }
 
 // Stop alarm kontrol işlemini durdurur
 func (m *AlarmMonitor) Stop() {
 	close(m.stopCh)
-	log.Println("Alarm monitörü durduruldu")
+	logger.Info("Alarm monitörü durduruldu")
 }
 
 // SetCheckInterval alarm kontrol aralığını değiştirir
@@ -140,10 +172,10 @@ func (m *AlarmMonitor) monitorLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			log.Printf("Periyodik alarm kontrolü yapılıyor (interval: %v)", m.checkInterval)
+			logger.Debug("Periyodik alarm kontrolü yapılıyor (interval: %v)", m.checkInterval)
 			m.checkAlarms()
 		case <-thresholdUpdateTicker.C:
-			log.Printf("Threshold değerleri güncelleniyor...")
+			logger.Debug("Threshold değerleri güncelleniyor...")
 			m.updateThresholds()
 		case <-m.stopCh:
 			return
@@ -180,9 +212,9 @@ func (m *AlarmMonitor) checkAlarms() {
 		m.checkMSSQLSlowQueries()
 		m.checkMSSQLDeadlocks()
 
-		log.Printf("MSSQL alarm kontrolleri yapılıyor...")
+		logger.Debug("MSSQL alarm kontrolleri yapılıyor...")
 	} else {
-		log.Printf("Bilinmeyen platform: %s", m.platform)
+		logger.Warning("Bilinmeyen platform: %s", m.platform)
 	}
 
 	// Sistem kaynaklarını kontrol etme fonksiyonu şimdilik kapalı
@@ -203,7 +235,7 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 		// Önceki bir alarm varsa ve aynı durumda ise tekrar gönderme
 		if exists && prevAlarm.Status == "triggered" {
 			// Alarm zaten tetiklenmiş, tekrar gönderme (sadece log için)
-			log.Printf("PostgreSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
+			logger.Debug("PostgreSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
 			return
 		}
 
@@ -222,14 +254,14 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 
 		// Alarmı gönder
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("PostgreSQL servis alarmı gönderilemedi: %v", err)
+			logger.Error("PostgreSQL servis alarmı gönderilemedi: %v", err)
 		} else {
 			// Başarıyla gönderildi, önbellekte sakla
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
 
-			log.Printf("PostgreSQL servis FAIL! alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("PostgreSQL servis FAIL! alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if status == "RUNNING" {
 		// Önceki bir alarm varsa ve tetiklenmişse, çözüldü mesajı gönder
@@ -249,14 +281,14 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 
 			// Çözüldü mesajını gönder
 			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("PostgreSQL servis çözüldü mesajı gönderilemedi: %v", err)
+				logger.Error("PostgreSQL servis çözüldü mesajı gönderilemedi: %v", err)
 			} else {
 				// Başarıyla gönderildi, önbellekte sakla
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = resolvedEvent
 				m.alarmCacheLock.Unlock()
 
-				log.Printf("PostgreSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+				logger.Info("PostgreSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
 		} else if !exists {
 			// İlk çalıştırma durumu - servis durumunu kaydet
@@ -275,7 +307,7 @@ func (m *AlarmMonitor) checkPostgreSQLServiceStatus() {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = initialEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("PostgreSQL servis durumu kaydedildi: %s", status)
+			logger.Info("PostgreSQL servis durumu kaydedildi: %s", status)
 		}
 	}
 }
@@ -298,7 +330,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 	if currentStatus.Status != "RUNNING" {
 		// Eğer önceki alarm varsa ve hala aynı durum devam ediyorsa, yeni alarm gönderme
 		if exists && prevAlarm.Status == "triggered" {
-			log.Printf("MongoDB servis durumu hala %s. Önceki alarm aktif (ID: %s)",
+			logger.Debug("MongoDB servis durumu hala %s. Önceki alarm aktif (ID: %s)",
 				currentStatus.Status, prevAlarm.Id)
 			return
 		}
@@ -318,12 +350,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 
 		// Alarmı gönder
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("MongoDB servis alarmı gönderilemedi: %v", err)
+			logger.Error("MongoDB servis alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MongoDB servis alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("MongoDB servis alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" {
 		// Servis düzeldi, çözüldü mesajı gönder
@@ -340,12 +372,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("MongoDB servis çözüldü mesajı gönderilemedi: %v", err)
+			logger.Error("MongoDB servis çözüldü mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MongoDB servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Warning("MongoDB servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 
@@ -377,7 +409,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 		if prevFailoverAlarm.Status == "triggered" {
 			if (prevStatus.CurrentState == "PRIMARY" && currentStatus.CurrentState == "SECONDARY") ||
 				(prevStatus.CurrentState == "SECONDARY" && currentStatus.CurrentState == "PRIMARY") {
-				log.Printf("MongoDB failover durumu değişmedi. Önceki alarm aktif (ID: %s)", prevFailoverAlarm.Id)
+				logger.Debug("MongoDB failover durumu değişmedi. Önceki alarm aktif (ID: %s)", prevFailoverAlarm.Id)
 				return
 			}
 		}
@@ -400,7 +432,7 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 		m.alarmCache[failoverKey] = initialStateEvent
 		m.alarmCacheLock.Unlock()
 
-		log.Printf("MongoDB başlangıç durumu kaydedildi: %s", currentStatus.CurrentState)
+		logger.Info("MongoDB başlangıç durumu kaydedildi: %s", currentStatus.CurrentState)
 		return
 	}
 
@@ -422,12 +454,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 
 		// Alarmı gönder
 		if err := m.reportAlarm(failoverEvent); err != nil {
-			log.Printf("MongoDB failover alarmı gönderilemedi: %v", err)
+			logger.Error("MongoDB failover alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[failoverKey] = failoverEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MongoDB failover alarmı gönderildi (ID: %s)", failoverEvent.Id)
+			logger.Warning("MongoDB failover alarmı gönderildi (ID: %s)", failoverEvent.Id)
 		}
 	} else if failoverExists && prevFailoverAlarm.Status == "triggered" {
 		// Durum normale döndüyse (örneğin: SECONDARY -> PRIMARY -> SECONDARY tamamlandı)
@@ -446,12 +478,12 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 
 		// Çözüldü mesajını gönder
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("MongoDB failover çözüldü mesajı gönderilemedi: %v", err)
+			logger.Error("MongoDB failover çözüldü mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[failoverKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MongoDB failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Warning("MongoDB failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
@@ -459,17 +491,17 @@ func (m *AlarmMonitor) checkMongoDBStatus() {
 // checkMongoSlowQueries MongoDB'deki yavaş sorguları kontrol eder ve alarm gönderir
 func (m *AlarmMonitor) checkMongoSlowQueries() {
 	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
-		log.Printf("Slow query threshold değeri ayarlanmamış")
+		logger.Warning("Slow query threshold değeri ayarlanmamış")
 		return
 	}
 
-	log.Printf("MongoDB yavaş sorgu kontrolü başlıyor. Threshold: %d ms", m.thresholds.SlowQueryThresholdMs)
+	logger.Debug("MongoDB yavaş sorgu kontrolü başlıyor. Threshold: %d ms", m.thresholds.SlowQueryThresholdMs)
 
 	// MongoDB kolektörünü oluştur
 	mongoCollector := mongo.NewMongoCollector(m.config)
 	client, err := mongoCollector.GetClient()
 	if err != nil {
-		log.Printf("MongoDB bağlantısı açılamadı: %v", err)
+		logger.Error("MongoDB bağlantısı açılamadı: %v", err)
 		return
 	}
 	defer client.Disconnect(context.Background())
@@ -488,14 +520,14 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		{Key: "microsecs_running", Value: bson.D{{Key: "$exists", Value: true}}},
 	}).Decode(&currentOps)
 	if err != nil {
-		log.Printf("Admin veritabanında currentOp komutu çalıştırılamadı: %v", err)
+		logger.Error("Admin veritabanında currentOp komutu çalıştırılamadı: %v", err)
 		return
 	}
 
-	log.Printf("currentOp komutu başarıyla çalıştırıldı, sonuçlar işleniyor...")
+	logger.Debug("currentOp komutu başarıyla çalıştırıldı, sonuçlar işleniyor...")
 
 	if inprog, ok := currentOps["inprog"].(primitive.A); ok {
-		log.Printf("Toplam %d aktif operasyon bulundu", len(inprog))
+		logger.Debug("Toplam %d aktif operasyon bulundu", len(inprog))
 		for _, op := range inprog {
 			if opMap, ok := op.(bson.M); ok {
 				// Debug için operasyon detaylarını loglamayı kaldır
@@ -578,7 +610,7 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 	}
 
 	if len(slowQueries) > 0 {
-		log.Printf("Toplam %d yavaş sorgu tespit edildi. En uzun süren sorgu: %.2f ms", len(slowQueries), maxDuration)
+		logger.Debug("Toplam %d yavaş sorgu tespit edildi. En uzun süren sorgu: %.2f ms", len(slowQueries), maxDuration)
 		alarmKey := "mongodb_slow_queries"
 
 		// Rate limiting kontrolü
@@ -589,7 +621,7 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		if exists {
 			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 			if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
-				log.Printf("MongoDB slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
+				logger.Debug("MongoDB slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
 				return
 			}
 		}
@@ -612,12 +644,12 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("MongoDB slow query alarmı gönderilemedi: %v", err)
+			logger.Error("MongoDB slow query alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MongoDB slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("MongoDB slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	}
 }
@@ -625,7 +657,7 @@ func (m *AlarmMonitor) checkMongoSlowQueries() {
 // checkSlowQueries uzun süren sorguları kontrol eder ve alarm gönderir
 func (m *AlarmMonitor) checkSlowQueries() {
 	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
-		log.Printf("Slow query threshold değeri ayarlanmamış")
+		logger.Warning("Slow query threshold değeri ayarlanmamış")
 		return
 	}
 
@@ -648,14 +680,14 @@ func (m *AlarmMonitor) checkSlowQueries() {
 
 	db, err := postgres.OpenDB()
 	if err != nil {
-		log.Printf("Veritabanı bağlantısı açılamadı: %v", err)
+		logger.Error("Veritabanı bağlantısı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Printf("Uzun süren sorgular alınamadı: %v", err)
+		logger.Error("Uzun süren sorgular alınamadı: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -673,7 +705,7 @@ func (m *AlarmMonitor) checkSlowQueries() {
 			durationMs float64
 		)
 		if err := rows.Scan(&pid, &username, &database, &queryText, &durationMs); err != nil {
-			log.Printf("Sorgu bilgileri okunamadı: %v", err)
+			logger.Error("Sorgu bilgileri okunamadı: %v", err)
 			continue
 		}
 
@@ -706,7 +738,7 @@ func (m *AlarmMonitor) checkSlowQueries() {
 		if exists {
 			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 			if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
-				log.Printf("Slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
+				logger.Debug("Slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
 				return
 			}
 		}
@@ -730,12 +762,12 @@ func (m *AlarmMonitor) checkSlowQueries() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("Slow query alarmı gönderilemedi: %v", err)
+			logger.Error("Slow query alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("Slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("Slow query alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	}
 }
@@ -743,13 +775,13 @@ func (m *AlarmMonitor) checkSlowQueries() {
 // checkCPUUsage CPU kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
 func (m *AlarmMonitor) checkCPUUsage() {
 	if m.thresholds == nil || m.thresholds.CpuThreshold == 0 {
-		log.Printf("CPU threshold değeri ayarlanmamış")
+		logger.Warning("CPU threshold değeri ayarlanmamış")
 		return
 	}
 
 	cpuUsage, err := getCPUUsage()
 	if err != nil {
-		log.Printf("CPU kullanımı alınamadı: %v", err)
+		logger.Error("CPU kullanımı alınamadı: %v", err)
 		return
 	}
 
@@ -798,12 +830,12 @@ func (m *AlarmMonitor) checkCPUUsage() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("CPU usage alarmı gönderilemedi: %v", err)
+			logger.Error("CPU usage alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("CPU usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("CPU usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" {
 		// CPU kullanımı normale döndü, resolved mesajı gönder
@@ -820,12 +852,12 @@ func (m *AlarmMonitor) checkCPUUsage() {
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("CPU usage resolved mesajı gönderilemedi: %v", err)
+			logger.Error("CPU usage resolved mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("CPU usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("CPU usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
@@ -833,7 +865,7 @@ func (m *AlarmMonitor) checkCPUUsage() {
 // checkMemoryUsage memory kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
 func (m *AlarmMonitor) checkMemoryUsage() {
 	if m.thresholds == nil || m.thresholds.MemoryThreshold == 0 {
-		log.Printf("Memory threshold değeri ayarlanmamış")
+		logger.Warning("Memory threshold değeri ayarlanmamış")
 		return
 	}
 
@@ -841,14 +873,14 @@ func (m *AlarmMonitor) checkMemoryUsage() {
 	cmd := exec.Command("sh", "-c", "free | grep Mem | awk '{print ($3/$2) * 100}'")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("Memory kullanımı alınamadı: %v", err)
+		logger.Error("Memory kullanımı alınamadı: %v", err)
 		return
 	}
 
 	memStr := strings.TrimSpace(string(output))
 	memUsage, err := strconv.ParseFloat(memStr, 64)
 	if err != nil {
-		log.Printf("Memory kullanımı parse edilemedi: %v", err)
+		logger.Error("Memory kullanımı parse edilemedi: %v", err)
 		return
 	}
 
@@ -886,12 +918,12 @@ func (m *AlarmMonitor) checkMemoryUsage() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("Memory usage alarmı gönderilemedi: %v", err)
+			logger.Error("Memory usage alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("Memory usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("Memory usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" {
 		// Memory kullanımı normale döndü
@@ -908,12 +940,12 @@ func (m *AlarmMonitor) checkMemoryUsage() {
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("Memory usage resolved mesajı gönderilemedi: %v", err)
+			logger.Error("Memory usage resolved mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("Memory usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("Memory usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
@@ -921,7 +953,7 @@ func (m *AlarmMonitor) checkMemoryUsage() {
 // checkDiskUsage disk kullanımını kontrol eder ve threshold'u aşarsa alarm üretir
 func (m *AlarmMonitor) checkDiskUsage() {
 	if m.thresholds == nil || m.thresholds.DiskThreshold == 0 {
-		log.Printf("Disk threshold değeri ayarlanmamış")
+		logger.Warning("Disk threshold değeri ayarlanmamış")
 		return
 	}
 
@@ -936,7 +968,7 @@ func (m *AlarmMonitor) checkDiskUsage() {
 			"Get-Volume | Where-Object {$_.DriveLetter} | Select-Object DriveLetter, @{Name='UsedPercent';Expression={100 - (100 * $_.SizeRemaining / $_.Size)}}, @{Name='Size';Expression={$_.Size}}, @{Name='FreeSpace';Expression={$_.SizeRemaining}} | ConvertTo-Json")
 		output, err := cmd.Output()
 		if err != nil {
-			log.Printf("Windows disk kullanımı alınamadı: %v", err)
+			logger.Error("Windows disk kullanımı alınamadı: %v", err)
 			return
 		}
 
@@ -947,7 +979,7 @@ func (m *AlarmMonitor) checkDiskUsage() {
 			// Tek bir volume için farklı format
 			var singleVolume map[string]interface{}
 			if err := json.Unmarshal(output, &singleVolume); err != nil {
-				log.Printf("Windows disk kullanım bilgisi parse edilemedi: %v", err)
+				logger.Error("Windows disk kullanım bilgisi parse edilemedi: %v", err)
 				return
 			}
 			volumes = []map[string]interface{}{singleVolume}
@@ -998,14 +1030,14 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		cmd := exec.Command("df", "-h")
 		output, err := cmd.Output()
 		if err != nil {
-			log.Printf("Disk kullanımı alınamadı: %v", err)
+			logger.Error("Disk kullanımı alınamadı: %v", err)
 			return
 		}
 
 		// df çıktısını parse et
 		lines := strings.Split(string(output), "\n")
 		if len(lines) < 2 {
-			log.Printf("Disk kullanım bilgisi parse edilemedi")
+			logger.Warning("Disk kullanım bilgisi parse edilemedi")
 			return
 		}
 
@@ -1066,7 +1098,7 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		prevTriggered := prevAlarm.Status == "triggered"
 		currentHigh := len(highUsageFilesystems) > 0
 		if prevTriggered == currentHigh {
-			log.Printf("Disk kullanımı durumu değişmedi. Alarm zaten gönderildi (%s)", prevAlarm.Id)
+			logger.Debug("Disk kullanımı durumu değişmedi. Alarm zaten gönderildi (%s)", prevAlarm.Id)
 			return
 		}
 	}
@@ -1092,12 +1124,12 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("Disk usage alarmı gönderilemedi: %v", err)
+			logger.Error("Disk usage alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("Disk usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("Disk usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" {
 		// Disk kullanımı normale döndü
@@ -1114,12 +1146,12 @@ func (m *AlarmMonitor) checkDiskUsage() {
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("Disk usage resolved mesajı gönderilemedi: %v", err)
+			logger.Error("Disk usage resolved mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("Disk usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("Disk usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
@@ -1149,7 +1181,7 @@ func min(a, b int) int {
 // reportAlarm bir alarm olayını API'ye bildirir
 func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 	maxRetries := 5            // Daha fazla deneme hakkı
-	backoff := 2 * time.Second // Daha uzun bekleme süresi
+	backoff := time.Second * 2 // Daha uzun bekleme süresi
 
 	// Bağlantı yenileme sayacı
 	connectionRefreshCount := 0
@@ -1178,20 +1210,31 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 
 			if attempt < maxRetries-1 {
 				if isConnectionError {
-					log.Printf("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
+					logger.Warning("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
 						attempt+1, maxRetries, err)
 
 					// Her 2 denemede bir client'ı yenilemeyi dene
 					if connectionRefreshCount == 0 {
-						log.Printf("Bağlantı hatası nedeniyle gRPC client yenileniyor...")
+						logger.Info("Bağlantı hatası nedeniyle gRPC client yenileniyor...")
 
-						// Asenkron olarak yeniden bağlanmaya çalış
-						go func() {
-							// Burada reporterı yenileme işlemi yapılabilir
-							// Ya da ana uygulamadan bir callback çağrılabilir
-							time.Sleep(100 * time.Millisecond) // Yenileme için kısa bekle
-							log.Printf("gRPC client yenileme işlemi tamamlandı")
-						}()
+						// Gerçek client yenileme işlemi
+						if m.clientRefreshCallback != nil {
+							newClient, refreshErr := m.clientRefreshCallback()
+							if refreshErr == nil && newClient != nil {
+								logger.Info("gRPC client başarıyla yenilendi")
+								m.client = newClient
+							} else {
+								logger.Warning("gRPC client yenilenemedi: %v", refreshErr)
+							}
+						} else {
+							// Asenkron olarak yeniden bağlanmaya çalış (eski yöntem)
+							go func() {
+								// Burada reporterı yenileme işlemi yapılabilir
+								// Ya da ana uygulamadan bir callback çağrılabilir
+								time.Sleep(100 * time.Millisecond) // Yenileme için kısa bekle
+								logger.Info("gRPC client yenileme işlemi tamamlandı")
+							}()
+						}
 
 						connectionRefreshCount++
 					} else {
@@ -1203,12 +1246,12 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 					if backoffTime > 30*time.Second {
 						backoffTime = 30 * time.Second // Maksimum 30 saniye
 					}
-					log.Printf("Yeniden deneme için %v bekleniyor...", backoffTime)
+					logger.Debug("Yeniden deneme için %v bekleniyor...", backoffTime)
 					time.Sleep(backoffTime)
 					continue
 				} else {
 					// Bağlantı hatası değil, sadece tekrar dene
-					log.Printf("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
+					logger.Warning("Alarm gönderimi başarısız (deneme %d/%d): %v. Yeniden deneniyor...",
 						attempt+1, maxRetries, err)
 					time.Sleep(backoff)
 					continue
@@ -1220,7 +1263,7 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 		}
 
 		// Başarılı
-		log.Printf("Alarm raporu gönderildi, yanıt: %s (deneme %d/%d)",
+		logger.Info("Alarm raporu gönderildi, yanıt: %s (deneme %d/%d)",
 			resp.Status, attempt+1, maxRetries)
 		return nil
 	}
@@ -1231,14 +1274,14 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 // UpdateClient, yeni bir gRPC client ile alarm monitörünün client'ını günceller
 func (m *AlarmMonitor) UpdateClient(client pb.AgentServiceClient) {
 	m.client = client
-	log.Println("AlarmMonitor client'ı güncellendi")
+	logger.Info("AlarmMonitor client'ı güncellendi")
 
 	// Client değişikliğinden sonra zorunlu threshold güncellemesi yap
 	go func() {
 		// Kısa bir bekleme süresi ekle (bağlantının tamamen oluşması için)
 		time.Sleep(500 * time.Millisecond)
 
-		log.Println("Bağlantı yenileme sonrası threshold'lar yeniden alınıyor...")
+		logger.Info("Bağlantı yenileme sonrası threshold'lar yeniden alınıyor...")
 		m.updateThresholds()
 	}()
 }
@@ -1333,18 +1376,18 @@ func (m *AlarmMonitor) sendVersionInfo() {
 
 			if attempt < maxRetries-1 && isConnectionError {
 				waitTime := backoff * time.Duration(attempt+1)
-				log.Printf("Versiyon bilgisi gönderilemedi (deneme %d/%d): %v. %v sonra tekrar denenecek...",
+				logger.Warning("Versiyon bilgisi gönderilemedi (deneme %d/%d): %v. %v sonra tekrar denenecek...",
 					attempt+1, maxRetries, err, waitTime)
 				time.Sleep(waitTime)
 				continue
 			}
 
-			log.Printf("Versiyon bilgisi gönderilemedi (son deneme %d/%d): %v",
+			logger.Warning("Versiyon bilgisi gönderilemedi (son deneme %d/%d): %v",
 				attempt+1, maxRetries, err)
 			return
 		}
 
-		log.Printf("Versiyon bilgisi başarıyla gönderildi: %s", resp.Status)
+		logger.Info("Versiyon bilgisi başarıyla gönderildi: %s", resp.Status)
 		return
 	}
 }
@@ -1377,11 +1420,11 @@ func getOSVersion() string {
 // checkMSSQLSlowQueries yavaş MSSQL sorgularını kontrol eder ve alarm üretir
 func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
-		log.Printf("MSSQL Slow query threshold değeri ayarlanmamış")
+		logger.Warning("MSSQL Slow query threshold değeri ayarlanmamış")
 		return
 	}
 
-	log.Printf("MSSQL yavaş sorgu kontrolü başlıyor. Threshold: %d ms", m.thresholds.SlowQueryThresholdMs)
+	logger.Debug("MSSQL yavaş sorgu kontrolü başlıyor. Threshold: %d ms", m.thresholds.SlowQueryThresholdMs)
 
 	alarmKey := "mssql_slow_queries"
 
@@ -1398,14 +1441,14 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL yavaş sorgu kontrolü için bağlantı açılamadı: %v", err)
+		logger.Error("MSSQL yavaş sorgu kontrolü için bağlantı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	// Bağlantıyı test et
 	if err = db.Ping(); err != nil {
-		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		logger.Error("MSSQL sunucusuna bağlantı kurulamadı: %v", err)
 		return
 	}
 
@@ -1453,7 +1496,7 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL yavaş sorgu sorgusu çalıştırılamadı: %v", err)
+		logger.Error("MSSQL yavaş sorgu sorgusu çalıştırılamadı: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -1489,7 +1532,7 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 			&sessionID, &loginName, &databaseName, &executionTimeMs, &command, &status,
 			&waitType, &waitTime, &lastWaitType, &hostName, &programName, &currentStatement,
 			&batchText, &cpuTime, &totalElapsedTime, &reads, &writes, &logicalReads); err != nil {
-			log.Printf("[ERROR] MSSQL yavaş sorgu satırı okunamadı: %v", err)
+			logger.Error("MSSQL yavaş sorgu satırı okunamadı: %v", err)
 			continue
 		}
 
@@ -1597,7 +1640,7 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 		if exists {
 			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 			if err == nil && time.Since(prevTimestamp) < 5*time.Minute {
-				log.Printf("MSSQL slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
+				logger.Debug("MSSQL slow query alarmı son 5 dakika içinde gönderildi, tekrar gönderilmeyecek")
 				shouldSendAlarm = false
 			}
 		}
@@ -1622,12 +1665,12 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 			}
 
 			if err := m.reportAlarm(alarmEvent); err != nil {
-				log.Printf("MSSQL slow query alarmı gönderilemedi: %v", err)
+				logger.Error("MSSQL slow query alarmı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = alarmEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL slow query alarmı gönderildi (ID: %s, %d yavaş sorgu)", alarmEvent.Id, len(slowQueries))
+				logger.Warning("MSSQL slow query alarmı gönderildi (ID: %s, %d yavaş sorgu)", alarmEvent.Id, len(slowQueries))
 			}
 		}
 	} else {
@@ -1654,12 +1697,12 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 			}
 
 			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("MSSQL slow query çözüldü mesajı gönderilemedi: %v", err)
+				logger.Error("MSSQL slow query çözüldü mesajı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = resolvedEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL slow query çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+				logger.Info("MSSQL slow query çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
 		}
 	}
@@ -1668,7 +1711,7 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 // checkMSSQLCPUUsage MSSQL sunucusunun CPU kullanımını kontrol eder ve alarm üretir
 func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	if m.thresholds == nil || m.thresholds.CpuThreshold == 0 {
-		log.Printf("MSSQL CPU threshold değeri ayarlanmamış")
+		logger.Warning("MSSQL CPU threshold değeri ayarlanmamış")
 		return
 	}
 
@@ -1687,14 +1730,14 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL CPU kullanımı kontrolü için bağlantı açılamadı: %v", err)
+		logger.Error("MSSQL CPU kullanımı kontrolü için bağlantı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	// Bağlantıyı test et
 	if err = db.Ping(); err != nil {
-		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		logger.Error("MSSQL sunucusuna bağlantı kurulamadı: %v", err)
 		return
 	}
 
@@ -1725,9 +1768,9 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	if err == nil && cpuUtilization.Valid {
 		cpuUsage = float64(cpuUtilization.Int64)
 		cpuUsageObtained = true
-		log.Printf("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Ring buffer)", cpuUsage)
+		logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Ring buffer)", cpuUsage)
 	} else {
-		log.Printf("[WARN] Ring buffer metodu ile MSSQL CPU kullanımı alınamadı: %v", err)
+		logger.Warning("Ring buffer metodu ile MSSQL CPU kullanımı alınamadı: %v", err)
 	}
 
 	// 2. Yöntem: Eğer birinci yöntem başarısız olursa, sys.dm_os_performance_counters kullan
@@ -1754,9 +1797,9 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 		if err == nil && sqlCpuUtilization.Valid {
 			cpuUsage = sqlCpuUtilization.Float64
 			cpuUsageObtained = true
-			log.Printf("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Performance counters)", cpuUsage)
+			logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Performance counters)", cpuUsage)
 		} else {
-			log.Printf("[WARN] Performance counters ile MSSQL CPU kullanımı alınamadı: %v", err)
+			logger.Warning("Performance counters ile MSSQL CPU kullanımı alınamadı: %v", err)
 		}
 	}
 
@@ -1785,9 +1828,9 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 		if err == nil && avgCpu.Valid {
 			cpuUsage = avgCpu.Float64
 			cpuUsageObtained = true
-			log.Printf("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Active queries)", cpuUsage)
+			logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Active queries)", cpuUsage)
 		} else {
-			log.Printf("[WARN] Aktif sorgular ile MSSQL CPU kullanımı alınamadı: %v", err)
+			logger.Warning("Aktif sorgular ile MSSQL CPU kullanımı alınamadı: %v", err)
 		}
 	}
 
@@ -1802,14 +1845,14 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 			if err == nil {
 				cpuUsage = cpuVal
 				cpuUsageObtained = true
-				log.Printf("[DEBUG] Sistem CPU kullanımı (Windows): %.2f%%", cpuUsage)
+				logger.Info("[DEBUG] Sistem CPU kullanımı (Windows): %.2f%%", cpuUsage)
 			}
 		}
 	}
 
 	// Eğer hiçbir yöntem başarılı olmazsa, hata dön
 	if !cpuUsageObtained {
-		log.Printf("[ERROR] Hiçbir yöntemle MSSQL CPU kullanımı alınamadı")
+		logger.Warning("Hiçbir yöntemle MSSQL CPU kullanımı alınamadı")
 		return
 	}
 
@@ -1848,12 +1891,12 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("MSSQL CPU usage alarmı gönderilemedi: %v", err)
+			logger.Error("MSSQL CPU usage alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL CPU usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("MSSQL CPU usage alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if cpuUsage < m.thresholds.CpuThreshold && exists && prevAlarm.Status == "triggered" {
 		// CPU kullanımı normale döndü, resolved mesajı gönder
@@ -1870,12 +1913,12 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("MSSQL CPU usage resolved mesajı gönderilemedi: %v", err)
+			logger.Error("MSSQL CPU usage resolved mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL CPU usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("MSSQL CPU usage resolved mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 }
@@ -1884,11 +1927,11 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 	// Threshold kontrolü - blocking_query_threshold_ms değerini kontrol et
 	if m.thresholds == nil || m.thresholds.BlockingQueryThresholdMs == 0 {
-		log.Printf("MSSQL Blocking query threshold değeri ayarlanmamış")
+		logger.Warning("MSSQL Blocking query threshold değeri ayarlanmamış")
 		return
 	}
 
-	log.Printf("MSSQL blokaj kontrolü başlıyor. Threshold: %d ms", m.thresholds.BlockingQueryThresholdMs)
+	logger.Debug("MSSQL blokaj kontrolü başlıyor. Threshold: %d ms", m.thresholds.BlockingQueryThresholdMs)
 
 	alarmKey := "mssql_blocking_queries"
 
@@ -1905,14 +1948,14 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL blokaj kontrolü için bağlantı açılamadı: %v", err)
+		logger.Error("MSSQL blokaj kontrolü için bağlantı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	// Bağlantıyı test et
 	if err = db.Ping(); err != nil {
-		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		logger.Error("MSSQL sunucusuna bağlantı kurulamadı: %v", err)
 		return
 	}
 
@@ -1965,7 +2008,7 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL blokaj sorgusu çalıştırılamadı: %v", err)
+		logger.Error("MSSQL blokaj sorgusu çalıştırılamadı: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -1998,7 +2041,7 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 			&blockedSessionID, &waitDurationMs, &blockingSessionID, &resourceDescription,
 			&blockedLogin, &blockedHost, &blockedProgram, &blockedDB, &blockedStatement, &blockedRequestSeconds,
 			&blockingLogin, &blockingHost, &blockingProgram, &blockingDB, &blockingStatement); err != nil {
-			log.Printf("[ERROR] MSSQL blokaj satırı okunamadı: %v", err)
+			logger.Error("MSSQL blokaj satırı okunamadı: %v", err)
 			continue
 		}
 
@@ -2094,12 +2137,12 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 			}
 
 			if err := m.reportAlarm(alarmEvent); err != nil {
-				log.Printf("MSSQL blokaj alarmı gönderilemedi: %v", err)
+				logger.Error("MSSQL blokaj alarmı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = alarmEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL blokaj alarmı gönderildi (ID: %s, %d blokaj)", alarmEvent.Id, len(blockingQueries))
+				logger.Warning("MSSQL blokaj alarmı gönderildi (ID: %s, %d blokaj)", alarmEvent.Id, len(blockingQueries))
 			}
 		}
 	} else {
@@ -2126,12 +2169,12 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 			}
 
 			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("MSSQL blokaj çözüldü mesajı gönderilemedi: %v", err)
+				logger.Error("MSSQL blokaj çözüldü mesajı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = resolvedEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL blokaj çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+				logger.Info("MSSQL blokaj çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
 		}
 	}
@@ -2185,7 +2228,7 @@ func (m *AlarmMonitor) checkMSSQLServiceStatus() {
 	var uptime int
 	err = db.QueryRow("SELECT DATEDIFF(MINUTE, create_date, GETDATE()) FROM sys.databases WHERE name = 'tempdb'").Scan(&uptime)
 	if err != nil {
-		log.Printf("[WARN] MSSQL uptime alınamadı: %v", err)
+		logger.Warning("MSSQL uptime alınamadı: %v", err)
 		uptime = 0
 	}
 
@@ -2232,14 +2275,14 @@ func (m *AlarmMonitor) checkMSSQLServiceStatus() {
 		m.alarmCache[haStateKey] = haStateInfo
 		m.alarmCacheLock.Unlock()
 
-		log.Printf("[DEBUG] MSSQL AlwaysOn durumu önbelleğe alındı: Role=%s, Group=%s", roleDesc, agName)
+		logger.Info("[DEBUG] MSSQL AlwaysOn durumu önbelleğe alındı: Role=%s, Group=%s", roleDesc, agName)
 
 		// Collector'ın da kullanabilmesi için dosyaya da yazalım
 		m.saveHAStateToDisk(roleDesc, agName)
 	} else if strings.Contains(agErr.Error(), "Invalid object name 'sys.availability_groups'") {
 		// AlwaysOn yapılandırması yok
 		isAlwaysOn = false
-		log.Printf("[DEBUG] MSSQL sunucusunda AlwaysOn yapılandırması bulunmuyor")
+		logger.Info("[DEBUG] MSSQL sunucusunda AlwaysOn yapılandırması bulunmuyor")
 	}
 
 	// Service durumu normal, önceki bir alarm varsa çözüldü mesajı gönder
@@ -2260,9 +2303,9 @@ func (m *AlarmMonitor) saveHAStateToDisk(role, group string) {
 
 	err := os.WriteFile(cacheFile, []byte(data), 0644)
 	if err != nil {
-		log.Printf("[ERROR] HA durumu dosyaya kaydedilemedi: %v", err)
+		logger.Error("HA durumu dosyaya kaydedilemedi: %v", err)
 	} else {
-		log.Printf("[DEBUG] HA durumu dosyaya kaydedildi: %s, %s", role, group)
+		logger.Debug("HA durumu dosyaya kaydedildi: %s, %s", role, group)
 	}
 }
 
@@ -2280,7 +2323,7 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 		// Servis durumu alarmı oluştur (triggered)
 		// Eğer önceki alarm varsa ve aynı durumda ise tekrar gönderme
 		if exists && prevAlarm.Status == "triggered" {
-			log.Printf("MSSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
+			logger.Debug("MSSQL servis durumu hala FAIL! Alarm zaten gönderildi (%s)", prevAlarm.Id)
 			return
 		}
 
@@ -2293,7 +2336,7 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 			role := haStateInfo.MetricValue
 			additionalInfo = fmt.Sprintf(" (Last known AlwaysOn state: %s)", role)
 			metricValue = "FAIL!_ALWAYSON" // Cluster üyesi olduğunu belirt
-			log.Printf("[INFO] MSSQL servis kapalıyken son bilinen AlwaysOn durumu kullanılıyor: %s", role)
+			logger.Info("[INFO] MSSQL servis kapalıyken son bilinen AlwaysOn durumu kullanılıyor: %s", role)
 		}
 
 		alarmEvent := &pb.AlarmEvent{
@@ -2310,12 +2353,12 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 		}
 
 		if err := m.reportAlarm(alarmEvent); err != nil {
-			log.Printf("MSSQL servis alarmı gönderilemedi: %v", err)
+			logger.Error("MSSQL servis alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = alarmEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL servis alarmı gönderildi (ID: %s)", alarmEvent.Id)
+			logger.Warning("MSSQL servis alarmı gönderildi (ID: %s)", alarmEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" {
 		// Servis durumu çözüldü mesajı oluştur (resolved)
@@ -2332,12 +2375,12 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 		}
 
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("MSSQL servis çözüldü mesajı gönderilemedi: %v", err)
+			logger.Error("MSSQL servis çözüldü mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("MSSQL servis çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	} else if !exists {
 		// İlk kez başlatılıyorsa, servis durumunu kaydet
@@ -2356,7 +2399,7 @@ func (m *AlarmMonitor) sendMSSQLServiceAlarm(alarmKey string, isRunning bool, me
 		m.alarmCacheLock.Lock()
 		m.alarmCache[alarmKey] = initialEvent
 		m.alarmCacheLock.Unlock()
-		log.Printf("MSSQL servis durumu kaydedildi")
+		logger.Info("MSSQL servis durumu kaydedildi")
 	}
 }
 
@@ -2377,14 +2420,14 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL failover kontrolü için bağlantı açılamadı: %v", err)
+		logger.Error("MSSQL failover kontrolü için bağlantı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	// Bağlantıyı test et
 	if err = db.Ping(); err != nil {
-		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		logger.Error("MSSQL sunucusuna bağlantı kurulamadı: %v", err)
 		return
 	}
 
@@ -2411,11 +2454,11 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 	if err != nil {
 		// Bu sorgu hatası AlwaysOn'un olmadığı ortamlarda normal
 		if strings.Contains(err.Error(), "Invalid object name 'sys.availability_groups'") {
-			log.Printf("[INFO] MSSQL sunucusunda AlwaysOn yapılandırması bulunmuyor")
+			logger.Info("MSSQL sunucusunda AlwaysOn yapılandırması bulunmuyor")
 			return
 		}
 
-		log.Printf("[ERROR] MSSQL AlwaysOn durumu sorgulanamadı: %v", err)
+		logger.Error("MSSQL AlwaysOn durumu sorgulanamadı: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -2443,7 +2486,7 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 			&currentState.ConnectedStateDesc,
 			&currentState.SynchronizationHealth,
 			&currentState.RecoveryHealth); err != nil {
-			log.Printf("[ERROR] MSSQL AlwaysOn satırı okunamadı: %v", err)
+			logger.Error("MSSQL AlwaysOn satırı okunamadı: %v", err)
 			return
 		}
 
@@ -2452,7 +2495,7 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 	}
 
 	if !hasData {
-		log.Printf("[INFO] MSSQL sunucusunda aktif AlwaysOn yapılandırması bulunamadı")
+		logger.Info("MSSQL sunucusunda aktif AlwaysOn yapılandırması bulunamadı")
 		return
 	}
 
@@ -2482,7 +2525,7 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 		m.alarmCache[alarmKey] = initialStateEvent
 		m.alarmCacheLock.Unlock()
 
-		log.Printf("MSSQL AlwaysOn başlangıç durumu kaydedildi: %s", currentState.RoleDesc)
+		logger.Info("MSSQL AlwaysOn başlangıç durumu kaydedildi: %s", currentState.RoleDesc)
 		return
 	}
 
@@ -2518,12 +2561,12 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 
 		// Alarmı gönder
 		if err := m.reportAlarm(failoverEvent); err != nil {
-			log.Printf("MSSQL failover alarmı gönderilemedi: %v", err)
+			logger.Error("MSSQL failover alarmı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = failoverEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL failover alarmı gönderildi (ID: %s)", failoverEvent.Id)
+			logger.Warning("MSSQL failover alarmı gönderildi (ID: %s)", failoverEvent.Id)
 		}
 	} else if exists && prevAlarm.Status == "triggered" &&
 		currentState.OperationalStateDesc == "ONLINE" &&
@@ -2545,12 +2588,12 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 
 		// Çözüldü mesajını gönder
 		if err := m.reportAlarm(resolvedEvent); err != nil {
-			log.Printf("MSSQL failover çözüldü mesajı gönderilemedi: %v", err)
+			logger.Error("MSSQL failover çözüldü mesajı gönderilemedi: %v", err)
 		} else {
 			m.alarmCacheLock.Lock()
 			m.alarmCache[alarmKey] = resolvedEvent
 			m.alarmCacheLock.Unlock()
-			log.Printf("MSSQL failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+			logger.Info("MSSQL failover çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 		}
 	}
 
@@ -2594,12 +2637,12 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 			}
 
 			if err := m.reportAlarm(healthEvent); err != nil {
-				log.Printf("MSSQL AG health alarmı gönderilemedi: %v", err)
+				logger.Error("MSSQL AG health alarmı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[syncAlarmKey] = healthEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL AG health alarmı gönderildi (ID: %s)", healthEvent.Id)
+				logger.Warning("MSSQL AG health alarmı gönderildi (ID: %s)", healthEvent.Id)
 			}
 		}
 	} else {
@@ -2625,12 +2668,12 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 			}
 
 			if err := m.reportAlarm(resolvedEvent); err != nil {
-				log.Printf("MSSQL AG health çözüldü mesajı gönderilemedi: %v", err)
+				logger.Error("MSSQL AG health çözüldü mesajı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[syncAlarmKey] = resolvedEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL AG health çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
+				logger.Info("MSSQL AG health çözüldü mesajı gönderildi (ID: %s)", resolvedEvent.Id)
 			}
 		}
 	}
@@ -2653,18 +2696,18 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL deadlock kontrolü için bağlantı açılamadı: %v", err)
+		logger.Error("MSSQL deadlock kontrolü için bağlantı açılamadı: %v", err)
 		return
 	}
 	defer db.Close()
 
 	// Bağlantıyı test et
 	if err = db.Ping(); err != nil {
-		log.Printf("[ERROR] MSSQL sunucusuna bağlantı kurulamadı: %v", err)
+		logger.Error("MSSQL sunucusuna bağlantı kurulamadı: %v", err)
 		return
 	}
 
-	log.Printf("MSSQL deadlock kontrolü başlıyor...")
+	logger.Debug("MSSQL deadlock kontrolü başlıyor...")
 
 	// Son 1 saat içindeki deadlock olaylarını sorgula
 	// system_health XEvent oturumundan deadlock bilgilerini çek
@@ -2680,7 +2723,7 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 	// Sorgu sonucunu okumak için hazırla
 	rows, err := db.Query(query)
 	if err != nil {
-		log.Printf("[ERROR] MSSQL deadlock sorgusu çalıştırılamadı: %v", err)
+		logger.Error("MSSQL deadlock sorgusu çalıştırılamadı: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -2701,7 +2744,7 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 		)
 
 		if err != nil {
-			log.Printf("[ERROR] Deadlock bilgisi okunamadı: %v", err)
+			logger.Error("Deadlock bilgisi okunamadı: %v", err)
 			continue
 		}
 
@@ -2709,12 +2752,12 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 	}
 
 	if err = rows.Err(); err != nil {
-		log.Printf("[ERROR] Deadlock satırları okunurken hata: %v", err)
+		logger.Error("Deadlock satırları okunurken hata: %v", err)
 	}
 
 	// Eğer deadlock bulunmuşsa alarm oluştur
 	if len(deadlocks) > 0 {
-		log.Printf("Son 1 saat içinde %d deadlock bulundu", len(deadlocks))
+		logger.Debug("Son 1 saat içinde %d deadlock bulundu", len(deadlocks))
 
 		// Rate limiting kontrolü
 		m.alarmCacheLock.RLock()
@@ -2771,30 +2814,15 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 			}
 
 			if err := m.reportAlarm(alarmEvent); err != nil {
-				log.Printf("MSSQL deadlock alarmı gönderilemedi: %v", err)
+				logger.Error("MSSQL deadlock alarmı gönderilemedi: %v", err)
 			} else {
 				m.alarmCacheLock.Lock()
 				m.alarmCache[alarmKey] = alarmEvent
 				m.alarmCacheLock.Unlock()
-				log.Printf("MSSQL deadlock alarmı gönderildi (ID: %s, %d deadlock)", alarmEvent.Id, len(deadlocks))
+				logger.Warning("MSSQL deadlock alarmı gönderildi (ID: %s, %d deadlock)", alarmEvent.Id, len(deadlocks))
 			}
 		}
 	} else {
-		log.Printf("Son 1 saat içinde deadlock bulunmadı")
+		logger.Info("Son 1 saat içinde deadlock bulunmadı")
 	}
-}
-
-// Yardımcı fonksiyonlar
-func getStringOrDefault(s sql.NullString, defaultValue string) string {
-	if s.Valid {
-		return s.String
-	}
-	return defaultValue
-}
-
-func getIntOrDefault(n sql.NullInt32, defaultValue int32) int32 {
-	if n.Valid {
-		return n.Int32
-	}
-	return defaultValue
 }

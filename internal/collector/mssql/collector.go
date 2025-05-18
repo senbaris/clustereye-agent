@@ -3,6 +3,7 @@ package mssql
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -18,6 +19,7 @@ import (
 	_ "github.com/microsoft/go-mssqldb" // MSSQL driver
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger"
 )
 
 // MSSQLCollector mssql için veri toplama yapısı
@@ -291,33 +293,122 @@ func (c *MSSQLCollector) getHAStateFromCache(key string) (struct{ role, group st
 	// Boş durumu hazırla
 	emptyState := struct{ role, group string }{"", ""}
 
-	// alarm.go dosyasında tanımlı alarmCache gibi bir cache sistemi olmadığından
-	// geçici bir dosya kullanarak son durumu saklayalım
-	cacheFile := filepath.Join(os.TempDir(), "mssql_ha_state.txt")
+	// Get cache file path based on OS
+	cacheFile := getCacheFilePath()
 
-	data, err := os.ReadFile(cacheFile)
-	if err != nil {
+	// Log attempted cache read
+	log.Printf("MSSQL HA durum önbelleği okunuyor: %s", cacheFile)
+
+	// Check if file exists
+	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
+		log.Printf("MSSQL HA durum önbelleği bulunamadı, ilk çalıştırma olabilir")
 		return emptyState, false
 	}
 
-	parts := strings.Split(string(data), "|")
-	if len(parts) >= 2 {
-		return struct{ role, group string }{parts[0], parts[1]}, true
+	// Read cache file
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		log.Printf("MSSQL HA durum önbelleği okunamadı: %v", err)
+		return emptyState, false
 	}
 
-	return emptyState, false
+	// Parse cached data from JSON
+	var cachedData struct {
+		Role        string    `json:"role"`
+		Group       string    `json:"group"`
+		LastUpdated time.Time `json:"last_updated"`
+	}
+
+	if err := json.Unmarshal(data, &cachedData); err != nil {
+		log.Printf("MSSQL HA durum önbelleği ayrıştırılamadı (JSON hatası): %v", err)
+
+		// Try legacy format for backward compatibility
+		parts := strings.Split(string(data), "|")
+		if len(parts) >= 2 {
+			log.Printf("Eski format önbellekte HA bilgisi bulundu: %s, %s", parts[0], parts[1])
+			return struct{ role, group string }{parts[0], parts[1]}, true
+		}
+
+		return emptyState, false
+	}
+
+	// Check if cache is stale (7 days max)
+	if time.Since(cachedData.LastUpdated) > 7*24*time.Hour {
+		log.Printf("MSSQL HA durum önbelleği çok eski (7 günden fazla): %s, yeni veri gerekli",
+			cachedData.LastUpdated.Format("2006-01-02 15:04:05"))
+		return emptyState, false
+	}
+
+	log.Printf("MSSQL HA durum önbelleğinden bilgi alındı: Role=%s, Group=%s, LastUpdated=%s",
+		cachedData.Role, cachedData.Group, cachedData.LastUpdated.Format("2006-01-02 15:04:05"))
+
+	return struct{ role, group string }{cachedData.Role, cachedData.Group}, true
+}
+
+// getCacheFilePath returns the appropriate path for the cache file based on OS
+func getCacheFilePath() string {
+	var basePath string
+
+	if runtime.GOOS == "windows" {
+		// Windows specific path
+		basePath = filepath.Join("C:\\Program Files\\ClusterEyeAgent", "cache")
+	} else {
+		// Linux/Unix path
+		basePath = "/var/lib/clustereye-agent/cache"
+
+		// Try user's home if agent might be running as non-root
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			basePath = filepath.Join(homeDir, ".clustereye", "cache")
+		}
+	}
+
+	// Ensure cache directory exists
+	if err := os.MkdirAll(basePath, 0755); err != nil {
+		log.Printf("Cache dizini oluşturulamadı: %v, geçici dizin kullanılacak", err)
+		// Fallback to temp directory if we can't create our preferred location
+		basePath = os.TempDir()
+	}
+
+	return filepath.Join(basePath, "mssql_ha_state.json")
 }
 
 // saveHAStateToCache saves HA information to a cache file
 func (c *MSSQLCollector) saveHAStateToCache(role, group string) {
-	cacheFile := filepath.Join(os.TempDir(), "mssql_ha_state.txt")
-	data := fmt.Sprintf("%s|%s", role, group)
+	// Prepare cache data with timestamp
+	cacheData := struct {
+		Role        string    `json:"role"`
+		Group       string    `json:"group"`
+		LastUpdated time.Time `json:"last_updated"`
+	}{
+		Role:        role,
+		Group:       group,
+		LastUpdated: time.Now(),
+	}
 
-	err := os.WriteFile(cacheFile, []byte(data), 0644)
+	// Convert to JSON
+	jsonData, err := json.Marshal(cacheData)
+	if err != nil {
+		log.Printf("HA durumu JSON formatına dönüştürülemedi: %v", err)
+		return
+	}
+
+	// Get cache file path
+	cacheFile := getCacheFilePath()
+
+	// Ensure directory exists
+	cacheDir := filepath.Dir(cacheFile)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		log.Printf("Cache dizini oluşturulamadı: %v", err)
+		return
+	}
+
+	// Write cache file
+	err = os.WriteFile(cacheFile, jsonData, 0644)
 	if err != nil {
 		log.Printf("HA durumu önbelleğe kaydedilemedi: %v", err)
 	} else {
-		log.Printf("HA durumu önbelleğe kaydedildi: %s, %s", role, group)
+		log.Printf("HA durumu başarıyla önbelleğe kaydedildi: Role=%s, Group=%s, Path=%s",
+			role, group, cacheFile)
 	}
 }
 
@@ -333,10 +424,11 @@ func (c *MSSQLCollector) GetHAClusterName() string {
 
 		// Önbellekte HA bilgisi varsa onu kullan
 		if hasHAState && haState.group != "" {
-			log.Printf("Servis kapalı ama önbellekte cluster adı mevcut: %s, önbellekteki bilgiler kullanılıyor", haState.group)
+			log.Printf("SQL Server servis kapalı, önbellekteki cluster adı kullanılıyor: %s", haState.group)
 			return haState.group
 		}
 
+		log.Printf("SQL Server kapalı ve önbellekte HA bilgisi bulunamadı")
 		return ""
 	}
 	defer db.Close()
@@ -377,6 +469,11 @@ func (c *MSSQLCollector) GetHAClusterName() string {
 
 			if err != nil {
 				log.Printf("Cluster name could not be determined: %v", err)
+				// Önbellekte bilgi varsa, veritabanından bilgi alınamasa bile önbellekteki bilgiyi geri döndür
+				if hasHAState && haState.group != "" {
+					log.Printf("Veritabanından bilgi alınamadı, önbellekteki grup bilgisini kullanılıyor: %s", haState.group)
+					return haState.group
+				}
 				return ""
 			}
 		}
@@ -554,57 +651,59 @@ func (c *MSSQLCollector) GetConfigPath() string {
 
 // GetMSSQLInfo collects SQL Server information
 func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
-	log.Printf("MSSQL bilgileri toplamaya başlanıyor...")
+	// Use internal logger and set level to INFO just for this function
+	// Replace: log.Printf("MSSQL bilgileri toplamaya başlanıyor...")
+	// With: logger.Info("MSSQL bilgileri toplamaya başlanıyor...")
 
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
-	log.Printf("Hostname: %s, IP: %s", hostname, ip)
+	logger.Debug("Hostname: %s, IP: %s", hostname, ip)
 
 	// Disk kullanımı al
-	log.Printf("Disk kullanımı alınıyor...")
+	logger.Debug("Disk kullanımı alınıyor...")
 	freeDisk, usagePercent := c.GetDiskUsage()
-	log.Printf("Disk kullanımı: %s boş, %d%% kullanımda", freeDisk, usagePercent)
+	logger.Debug("Disk kullanımı: %s boş, %d%% kullanımda", freeDisk, usagePercent)
 
 	// Get version and edition
-	log.Printf("SQL Server versiyon ve sürümü alınıyor...")
+	logger.Debug("SQL Server versiyon ve sürümü alınıyor...")
 	version, edition := c.GetMSSQLVersion()
-	log.Printf("SQL Server versiyon: %s, sürüm: %s", version, edition)
+	logger.Debug("SQL Server versiyon: %s, sürüm: %s", version, edition)
 
 	// Get HA status
-	log.Printf("High Availability durumu kontrol ediliyor...")
+	logger.Debug("High Availability durumu kontrol ediliyor...")
 	nodeStatus, isHAEnabled := c.GetNodeStatus()
-	log.Printf("HA durumu: %s, HA etkin: %v", nodeStatus, isHAEnabled)
+	logger.Debug("HA durumu: %s, HA etkin: %v", nodeStatus, isHAEnabled)
 
 	clusterName := ""
 	if isHAEnabled {
-		log.Printf("AlwaysOn Availability Group ismi alınıyor...")
+		logger.Debug("AlwaysOn Availability Group ismi alınıyor...")
 		clusterName = c.GetHAClusterName()
-		log.Printf("Cluster adı: %s", clusterName)
+		logger.Debug("Cluster adı: %s", clusterName)
 	} else {
 		// Önbellekteki bilgileri kontrol et (service down olsa bile)
 		haState, hasHAState := c.getHAStateFromCache("mssql_ha_state")
 		if hasHAState && haState.group != "" {
 			clusterName = haState.group
-			log.Printf("Servis kapalı, önbellekteki cluster adı kullanılıyor: %s", clusterName)
+			logger.Debug("Servis kapalı, önbellekteki cluster adı kullanılıyor: %s", clusterName)
 			isHAEnabled = true
 			nodeStatus = haState.role
 		}
 	}
 
 	// System information
-	log.Printf("Sistem bilgileri alınıyor...")
+	logger.Debug("Sistem bilgileri alınıyor...")
 	totalvCpu := c.getTotalvCpu()
 	totalMemory := c.getTotalMemory()
-	log.Printf("vCPU: %d, Toplam Bellek: %d bayt", totalvCpu, totalMemory)
+	logger.Debug("vCPU: %d, Toplam Bellek: %d bayt", totalvCpu, totalMemory)
 
-	log.Printf("Yapılandırma dosya yolu alınıyor...")
+	logger.Debug("Yapılandırma dosya yolu alınıyor...")
 	configPath := c.GetConfigPath()
-	log.Printf("Yapılandırma yolu: %s", configPath)
+	logger.Debug("Yapılandırma yolu: %s", configPath)
 
 	// MSSQL servis durumu
-	log.Printf("SQL Server servis durumu kontrol ediliyor...")
+	logger.Debug("SQL Server servis durumu kontrol ediliyor...")
 	serviceStatus := c.GetMSSQLStatus()
-	log.Printf("SQL Server servis durumu: %s", serviceStatus)
+	logger.Debug("SQL Server servis durumu: %s", serviceStatus)
 
 	info := &MSSQLInfo{
 		ClusterName: clusterName,
@@ -627,7 +726,7 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 		Edition:     edition,
 	}
 
-	log.Printf("MSSQL bilgileri toplandı: ClusterName=%s, NodeStatus=%s, Version=%s, HAEnabled=%v",
+	logger.Info("MSSQL bilgileri toplandı: ClusterName=%s, NodeStatus=%s, Version=%s, HAEnabled=%v",
 		info.ClusterName, info.NodeStatus, info.Version, info.IsHAEnabled)
 
 	return info

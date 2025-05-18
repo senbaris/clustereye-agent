@@ -11,6 +11,7 @@ import (
 	"github.com/kardianos/service"
 	"github.com/senbaris/clustereye-agent/internal/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger"
 )
 
 type program struct {
@@ -25,14 +26,14 @@ func (p *program) Start(s service.Service) error {
 }
 
 func (p *program) run() {
-	log.Printf("ClusterEye Agent starting... Platform: %s", p.platform)
+	logger.Info("ClusterEye Agent starting... Platform: %s", p.platform)
 
 	a := agent.NewAgent(p.cfg)
 	a.SetPlatform(p.platform)
 	p.agent = a
 
 	if err := p.agent.Start(); err != nil {
-		log.Fatalf("Agent could not start: %v", err)
+		logger.Fatal("Agent could not start: %v", err)
 	}
 
 	// Block until killed
@@ -42,7 +43,7 @@ func (p *program) run() {
 func (p *program) Stop(s service.Service) error {
 	if p.agent != nil {
 		p.agent.Stop()
-		log.Println("Agent stopped.")
+		logger.Info("Agent stopped.")
 	}
 	return nil
 }
@@ -54,6 +55,7 @@ func main() {
 	helpFlag := flag.Bool("help", false, "Show help")
 	versionFlag := flag.Bool("version", false, "Show version")
 	svcFlag := flag.String("service", "", "Control the system service: install, uninstall, start, stop")
+	logLevelFlag := flag.String("loglevel", "WARNING", "Log level: DEBUG, INFO, WARNING, ERROR, FATAL")
 
 	flag.Parse()
 
@@ -67,9 +69,16 @@ func main() {
 		return
 	}
 
+	// Set log level from command line flag
+	if *logLevelFlag != "" {
+		level := logger.ParseLevel(*logLevelFlag)
+		logger.SetLevel(level)
+		logger.Info("Log seviyesi ayarlandı: %s", logger.LevelToString(level))
+	}
+
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatal("Failed to load config: %v", err)
 	}
 
 	prg := &program{
@@ -85,20 +94,20 @@ func main() {
 
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal("Failed to create service: %v", err)
 	}
 
 	if len(*svcFlag) > 0 {
 		err := service.Control(s, *svcFlag)
 		if err != nil {
-			log.Fatalf("Service command failed: %v", err)
+			logger.Fatal("Service command failed: %v", err)
 		}
 		return
 	}
 
 	err = s.Run()
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal("Service run failed: %v", err)
 	}
 }
 
@@ -110,6 +119,18 @@ func initLogging() {
 		return
 	}
 
+	// Windows Event Log'unu kullanmayı dene
+	if setupWindowsEventLog() {
+		// Başarılı, Event Log kullanılıyor
+		return
+	}
+
+	// Event Log başarısız olursa dosya log sistemini kullan
+	setupFileLogging()
+}
+
+// Dosya log sistemini kurma yardımcı fonksiyonu
+func setupFileLogging() {
 	exePath, err := os.Executable()
 	if err != nil {
 		log.Fatalf("Failed to get executable path: %v", err)
@@ -122,10 +143,15 @@ func initLogging() {
 		_ = os.Rename(logFile, logFile+".old")
 	}
 
-	// Dosyayı aç ve log çıktısını yönlendir
+	// Dosyayı aç
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
+
+	// Set the output for both standard log and our logger package
 	log.SetOutput(f)
+	logger.SetOutput(f)
+
+	logger.Info("Dosya log sistemi başarıyla etkinleştirildi, log seviyesi: %s", logger.LevelToString(logger.GetLevel()))
 }
