@@ -2,8 +2,5 @@
 
 package main
 
-// setupWindowsEventLog is a no-op on non-Windows platforms
-func setupWindowsEventLog() bool {
-	// Non-Windows sistemlerde çalışmıyor, dosya loguna dönülmeli
-	return false
-}
+// Bu dosya sadece Windows olmayan platformlarda derlenir.
+// Artık setupWindowsEventLog fonksiyonu içermiyor.

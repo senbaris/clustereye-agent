@@ -11,8 +11,15 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
-// setupWindowsEventLog configures logging to use the Windows Event Log
-func setupWindowsEventLog() bool {
+func init() {
+	// Windows-specific eventlog yapılandırmasını ayarla
+	// Bu fonksiyon sadece Windows'ta çalışacak
+	configureWindowsEventLog = setupWindowsEventLogInternal
+}
+
+// setupWindowsEventLogInternal configures logging to use the Windows Event Log
+// Sadece Windows platformunda kullanılır
+func setupWindowsEventLogInternal() bool {
 	const sourceName = "ClusterEyeAgent"
 
 	// EventLog'a erişim sağla

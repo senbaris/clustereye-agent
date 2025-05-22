@@ -150,7 +150,7 @@ func initLogging() {
 	var useEventLog bool
 	if runtime.GOOS == "windows" {
 		// Bu kod yalnızca Windows'ta derlenecek ve çalışacak
-		useEventLog = setupWindowsEventLogWrapper()
+		useEventLog = setupWindowsEventLog()
 		if useEventLog {
 			return // Windows EventLog başarıyla ayarlandı
 		}
@@ -160,14 +160,25 @@ func initLogging() {
 	setupFileLogging()
 }
 
-// setupWindowsEventLogWrapper Windows platformlarında Event Log kurulumunu çağırır
-// Bu wrapper, Windows-specific kodun doğrudan çağrılmasını önler
-func setupWindowsEventLogWrapper() bool {
-	if runtime.GOOS == "windows" {
-		return setupWindowsEventLog()
+// setupWindowsEventLog Windows Event Log'unu yapılandırır
+// Sadece Windows platformunda gerçek davranışı gösterir
+// Linux/Mac'te her zaman false döner
+func setupWindowsEventLog() bool {
+	// Non-Windows platformlarında çalışmaz
+	if runtime.GOOS != "windows" {
+		return false
 	}
-	return false
+
+	// Windows platformu için olan kodları çağırır
+	// Windows'ta derlenen eventlog_windows.go içindeki gerçek implementasyona
+	// yapılan çağrı bu noktada düzgün çalışır
+	return configureWindowsEventLog()
 }
+
+// configureWindowsEventLog Windows Event Log implementasyonunu çağırır
+// Boş implementasyon - eventlog_windows.go içinde gerçek implementasyon var
+// Windows olmayan platformlarda derlemeyi tamamlamak için eklendi
+var configureWindowsEventLog = func() bool { return false }
 
 // Dosya log sistemini kurma yardımcı fonksiyonu
 func setupFileLogging() {

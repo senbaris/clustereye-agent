@@ -28,11 +28,14 @@ jobs:
 
       - name: Build for AMD64
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build/clustereye-agent-linux-amd64 cmd/agent/main.go
+          mkdir -p build
+          # Doğrudan main.go dosyasını değil, tüm paketi derle
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build/clustereye-agent-linux-amd64 ./cmd/agent
           
       - name: Build for ARM64
         run: |
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build/clustereye-agent-linux-arm64 cmd/agent/main.go
+          # Doğrudan main.go dosyasını değil, tüm paketi derle
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build/clustereye-agent-linux-arm64 ./cmd/agent
 
       - name: Copy config example
         run: |
