@@ -937,12 +937,96 @@ func (c *MSSQLCollector) collectMSSQLInfo() *MSSQLInfo {
 	// Get hostname and IP using Go's standard library when possible
 	hostname, _ = os.Hostname()
 
-	if runtime.GOOS == "windows" {
-		// Get network information with single PowerShell call for Windows
-		ip = c.getLocalIP()
-	} else {
-		// For other platforms, use Go standard library
-		ip = c.getLocalIPGo()
+	// Always On yapısında güvenilir IP adresi tespiti için önce veritabanına bağlanıp
+	// gerçek IP adresini sorgulamayı deneyelim
+	// Bu şekilde Listener IP yerine fiziksel IP adresini alabiliriz
+	var realIP string
+	dbConn, dbErr := c.GetClient()
+	if dbErr == nil {
+		// Önce şu anki bağlantının host bilgisini almayı deneyelim
+		err := dbConn.QueryRow(`
+			SELECT
+				CASE
+					-- IPv4 için
+					WHEN CHARINDEX(':', CONVERT(NVARCHAR(50), CONNECTIONPROPERTY('local_net_address'))) = 0 
+						THEN CONVERT(NVARCHAR(50), CONNECTIONPROPERTY('local_net_address'))
+					-- IPv6 için
+					ELSE SUBSTRING(CONVERT(NVARCHAR(50), CONNECTIONPROPERTY('local_net_address')), 1, 
+						CHARINDEX(':', CONVERT(NVARCHAR(50), CONNECTIONPROPERTY('local_net_address'))) - 1)
+				END AS local_ip
+		`).Scan(&realIP)
+
+		if err == nil && realIP != "" && realIP != "null" {
+			logger.Debug("SQL bağlantısından alınan IP adresi: %s", realIP)
+
+			// 127.0.0.1 veya localhost gibi loopback adres mi diye kontrol et
+			if realIP != "127.0.0.1" && !strings.HasPrefix(realIP, "localhost") {
+				ip = realIP
+			}
+		} else {
+			// Alternatif bir sorgu daha deneyelim - SQL Server'ın IP adreslerini sorgulayalım
+			rows, err := dbConn.Query(`
+				SELECT 
+					DISTINCT local_net_address 
+				FROM sys.dm_exec_connections 
+				WHERE local_net_address IS NOT NULL
+					AND local_net_address <> '127.0.0.1'
+					AND local_net_address <> '::1'
+			`)
+
+			if err == nil {
+				defer rows.Close()
+
+				var ipAddresses []string
+				for rows.Next() {
+					var addr string
+					if err := rows.Scan(&addr); err == nil && addr != "" {
+						// IPv6 adresiyse IPv4 kısmını al
+						if strings.Contains(addr, ":") {
+							addr = strings.Split(addr, ":")[0]
+						}
+
+						ipAddresses = append(ipAddresses, addr)
+					}
+				}
+
+				// Hostname ile aynı octets'e sahip IP adresini bulmaya çalış
+				// Bu şekilde node üzerindeki gerçek IP'yi daha doğru belirleyebiliriz
+				if len(ipAddresses) > 0 {
+					logger.Debug("SQL Server'dan alınan IP adresleri: %v", ipAddresses)
+
+					// Eğer birden fazla IP varsa, public IP'yi tercih et
+					// Always On IP'leri genellikle 192.168/10.0 gibi private range'lerde olur
+					bestIP := ipAddresses[0] // Varsayılan olarak ilk IP'yi al
+
+					// Hostname bilgisi bir IP içeriyorsa, o IP'yi eşleştir
+					if net.ParseIP(hostname) != nil {
+						for _, addr := range ipAddresses {
+							if addr == hostname {
+								bestIP = addr
+								break
+							}
+						}
+					}
+
+					// IP adresini kullan
+					ip = bestIP
+				}
+			}
+		}
+
+		// Burada dbConn.Close() yapmıyoruz çünkü singleton pattern kullanıyoruz
+	}
+
+	// Eğer veritabanından IP adresi alınamadıysa, Go veya PowerShell yöntemlerini kullan
+	if ip == "" {
+		if runtime.GOOS == "windows" {
+			// Get network information with single PowerShell call for Windows
+			ip = c.getLocalIP()
+		} else {
+			// For other platforms, use Go standard library
+			ip = c.getLocalIPGo()
+		}
 	}
 
 	logger.Debug("Hostname: %s, IP: %s", hostname, ip)

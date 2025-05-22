@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -431,8 +433,15 @@ func NewReporter(cfg *config.AgentConfig) *Reporter {
 
 // Connect GRPC sunucusuna bağlanır
 func (r *Reporter) Connect() error {
-	// GRPC bağlantısı oluştur
-	log.Printf("ClusterEye sunucusuna bağlanıyor: %s", r.cfg.GRPC.ServerAddress)
+	// Konfigürasyonu kontrol et
+	if r.cfg == nil {
+		return fmt.Errorf("konfigürasyon yüklenmemiş")
+	}
+
+	// Adres kontrolü
+	if r.cfg.GRPC.ServerAddress == "" {
+		return fmt.Errorf("gRPC sunucu adresi belirtilmemiş")
+	}
 
 	// gRPC bağlantı seçeneklerini yapılandır
 	opts := []grpc.DialOption{
@@ -442,29 +451,29 @@ func (r *Reporter) Connect() error {
 		// Bağlantı parametrelerini ayarla
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
-				BaseDelay:  2.0 * time.Second, // 1 saniyeden 2 saniyeye çıkarıldı
-				Multiplier: 2.0,               // 1.5'ten 2.0'a çıkarıldı
-				Jitter:     0.3,               // 0.2'den 0.3'e çıkarıldı
-				MaxDelay:   30 * time.Second,  // 20 saniyeden 30 saniyeye çıkarıldı
+				BaseDelay:  1.0 * time.Second,
+				Multiplier: 1.5,
+				Jitter:     0.2,
+				MaxDelay:   20 * time.Second,
 			},
-			MinConnectTimeout: 15 * time.Second, // 10 saniyeden 15 saniyeye çıkarıldı
+			MinConnectTimeout: 10 * time.Second,
 		}),
 
 		// Otomatik yeniden bağlantı etkinleştir
 		grpc.WithDisableServiceConfig(),
 
-		// Keep-alive seçenekleri - önemli: ENHANCE_YOUR_CALM hatalarını önlemek için
+		// Keep-alive seçenekleri
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                180 * time.Second, // 60 saniyeden 180 saniyeye çıkarıldı (daha az sıklıkla ping)
-			Timeout:             20 * time.Second,  // 10 saniyeden 20 saniyeye çıkarıldı
-			PermitWithoutStream: false,             // Stream yokken ping gönderme (doğru ayar)
+			// Linux platformlarında daha az sıklıkta ping göndererek "too_many_pings" hatasını önle
+			Time: func() time.Duration {
+				if runtime.GOOS == "linux" {
+					return 180 * time.Second // Linux'ta 3 dakikada bir ping
+				}
+				return 60 * time.Second // Windows'ta 1 dakikada bir ping
+			}(),
+			Timeout:             20 * time.Second, // 10 saniyeden 20 saniyeye çıkarıldı - daha uzun timeout
+			PermitWithoutStream: false,            // Stream yokken ping gönderme (daha önce true'ydu)
 		}),
-
-		// Bellek kullanımını sınırlamak için maksimum mesaj boyutu ayarı
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(25*1024*1024), // Maksimum 25MB (varsayılan)
-			grpc.MaxCallSendMsgSize(25*1024*1024), // Maksimum 25MB (varsayılan)
-		),
 	}
 
 	// Bağlantı için context oluştur - zaman aşımını artır
@@ -480,9 +489,6 @@ func (r *Reporter) Connect() error {
 	if err != nil {
 		return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
 	}
-
-	// Bağlantı kurulduktan sonra kısa bir süre bekleyelim - stabilizasyon için
-	time.Sleep(500 * time.Millisecond)
 
 	r.grpcClient = conn
 
@@ -706,20 +712,52 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 		PostgresPass: r.cfg.PostgreSQL.Pass,
 	}
 
+	// Linux için yeniden bağlantı oluşturma özelliği - bağlantı başarısız olursa başka bir yeniden bağlantı isteği göndermeden önce belirli bir süre bekle
+	// Bu, bir Linux sunucusundaki tüm ajanların aynı anda bağlanmasını engeller
+	// Sadece Linux platformunda yapalım çünkü Windows'ta zaten daha yavaş çalışıyor
+	if runtime.GOOS == "linux" && (platform == "postgres" || platform == "mongo") {
+		// Agent ID'ye göre rastgele bir bekleme süresi oluştur (1-5 saniye arasında)
+		// Bu, tüm ajanların aynı anda bağlanmasını engeller
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		jitter := time.Duration(rnd.Intn(4)+1) * time.Second
+		logger.Info("Linux platformunda çalışırken kayıt öncesi %v bekleniyor...", jitter)
+		time.Sleep(jitter)
+	}
+
 	// Stream üzerinden agent bilgilerini göndermeyi birkaç kez deneyelim
 	maxRetries := 3
 	var lastErr error
 
+	// Yeniden bağlantı için son deneme zamanını izle - bu, çok hızlı yeniden bağlantı denemelerini önler
+	lastRetryTime := time.Now().Add(-1 * time.Minute) // İlk denemede hemen devam etmek için -1 dakika başlat
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Stream sorunu varsa, yeniden bağlantı kur
+		// Hızlı yeniden bağlantıları önlemek için minimum bekleme süresi
+		timeSinceLastRetry := time.Since(lastRetryTime)
+		minRetryInterval := 5 * time.Second
+
 		if attempt > 0 {
+			// İlk denemeden sonra, minimum bekleme süresini uygula
+			if timeSinceLastRetry < minRetryInterval {
+				waitTime := minRetryInterval - timeSinceLastRetry
+				log.Printf("Çok hızlı yeniden bağlantı önleniyor, %v daha bekleniyor...", waitTime)
+				time.Sleep(waitTime)
+			}
+
 			log.Printf("Stream bağlantısı yenileniyor (deneme %d/%d)...", attempt+1, maxRetries)
 			if err := r.reconnect(); err != nil {
 				log.Printf("Stream yeniden bağlantı hatası: %v", err)
-				time.Sleep(2 * time.Second)
+				// Linux platformunda daha uzun süre bekle
+				if runtime.GOOS == "linux" {
+					time.Sleep(5 * time.Second)
+				} else {
+					time.Sleep(2 * time.Second)
+				}
 				continue
 			}
 		}
+
+		lastRetryTime = time.Now()
 
 		// Agent Message oluştur
 		agentMessage := &pb.AgentMessage{
@@ -730,18 +768,19 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 
 		// Kısa bir timeout ile mesajı gönder
 		sendDone := make(chan error, 1)
+
 		go func() {
 			// Mesaj gönderirken herhangi bir context iptalinden etkilenmemesi için
 			// doğrudan gönder
 			sendDone <- r.stream.Send(agentMessage)
 		}()
 
-		// En fazla 5 saniye bekle
+		// En fazla 10 saniye bekle (5'ten 10'a çıkarıldı - daha güvenilir)
 		var err error
 		select {
 		case err = <-sendDone:
 			// Mesaj gönderimi tamamlandı
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			err = fmt.Errorf("agent bilgileri gönderimi zaman aşımına uğradı")
 			// Bu timeout durumunda stream hala açık olabilir, zorla kapatma
 			log.Printf("Zaman aşımı nedeniyle stream yenileniyor...")
@@ -758,11 +797,18 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			if err == io.EOF || strings.Contains(err.Error(), "transport") ||
 				strings.Contains(err.Error(), "connection") {
 				log.Printf("Bağlantı hatası tespit edildi, yeniden bağlanılacak...")
-				time.Sleep(2 * time.Second)
+				// Linux platformunda daha uzun süre bekle
+				if runtime.GOOS == "linux" {
+					time.Sleep(5 * time.Second)
+				} else {
+					time.Sleep(2 * time.Second)
+				}
 				continue
 			}
 
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			// Denemeler arasında giderek artan bekleme süresi (exponential backoff)
+			retryDelay := time.Duration(attempt+1) * 3 * time.Second
+			time.Sleep(retryDelay)
 			continue
 		}
 
@@ -782,24 +828,47 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 		// Önceki periyodik raporlama durdurulur ve yenisi başlatılır
 		go func() {
 			// Raporlama başlamadan önce kısa bir gecikme ekle - API yükünü azaltmak için
-			time.Sleep(5 * time.Second)
+			// Linux platformunda daha uzun gecikme ekleyelim
+			var initialDelay time.Duration
+			if runtime.GOOS == "linux" {
+				// Hostname'in hash değerine göre 10-20 saniye arasında bir gecikme oluştur
+				// Bu, tüm Linux ajanlarının aynı anda bağlanmasını engeller
+				hash := fnv.New32a()
+				hash.Write([]byte(hostname))
+				hashValue := hash.Sum32()
+				initialDelay = time.Duration(10+int(hashValue%10)) * time.Second
+				logger.Info("Linux platformunda çalışırken periyodik raporlama öncesi %v bekleniyor...", initialDelay)
+			} else {
+				initialDelay = 5 * time.Second
+			}
+			time.Sleep(initialDelay)
 
 			// Platform bazlı varsayılan interval
 			var defaultInterval time.Duration
 			if platform == "postgres" || platform == "mongo" {
-				defaultInterval = 1 * time.Minute // 1 dakika
+				// Linux ve Windows'ta farklı aralıklar kullan
+				if runtime.GOOS == "linux" {
+					defaultInterval = 2 * time.Minute // Linux'ta 2 dakika (postgres/mongo)
+				} else {
+					defaultInterval = 1 * time.Minute // Windows'ta 1 dakika (postgres/mongo)
+				}
 			} else if platform == "mssql" {
-				defaultInterval = 2 * time.Minute // 2 dakika
+				defaultInterval = 2 * time.Minute // Windows'ta 2 dakika (mssql)
 			} else {
 				defaultInterval = 1 * time.Minute // Varsayılan 1 dakika
 			}
 
 			r.StartPeriodicReporting(defaultInterval, platform)
-			logger.Info("Periyodik raporlama başlatıldı (AgentRegistration içinden)")
+			logger.Info("Periyodik raporlama başlatıldı (AgentRegistration içinden), aralık: %v", defaultInterval)
 		}()
 
 		// İlk bilgi gönderimi için gecikme ekle - böylece aynı anda çok fazla istek oluşmaz
-		time.Sleep(2 * time.Second)
+		// Linux platformunda daha uzun bir gecikme kullan
+		if runtime.GOOS == "linux" {
+			time.Sleep(5 * time.Second)
+		} else {
+			time.Sleep(2 * time.Second)
+		}
 
 		// Platform seçimine göre ilk bilgileri gönder
 		// NOT: İlk bilgileri artık periyodik raporlama içinde gönder, burada değil
@@ -2923,8 +2992,20 @@ func (r *Reporter) reconnect() error {
 	}
 
 	// Yeniden bağlantı için bir kaç deneme yapalım
-	maxRetries := 3               // 5'ten 3'e düşürüldü - daha az deneme yapalım
-	retryDelay := 3 * time.Second // Daha uzun bekleme süresi
+	maxRetries := 3 // 5'ten 3'e düşürüldü - daha az deneme yapalım
+
+	// Linux platformunda daha uzun bekleme süresi kullan
+	var retryDelay time.Duration
+	if runtime.GOOS == "linux" {
+		retryDelay = 5 * time.Second // Linux için daha uzun bekleme süresi
+	} else {
+		retryDelay = 3 * time.Second // Windows için normal bekleme süresi
+	}
+
+	// Yeniden bağlantı işleminden önce kısa bir gecikme ekle - API üzerinde yükü azaltmak için
+	cooldownPeriod := 2 * time.Second
+	logger.Info("Yeniden bağlantı öncesi %v bekleniyor...", cooldownPeriod)
+	time.Sleep(cooldownPeriod)
 
 	var err error
 	for i := 0; i < maxRetries; i++ {
@@ -2942,7 +3023,12 @@ func (r *Reporter) reconnect() error {
 		if i < maxRetries-1 {
 			time.Sleep(retryDelay)
 			// Her denemede bekleme süresini artır (exponential backoff)
-			retryDelay = time.Duration(float64(retryDelay) * 2.0) // 1.5 yerine 2.0 çarpanı kullan
+			// Linux platformunda daha agresif bekleme artışı kullan
+			if runtime.GOOS == "linux" {
+				retryDelay = time.Duration(float64(retryDelay) * 2.5) // Linux için daha büyük çarpan
+			} else {
+				retryDelay = time.Duration(float64(retryDelay) * 2.0) // Windows için normal çarpan
+			}
 		}
 	}
 
@@ -2950,8 +3036,13 @@ func (r *Reporter) reconnect() error {
 		return fmt.Errorf("maksimum yeniden bağlantı denemesi aşıldı: %v", err)
 	}
 
-	// Kısa bir süre bekleyelim - sunucunun hazır olmasını garantilemek için
-	time.Sleep(1 * time.Second)
+	// Bağlantı başarılı olduktan sonra, yeniden kaydı denemeden önce daha uzun bir bekleme
+	stabilizationPeriod := 2 * time.Second
+	if runtime.GOOS == "linux" {
+		stabilizationPeriod = 4 * time.Second // Linux için daha uzun bekleme
+	}
+	logger.Info("Bağlantı stabilizasyonu için %v bekleniyor...", stabilizationPeriod)
+	time.Sleep(stabilizationPeriod)
 
 	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
 	// Mevcut platform bilgisini kullanarak agent kaydını yenile
@@ -3185,11 +3276,21 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		interval = 2 * time.Minute // 1 dakikadan 2 dakikaya çıkarıldı
 		logger.Info("MSSQL platformu için raporlama aralığı 2 dakika olarak ayarlandı")
 	} else if platform == "postgres" {
-		interval = 1 * time.Minute // 30 saniyeden 1 dakikaya çıkarıldı
-		logger.Info("PostgreSQL platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+		if runtime.GOOS == "linux" {
+			interval = 2 * time.Minute // Linux için 2 dakikaya çıkarıldı
+			logger.Info("Linux PostgreSQL platformu için raporlama aralığı 2 dakika olarak ayarlandı")
+		} else {
+			interval = 1 * time.Minute // Windows için 1 dakika
+			logger.Info("Windows PostgreSQL platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+		}
 	} else if platform == "mongo" {
-		interval = 1 * time.Minute // 30 saniyeden 1 dakikaya çıkarıldı
-		logger.Info("MongoDB platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+		if runtime.GOOS == "linux" {
+			interval = 2 * time.Minute // Linux için 2 dakikaya çıkarıldı
+			logger.Info("Linux MongoDB platformu için raporlama aralığı 2 dakika olarak ayarlandı")
+		} else {
+			interval = 1 * time.Minute // Windows için 1 dakika
+			logger.Info("Windows MongoDB platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+		}
 	}
 
 	// Raporlama başlatıldığını göster
@@ -3212,7 +3313,12 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 	lastReconnectTime := time.Time{}
 
 	// Minimum rapor etme aralığı - ardışık raporlar arasında en az bu kadar zaman olmalı
+	// Linux platformunda minimum aralığı artır
 	minReportInterval := interval / 2
+	if runtime.GOOS == "linux" {
+		// Daha agresif throttling
+		minReportInterval = interval * 3 / 4 // interval'in 3/4'ü kadar minimum süre (ör. 2dk için 90 saniye)
+	}
 
 	// Heartbeat ticker - periyodik raporlamanın çalıştığını görmek için log
 	heartbeatTicker := time.NewTicker(30 * time.Second)
@@ -3230,12 +3336,23 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		}()
 
 		// İlk çalıştırmada daha uzun bir gecikme ekle - sistemin tam olarak başlaması için
-		initialDelay := 15 * time.Second
+		var initialDelay time.Duration
 		if platform == "mssql" && runtime.GOOS == "windows" {
 			// MSSQL için daha uzun bir başlangıç gecikmesi kullan
 			initialDelay = 30 * time.Second
 			logger.Info("MSSQL platformu için ilk raporlamaya kadar %v bekleniyor...", initialDelay)
+		} else if runtime.GOOS == "linux" {
+			// Linux platformunda daha uzun bir başlangıç gecikmesi ve jitter kullan
+			// Hostname'in hash değerine göre 20-40 saniye arasında bir gecikme oluştur
+			hostname, _ := os.Hostname()
+			hash := fnv.New32a()
+			hash.Write([]byte(hostname))
+			hashValue := hash.Sum32()
+			initialDelay = time.Duration(20+int(hashValue%20)) * time.Second
+			logger.Info("Linux %s platformu için ilk raporlamaya kadar %v bekleniyor (jitter uygulandı)...",
+				platform, initialDelay)
 		} else {
+			initialDelay = 15 * time.Second
 			logger.Info("%s platformu için ilk raporlamaya kadar %v bekleniyor...", platform, initialDelay)
 		}
 		time.Sleep(initialDelay)
@@ -3247,6 +3364,9 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		// 2 kez deneme yap (3 yerine), başarısız olursa devam et
 		maxRetries := 2
 		retryDelay := 5 * time.Second // Daha uzun bekleme süresi
+		if runtime.GOOS == "linux" {
+			retryDelay = 10 * time.Second // Linux için daha uzun bekleme süresi
+		}
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			if attempt > 0 {
@@ -3313,7 +3433,13 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 						strings.Contains(err.Error(), "unavailable") {
 
 						// Son reconnect'ten belli bir süre geçtiyse yeniden bağlan
-						if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > 30*time.Second {
+						// Linux platformunda daha uzun bir bekleme süresi uygula
+						minReconnectInterval := 30 * time.Second
+						if runtime.GOOS == "linux" {
+							minReconnectInterval = 60 * time.Second // Linux için 1 dakika
+						}
+
+						if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > minReconnectInterval {
 							logger.Warning("Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
 
 							if reconnErr := r.reconnect(); reconnErr != nil {
@@ -3323,7 +3449,8 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 								lastReconnectTime = time.Now()
 							}
 						} else {
-							logger.Warning("Son yeniden bağlantıdan bu yana çok kısa süre geçti, yeniden bağlantı atlanıyor")
+							logger.Warning("Son yeniden bağlantıdan bu yana çok kısa süre geçti (%v < %v), yeniden bağlantı atlanıyor",
+								time.Since(lastReconnectTime), minReconnectInterval)
 						}
 					}
 				} else {
@@ -3379,7 +3506,13 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 							strings.Contains(err.Error(), "unavailable") {
 
 							// Son reconnect'ten belli bir süre geçtiyse yeniden bağlan
-							if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > 30*time.Second {
+							// Linux platformunda daha uzun bir bekleme süresi uygula
+							minReconnectInterval := 30 * time.Second
+							if runtime.GOOS == "linux" {
+								minReconnectInterval = 60 * time.Second // Linux için 1 dakika
+							}
+
+							if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > minReconnectInterval {
 								logger.Warning("Watchdog: Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
 
 								if reconnErr := r.reconnect(); reconnErr != nil {
@@ -3388,6 +3521,8 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 									logger.Info("Watchdog: Yeniden bağlantı başarılı")
 									lastReconnectTime = time.Now()
 								}
+							} else {
+								logger.Warning("Watchdog: Son yeniden bağlantıdan bu yana çok kısa süre geçti, yeniden bağlantı atlanıyor")
 							}
 						}
 					}
