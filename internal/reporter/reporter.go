@@ -442,34 +442,47 @@ func (r *Reporter) Connect() error {
 		// Bağlantı parametrelerini ayarla
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
-				BaseDelay:  1.0 * time.Second,
-				Multiplier: 1.5,
-				Jitter:     0.2,
-				MaxDelay:   20 * time.Second,
+				BaseDelay:  2.0 * time.Second, // 1 saniyeden 2 saniyeye çıkarıldı
+				Multiplier: 2.0,               // 1.5'ten 2.0'a çıkarıldı
+				Jitter:     0.3,               // 0.2'den 0.3'e çıkarıldı
+				MaxDelay:   30 * time.Second,  // 20 saniyeden 30 saniyeye çıkarıldı
 			},
-			MinConnectTimeout: 10 * time.Second,
+			MinConnectTimeout: 15 * time.Second, // 10 saniyeden 15 saniyeye çıkarıldı
 		}),
 
 		// Otomatik yeniden bağlantı etkinleştir
 		grpc.WithDisableServiceConfig(),
 
-		// Keep-alive seçenekleri
+		// Keep-alive seçenekleri - önemli: ENHANCE_YOUR_CALM hatalarını önlemek için
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                60 * time.Second, // 60 saniyede bir ping (daha önce 10 saniyeydi, arttırdık)
-			Timeout:             10 * time.Second, // 10 saniye ping timeout
-			PermitWithoutStream: false,            // Stream yokken ping gönderme (daha önce true'ydu)
+			Time:                180 * time.Second, // 60 saniyeden 180 saniyeye çıkarıldı (daha az sıklıkla ping)
+			Timeout:             20 * time.Second,  // 10 saniyeden 20 saniyeye çıkarıldı
+			PermitWithoutStream: false,             // Stream yokken ping gönderme (doğru ayar)
 		}),
+
+		// Bellek kullanımını sınırlamak için maksimum mesaj boyutu ayarı
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(25*1024*1024), // Maksimum 25MB (varsayılan)
+			grpc.MaxCallSendMsgSize(25*1024*1024), // Maksimum 25MB (varsayılan)
+		),
 	}
 
-	// Bağlantı için context oluştur
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Bağlantı için context oluştur - zaman aşımını artır
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second) // 15 saniyeden 30 saniyeye çıkarıldı
 	defer dialCancel()
 
+	// Bağlantı kurulmadan önce kısa bir gecikme ekle - sunucu yükünü hafifletmek için
+	time.Sleep(1 * time.Second)
+
 	// gRPC bağlantısını oluştur
+	log.Printf("gRPC bağlantısı kuruluyor: %s (timeout: 30s)", r.cfg.GRPC.ServerAddress)
 	conn, err := grpc.DialContext(dialCtx, r.cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
 		return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
 	}
+
+	// Bağlantı kurulduktan sonra kısa bir süre bekleyelim - stabilizasyon için
+	time.Sleep(500 * time.Millisecond)
 
 	r.grpcClient = conn
 
