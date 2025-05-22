@@ -2779,7 +2779,8 @@ func flattenMap(data map[string]interface{}) map[string]interface{} {
 
 	// Special handling for top-level keys that should not be nested further
 	for key, value := range data {
-		if key == "status" || key == "analysis_timestamp" || key == "database_name" || key == "server_name" {
+		if key == "status" || key == "analysis_timestamp" || key == "database_name" || key == "server_name" ||
+			key == "analysis_duration_ms" || key == "analyzed_categories" {
 			result[key] = value
 			continue
 		}
@@ -2790,7 +2791,47 @@ func flattenMap(data map[string]interface{}) map[string]interface{} {
 			if hasNestedArrays(v) {
 				log.Printf("İç içe map düzleştiriliyor: %s", key)
 			}
-			flatten(key, v)
+
+			// Special handling for TempDBConfiguration to ensure its contents are properly flattened
+			if key == "TempDBConfiguration" {
+				log.Printf("TempDBConfiguration düzleştiriliyor (%d öğe)...", len(v))
+				// First add a simple presence indicator
+				result["has_tempdb_config"] = true
+
+				// Ensure that each key in TempDBConfiguration is properly added
+				for tempKey, tempValue := range v {
+					tempPrefix := "tempdb_" + tempKey
+
+					// Handle special case for files array
+					if tempKey == "files" || tempKey == "file_details" || tempKey == "basic_file_details" {
+						if filesArray, ok := tempValue.([]map[string]interface{}); ok {
+							result[tempPrefix+"_count"] = len(filesArray)
+							for i, file := range filesArray {
+								for fileKey, fileValue := range file {
+									result[fmt.Sprintf("%s_%d_%s", tempPrefix, i, fileKey)] = fileValue
+								}
+							}
+						} else if filesArray, ok := tempValue.([]interface{}); ok {
+							result[tempPrefix+"_count"] = len(filesArray)
+							for i, file := range filesArray {
+								if fileMap, ok := file.(map[string]interface{}); ok {
+									for fileKey, fileValue := range fileMap {
+										result[fmt.Sprintf("%s_%d_%s", tempPrefix, i, fileKey)] = fileValue
+									}
+								}
+							}
+						} else {
+							// If not an array, just flatten normally
+							flatten(tempPrefix, tempValue)
+						}
+					} else {
+						// For other keys, just add them with the tempdb_ prefix
+						result[tempPrefix] = tempValue
+					}
+				}
+			} else {
+				flatten(key, v)
+			}
 
 		case []map[string]interface{}:
 			// Log when flattening an array

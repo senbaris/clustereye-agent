@@ -960,6 +960,11 @@ func (b *BestPracticesCollector) collectTempDBConfiguration() {
 	db, err := b.collector.GetClient()
 	if err != nil {
 		log.Printf("TempDB yapılandırması toplanamadı: %v", err)
+		// Hata durumunda bile boş bir yapı oluştur
+		b.results["TempDBConfiguration"] = map[string]interface{}{
+			"error":  err.Error(),
+			"status": "error",
+		}
 		return
 	}
 	defer db.Close()
@@ -974,8 +979,10 @@ func (b *BestPracticesCollector) collectTempDBConfiguration() {
 	err = db.QueryRow(`SELECT cpu_count FROM sys.dm_os_sys_info`).Scan(&cpuCount)
 	if err != nil {
 		log.Printf("CPU sayısı alınamadı: %v", err)
+		tempDBConfig["cpu_count_error"] = err.Error()
 		cpuCount = 0
 	}
+	tempDBConfig["cpu_count"] = cpuCount
 
 	// TempDB dosya sayısını ve boyutlarını al
 	rows, err := db.Query(`
@@ -987,11 +994,17 @@ func (b *BestPracticesCollector) collectTempDBConfiguration() {
 		WHERE database_id = DB_ID('tempdb') AND type_desc = 'ROWS'
 	`)
 
-	if err == nil {
+	if err != nil {
+		log.Printf("TempDB dosya bilgileri alınamadı: %v", err)
+		tempDBConfig["file_info_error"] = err.Error()
+	} else {
 		defer rows.Close()
 		if rows.Next() {
 			err := rows.Scan(&tempDBFileCount, &totalSizeMB, &availableSizeMB)
-			if err == nil {
+			if err != nil {
+				log.Printf("TempDB dosya bilgileri tarama hatası: %v", err)
+				tempDBConfig["scan_error"] = err.Error()
+			} else {
 				// CPU sayısı ile TempDB dosya sayısı kontrolü
 				isTempDBOptimal := true
 				var recommendation string
@@ -1005,15 +1018,70 @@ func (b *BestPracticesCollector) collectTempDBConfiguration() {
 				}
 
 				tempDBConfig["file_count"] = tempDBFileCount
-				tempDBConfig["cpu_count"] = cpuCount
 				tempDBConfig["is_optimal"] = isTempDBOptimal
 				if !isTempDBOptimal {
 					tempDBConfig["recommendation"] = recommendation
 				}
 				tempDBConfig["total_size_mb"] = totalSizeMB
 				tempDBConfig["available_size_mb"] = availableSizeMB
+
+				log.Printf("TempDB dosya sayısı: %d, CPU sayısı: %d, Optimal: %v",
+					tempDBFileCount, cpuCount, isTempDBOptimal)
+			}
+		} else {
+			log.Printf("TempDB dosya bilgileri için satır döndürülmedi")
+			tempDBConfig["no_rows"] = true
+		}
+
+		if err := rows.Err(); err != nil {
+			log.Printf("TempDB dosya bilgileri satır döngüsü hatası: %v", err)
+			tempDBConfig["rows_error"] = err.Error()
+		}
+	}
+
+	// Alternatif TempDB dosya bilgisi sorgusu - daha detaylı bilgi
+	rows, err = db.Query(`
+		SELECT 
+			name,
+			physical_name,
+			type_desc,
+			size * 8 / 1024 AS size_mb,
+			growth,
+			is_percent_growth,
+			max_size
+		FROM sys.master_files
+		WHERE database_id = DB_ID('tempdb')
+	`)
+
+	if err == nil {
+		defer rows.Close()
+		var tempDbFiles []map[string]interface{}
+
+		for rows.Next() {
+			var name, physicalName, typeDesc string
+			var sizeMB, growth, maxSize int
+			var isPercentGrowth bool
+
+			if err := rows.Scan(&name, &physicalName, &typeDesc, &sizeMB, &growth, &isPercentGrowth, &maxSize); err == nil {
+				tempDbFiles = append(tempDbFiles, map[string]interface{}{
+					"name":              name,
+					"physical_name":     physicalName,
+					"type":              typeDesc,
+					"size_mb":           sizeMB,
+					"growth":            growth,
+					"is_percent_growth": isPercentGrowth,
+					"max_size":          maxSize,
+				})
 			}
 		}
+
+		if len(tempDbFiles) > 0 {
+			tempDBConfig["files"] = tempDbFiles
+			log.Printf("TempDB detaylı dosya bilgileri alındı: %d dosya", len(tempDbFiles))
+		}
+	} else {
+		log.Printf("TempDB detaylı dosya bilgileri alınamadı: %v", err)
+		tempDBConfig["files_query_error"] = err.Error()
 	}
 
 	// TempDB fragmantasyonu kontrolü
@@ -1047,10 +1115,57 @@ func (b *BestPracticesCollector) collectTempDBConfiguration() {
 
 		if len(fileDetails) > 0 {
 			tempDBConfig["file_details"] = fileDetails
+			log.Printf("TempDB dosya kullanım detayları alındı: %d dosya", len(fileDetails))
+		}
+	} else {
+		// Bu sorgu tempdb veritabanına özel erişim gerektirebilir
+		// ve bazı durumlarda başarısız olabilir, bu normal
+		log.Printf("TempDB dosya kullanım detayları alınamadı: %v", err)
+		tempDBConfig["usage_query_error"] = err.Error()
+
+		// Bu durumda basitleştirilmiş bir sorgu deneyelim
+		alternativeRows, altErr := db.Query(`
+			SELECT 
+				DB_NAME(database_id) as db_name,
+				name,
+				physical_name,
+				size * 8 / 1024 as size_mb
+			FROM sys.master_files
+			WHERE database_id = DB_ID('tempdb')
+		`)
+
+		if altErr == nil {
+			defer alternativeRows.Close()
+			var altFileDetails []map[string]interface{}
+
+			for alternativeRows.Next() {
+				var dbName, name, physicalName string
+				var sizeMB int
+
+				if scanErr := alternativeRows.Scan(&dbName, &name, &physicalName, &sizeMB); scanErr == nil {
+					altFileDetails = append(altFileDetails, map[string]interface{}{
+						"db_name":       dbName,
+						"name":          name,
+						"physical_name": physicalName,
+						"size_mb":       sizeMB,
+					})
+				}
+			}
+
+			if len(altFileDetails) > 0 {
+				tempDBConfig["basic_file_details"] = altFileDetails
+				log.Printf("TempDB temel dosya bilgileri alındı: %d dosya", len(altFileDetails))
+			}
+		} else {
+			log.Printf("TempDB alternatif dosya bilgileri de alınamadı: %v", altErr)
 		}
 	}
 
+	// Sonuçları kaydet
 	b.results["TempDBConfiguration"] = tempDBConfig
+
+	// Verilerin kaydedildiğini onaylamak için log
+	log.Printf("TempDB yapılandırması başarıyla toplandı ve sonuçlara eklendi. Alanlar: %d", len(tempDBConfig))
 }
 
 // min iki sayının küçük olanını döndürür
