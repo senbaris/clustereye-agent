@@ -2,6 +2,7 @@ package mssql
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"time"
 )
@@ -22,15 +23,93 @@ func NewBestPracticesCollector(collector *MSSQLCollector) *BestPracticesCollecto
 
 // CollectAll tüm best practice metriklerini toplar
 func (b *BestPracticesCollector) CollectAll() map[string]interface{} {
-	b.collectSystemConfiguration()
-	b.collectDatabaseHealth()
-	b.collectPerformanceMetrics()
-	b.collectHighAvailabilityStatus()
-	b.collectSecuritySettings()
-	b.collectSystemMetrics()
-	b.collectBackupStatus()
+	// Sonuçları içeren ana harita
+	b.results = make(map[string]interface{})
+
+	// Başlangıç zamanı
+	startTime := time.Now()
+
+	// Her bir kategori için ayrı retry mekanizması ve panic koruması uygulayalım
+	// Bu şekilde bir kategorideki hata diğerlerinin çalışmasını engellemeyecek
+	collectWithRetry(func() {
+		b.collectSystemConfiguration()
+	}, "SystemConfiguration", 2)
+
+	collectWithRetry(func() {
+		b.collectDatabaseHealth()
+	}, "DatabaseHealth", 2)
+
+	collectWithRetry(func() {
+		b.collectPerformanceMetrics()
+	}, "PerformanceMetrics", 2)
+
+	collectWithRetry(func() {
+		b.collectHighAvailabilityStatus()
+	}, "HighAvailabilityStatus", 2)
+
+	collectWithRetry(func() {
+		b.collectSecuritySettings()
+	}, "SecuritySettings", 2)
+
+	collectWithRetry(func() {
+		b.collectSystemMetrics()
+	}, "SystemMetrics", 2)
+
+	collectWithRetry(func() {
+		b.collectBackupStatus()
+	}, "BackupStatus", 2)
+
+	// TempDB yapılandırması kontrolü - ayrı bir fonksiyon olarak ekliyoruz
+	collectWithRetry(func() {
+		b.collectTempDBConfiguration()
+	}, "TempDBConfiguration", 2)
+
+	// Analiz tamamlandı, toplam süreyi ekle
+	duration := time.Since(startTime)
+	b.results["analysis_duration_ms"] = duration.Milliseconds()
+	b.results["analyzed_categories"] = len(b.results)
+	b.results["analysis_timestamp"] = time.Now().Format(time.RFC3339)
 
 	return b.results
+}
+
+// collectWithRetry, bir koleksiyon fonksiyonunu belirtilen sayıda tekrar dener
+// Panic durumunda recovery sağlar ve logging yapar
+func collectWithRetry(collectFunc func(), categoryName string, maxRetries int) {
+	// En dışta panic recovery ekliyoruz
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] %s kategorisi panic ile başarısız oldu: %v", categoryName, r)
+		}
+	}()
+
+	// Belirtilen sayıda deneme yap
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// İlk deneme değilse biraz bekle
+		if attempt > 0 {
+			wait := time.Duration(attempt*2+1) * time.Second
+			log.Printf("[INFO] %s kategorisi yeniden deneniyor (%d/%d) - %s bekleniyor...",
+				categoryName, attempt+1, maxRetries, wait)
+			time.Sleep(wait)
+		}
+
+		// Fonksiyonu çağır, panic recovery ile
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[ERROR] %s deneme %d: Panic oluştu: %v",
+						categoryName, attempt+1, r)
+				}
+			}()
+
+			// Fonksiyonu çağır
+			collectFunc()
+		}()
+
+		// Eğer başarılıysa döngüden çık
+		// (Fonksiyon dönebilmişse panic olmamış demektir)
+		break
+	}
 }
 
 // collectSystemConfiguration SQL Server sistem konfigürasyonunu toplar
@@ -874,6 +953,104 @@ func (b *BestPracticesCollector) collectBackupStatus() {
 
 	// Tüm sonuçları kaydet
 	b.results["BackupStatus"] = backupStatus
+}
+
+// collectTempDBConfiguration TempDB yapılandırmasını kontrol eder
+func (b *BestPracticesCollector) collectTempDBConfiguration() {
+	db, err := b.collector.GetClient()
+	if err != nil {
+		log.Printf("TempDB yapılandırması toplanamadı: %v", err)
+		return
+	}
+	defer db.Close()
+
+	tempDBConfig := make(map[string]interface{})
+
+	// TempDB dosya sayısı ve CPU sayısı kontrolü
+	var cpuCount, tempDBFileCount int
+	var totalSizeMB, availableSizeMB float64
+
+	// CPU sayısını al
+	err = db.QueryRow(`SELECT cpu_count FROM sys.dm_os_sys_info`).Scan(&cpuCount)
+	if err != nil {
+		log.Printf("CPU sayısı alınamadı: %v", err)
+		cpuCount = 0
+	}
+
+	// TempDB dosya sayısını ve boyutlarını al
+	rows, err := db.Query(`
+		SELECT 
+			COUNT(*) as file_count,
+			CAST(SUM(size * 8.0 / 1024) AS DECIMAL(18,2)) as total_size_mb,
+			CAST(SUM(CASE WHEN max_size = -1 THEN 0 ELSE max_size * 8.0 / 1024 - size * 8.0 / 1024 END) AS DECIMAL(18,2)) as available_size_mb
+		FROM sys.master_files
+		WHERE database_id = DB_ID('tempdb') AND type_desc = 'ROWS'
+	`)
+
+	if err == nil {
+		defer rows.Close()
+		if rows.Next() {
+			err := rows.Scan(&tempDBFileCount, &totalSizeMB, &availableSizeMB)
+			if err == nil {
+				// CPU sayısı ile TempDB dosya sayısı kontrolü
+				isTempDBOptimal := true
+				var recommendation string
+
+				if cpuCount > 0 && tempDBFileCount < cpuCount && cpuCount <= 8 {
+					isTempDBOptimal = false
+					recommendation = fmt.Sprintf("TempDB dosya sayısı CPU sayısından az. Önerilen: %d dosya", cpuCount)
+				} else if cpuCount > 8 && tempDBFileCount < 8 {
+					isTempDBOptimal = false
+					recommendation = "TempDB dosya sayısı 8'den az. Önerilen: En az 8 dosya"
+				}
+
+				tempDBConfig["file_count"] = tempDBFileCount
+				tempDBConfig["cpu_count"] = cpuCount
+				tempDBConfig["is_optimal"] = isTempDBOptimal
+				if !isTempDBOptimal {
+					tempDBConfig["recommendation"] = recommendation
+				}
+				tempDBConfig["total_size_mb"] = totalSizeMB
+				tempDBConfig["available_size_mb"] = availableSizeMB
+			}
+		}
+	}
+
+	// TempDB fragmantasyonu kontrolü
+	rows, err = db.Query(`
+		SELECT 
+			name,
+			CAST(total_page_count * 8.0 / 1024 AS DECIMAL(18,2)) as size_mb,
+			CAST(CAST(free_space_in_bytes AS DECIMAL(18,2)) / 1048576 AS DECIMAL(18,2)) as free_space_mb,
+			CAST(CAST(free_space_in_bytes AS DECIMAL(18,2)) / (total_page_count * 8192.0) * 100 AS DECIMAL(18,2)) as free_space_percent
+		FROM tempdb.sys.dm_db_file_space_usage
+		JOIN tempdb.sys.database_files ON file_id = dm_db_file_space_usage.file_id
+	`)
+
+	if err == nil {
+		defer rows.Close()
+		var fileDetails []map[string]interface{}
+
+		for rows.Next() {
+			var name string
+			var sizeMB, freeSpaceMB, freeSpacePercent float64
+
+			if err := rows.Scan(&name, &sizeMB, &freeSpaceMB, &freeSpacePercent); err == nil {
+				fileDetails = append(fileDetails, map[string]interface{}{
+					"name":               name,
+					"size_mb":            sizeMB,
+					"free_space_mb":      freeSpaceMB,
+					"free_space_percent": freeSpacePercent,
+				})
+			}
+		}
+
+		if len(fileDetails) > 0 {
+			tempDBConfig["file_details"] = fileDetails
+		}
+	}
+
+	b.results["TempDBConfiguration"] = tempDBConfig
 }
 
 // min iki sayının küçük olanını döndürür

@@ -103,157 +103,102 @@ func NewMSSQLCollector(cfg *config.AgentConfig) *MSSQLCollector {
 	return collector
 }
 
-// GetClient returns a SQL Server connection
+// GetClient veritabanına bağlantı sağlar
 func (c *MSSQLCollector) GetClient() (*sql.DB, error) {
+	// Mutex ile bağlantı havuzuna erişimi kilitle
 	c.sqlConnLock.Lock()
 	defer c.sqlConnLock.Unlock()
 
+	// Loglama için güncel timestamp
+	now := time.Now()
+
 	// Mevcut bağlantıyı kontrol et
 	if c.sqlConn != nil {
-		// Ping yöntemiyle bağlantının açık olduğunu doğrula
-		// Ancak çok sık ping yapmaktan kaçın - 30 saniyede bir maksimum
-		if time.Since(c.lastConnCheck) > 30*time.Second {
-			pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			pingErr := c.sqlConn.PingContext(pingCtx)
-			cancel()
+		// Bağlantının hala açık olduğunu kontrol et
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 
-			c.lastConnCheck = time.Now() // Her zaman son kontrol zamanını güncelle
+		err := c.sqlConn.PingContext(pingCtx)
 
-			if pingErr != nil {
-				logger.Error("!!!!! Existing SQL connection invalid (ping failed): %v !!!!!", pingErr)
-				logger.Error("Bağlantı kapatılıp yeni bağlantı açılacak...")
-				// Bağlantıyı yeniden oluştur
-				c.sqlConn.Close()
-				c.sqlConn = nil
-			} else {
-				logger.Info("SQL connection is valid (ping successful)")
-				return c.sqlConn, nil
-			}
+		if err != nil {
+			logger.Error("!!!!! Existing SQL connection invalid (ping failed): %v !!!!!", err)
+			logger.Error("Bağlantı kapatılıp yeni bağlantı açılacak...")
+
+			// Bağlantıyı kapat ve sıfırla
+			c.sqlConn.Close()
+			c.sqlConn = nil
 		} else {
-			// Son kontrol yeterince yakın zamanda yapıldı, bağlantıyı yeniden kullan
-			logger.Debug("Reusing existing SQL connection (last checked %v ago)", time.Since(c.lastConnCheck))
+			// Mevcut bağlantı geçerli, güncelleme zamanını kaydet
+			c.lastConnCheck = now
+			logger.Debug("Mevcut SQL bağlantısı kullanılıyor (son kontrol: %v)", time.Since(c.lastConnCheck))
 			return c.sqlConn, nil
 		}
 	}
 
-	// Debug: Şu anki connection pool durumunu göster
+	// Bağlantı havuzu durumunu logla
 	logger.Info("SQL Bağlantı havuzu durumu: sqlConn=%v, lastConnCheck=%v",
 		c.sqlConn != nil, c.lastConnCheck)
 
-	// Retry mekanizması ekleyelim
+	// Retry mekanizması - bağlantı kurulamadığında tekrar dene
+	var db *sql.DB
+	var err error
 	maxRetries := 3
 	retryDelay := 1 * time.Second
-	var lastError error
+	connectTimeout := 10 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			logger.Info("SQL Server bağlantısı yeniden deneniyor (%d/%d)...", attempt+1, maxRetries)
+			logger.Warning("SQL Server bağlantısı yeniden deneniyor (%d/%d)... Hata: %v",
+				attempt+1, maxRetries, err)
 			time.Sleep(retryDelay)
-			// Her denemede bekleme süresini arttır
-			retryDelay *= 2
+			retryDelay *= 2 // Her denemede bekleme süresini arttır
 		}
 
-		// Bağlantı yok, yeni bağlantı oluştur
-		var connStr string
+		// Bağlantı bilgilerini oluştur
+		dsn := fmt.Sprintf("server=%s;port=%s;user id=%s;password=%s;database=%s;trustservercertificate=%t;connection timeout=%d",
+			c.cfg.MSSQL.Host, c.cfg.MSSQL.Port, c.cfg.MSSQL.User, c.cfg.MSSQL.Pass,
+			c.cfg.MSSQL.Database, c.cfg.MSSQL.TrustCert, connectTimeout)
 
-		// Connection string components
-		host := c.cfg.MSSQL.Host
-		if host == "" {
-			host = "localhost"
-		}
+		// Bağlantı zamanlamasını ölç
+		startConnectTime := time.Now()
 
-		port := c.cfg.MSSQL.Port
-		if port == "" {
-			port = "1433" // Default SQL Server port
-		}
-
-		instance := c.cfg.MSSQL.Instance
-		database := c.cfg.MSSQL.Database
-		if database == "" {
-			database = "master" // Default database
-		}
-
-		// If Windows authentication is enabled
-		if c.cfg.MSSQL.WindowsAuth {
-			if instance != "" {
-				connStr = fmt.Sprintf("server=%s\\%s;database=%s;trusted_connection=yes", host, instance, database)
-			} else {
-				connStr = fmt.Sprintf("server=%s,%s;database=%s;trusted_connection=yes", host, port, database)
-			}
-		} else {
-			// SQL Server authentication
-			if instance != "" {
-				connStr = fmt.Sprintf("server=%s\\%s;user id=%s;password=%s;database=%s",
-					host, instance, c.cfg.MSSQL.User, c.cfg.MSSQL.Pass, database)
-			} else {
-				connStr = fmt.Sprintf("server=%s,%s;user id=%s;password=%s;database=%s",
-					host, port, c.cfg.MSSQL.User, c.cfg.MSSQL.Pass, database)
-			}
-		}
-
-		// Add TrustServerCertificate if needed
-		if c.cfg.MSSQL.TrustCert {
-			connStr += ";trustservercertificate=true"
-		}
-
-		// Additional connection parameters for fixing socket issues
-		connStr += ";connection timeout=15"
-
-		// Add connection pooling parameters to fix socket exhaustion
-		connStr += ";connection pooling=true;max pool size=30;min pool size=3"
-
-		// Add connection reset parameters to help with socket reuse
-		connStr += ";connection reset=true;application intent=readwrite"
-
-		// Set TCP keepalive to help with stale connections
-		connStr += ";keepalive=60"
-
-		logger.Debug("MSSQL connection string (credentials hidden): %s",
-			regexp.MustCompile(`password=([^;])*`).ReplaceAllString(connStr, "password=****"))
-
-		logger.Debug("Creating SQL Server connection to %s...", host)
-		startTime := time.Now()
-
-		// Bağlantıyı oluştur
-		db, err := sql.Open("sqlserver", connStr)
+		// Veritabanı bağlantısını aç
+		db, err = sql.Open("sqlserver", dsn)
 		if err != nil {
-			// Enhanced logging for connection errors
-			logger.Error("Failed to open SQL connection after %v: %v",
-				time.Since(startTime), err)
-
-			lastError = err
-			continue // Retry
+			logger.Error("SQL Server bağlantısı açılamadı: %v", err)
+			continue
 		}
 
-		// Bağlantı havuzu ayarları
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(5)
-		db.SetConnMaxLifetime(30 * time.Minute) // 30 dakikaya çıkar
-		db.SetConnMaxIdleTime(10 * time.Minute) // 10 dakikaya çıkar
+		// Bağlantı havuzu ayarlarını yap
+		db.SetMaxOpenConns(5)
+		db.SetMaxIdleConns(2)
+		db.SetConnMaxLifetime(30 * time.Minute) // Bağlantı ömrünü arttırdık
+		db.SetConnMaxIdleTime(10 * time.Minute) // Boşta kalma süresini arttırdık
 
-		// Bağlantıyı ping ile test et
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		pingErr := db.PingContext(ctx)
+		// Bağlantıyı test et
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = db.PingContext(pingCtx)
 		cancel()
 
-		if pingErr != nil {
-			db.Close() // Bağlantıyı temizle
-			logger.Error("SQL connection ping test failed: %v", pingErr)
-			lastError = pingErr
-			continue // Retry
+		if err != nil {
+			logger.Error("SQL Server ping başarısız: %v", err)
+			db.Close() // Hatadan sonra bağlantıyı kapat
+			continue
 		}
 
-		// Bağlantı başarılı ise, yapıyı güncelle
-		c.sqlConn = db
-		c.lastConnCheck = time.Now()
+		// Bağlantı başarılı
+		connectDuration := time.Since(startConnectTime)
+		logger.Info("SQL Server connection established in %.4fms", connectDuration.Seconds()*1000)
 
-		// Connection successfully established
-		logger.Info("SQL Server connection established in %v", time.Since(startTime))
+		// Bağlantıyı önbelleğe al
+		c.sqlConn = db
+		c.lastConnCheck = now
 		return db, nil
 	}
 
-	// Tüm denemeler başarısız oldu
-	return nil, fmt.Errorf("failed to connect to SQL Server after %d attempts: %v", maxRetries, lastError)
+	// Tüm denemeler başarısız olduysa, son hatayı döndür
+	return nil, fmt.Errorf("maksimum deneme sayısına ulaşıldı (%d), bağlantı kurulamadı: %v",
+		maxRetries, err)
 }
 
 // GetMSSQLStatus checks if SQL Server service is running by checking if the configured host:port is accessible
