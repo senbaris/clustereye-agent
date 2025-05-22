@@ -3051,7 +3051,7 @@ func initWindowsCheckIntervals() map[string]time.Duration {
 	return map[string]time.Duration{
 		"failover": 2 * time.Minute,  // Her 6 dakikada bir (önceden 3 dk)
 		"blocking": 2 * time.Minute,  // Her 5 dakikada bir (önceden 2 dk)
-		"cpu":      3 * time.Minute,  // Her 3 dakikada bir (önceden 1 dk)
+		"cpu":      1 * time.Minute,  // Her 3 dakikada bir (önceden 1 dk)
 		"slow":     5 * time.Minute,  // Her 10 dakikada bir (önceden 5 dk)
 		"deadlock": 15 * time.Minute, // Her 15 dakikada bir (önceden 10 dk)
 	}

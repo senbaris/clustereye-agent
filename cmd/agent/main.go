@@ -141,7 +141,8 @@ const maxLogSize = 10 * 1024 * 1024 // 10 MB
 
 func initLogging() {
 	if runtime.GOOS != "windows" {
-		// Linux'ta log dosyasına yazma
+		// Linux/Mac için basit dosya log kurulumu
+		setupFileLogging()
 		return
 	}
 
