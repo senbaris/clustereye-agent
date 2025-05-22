@@ -119,13 +119,7 @@ func initLogging() {
 		return
 	}
 
-	// Windows Event Log'unu kullanmayı dene
-	if setupWindowsEventLog() {
-		// Başarılı, Event Log kullanılıyor
-		return
-	}
-
-	// Event Log başarısız olursa dosya log sistemini kullan
+	// Windows'ta dosya log sistemini kullan
 	setupFileLogging()
 }
 
