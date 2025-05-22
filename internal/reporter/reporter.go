@@ -764,30 +764,33 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 
 		// Periyodik raporlamayı başlat - önce bir log yazdıralım
 		logger.Info("Periyodik raporlama başlatılıyor - %s platformu için (agent.AgentRegistration'dan)", platform)
+
+		// Kısa bir gecikmeden sonra başlat (GRPC işlemlerinin tamamlanması için)
+		// Önceki periyodik raporlama durdurulur ve yenisi başlatılır
 		go func() {
-			// Kısa bir gecikmeden sonra başlat (GRPC işlemlerinin tamamlanması için)
-			time.Sleep(3 * time.Second)
-			r.StartPeriodicReporting(30*time.Second, platform)
+			// Raporlama başlamadan önce kısa bir gecikme ekle - API yükünü azaltmak için
+			time.Sleep(5 * time.Second)
+
+			// Platform bazlı varsayılan interval
+			var defaultInterval time.Duration
+			if platform == "postgres" || platform == "mongo" {
+				defaultInterval = 1 * time.Minute // 1 dakika
+			} else if platform == "mssql" {
+				defaultInterval = 2 * time.Minute // 2 dakika
+			} else {
+				defaultInterval = 1 * time.Minute // Varsayılan 1 dakika
+			}
+
+			r.StartPeriodicReporting(defaultInterval, platform)
 			logger.Info("Periyodik raporlama başlatıldı (AgentRegistration içinden)")
 		}()
 
+		// İlk bilgi gönderimi için gecikme ekle - böylece aynı anda çok fazla istek oluşmaz
+		time.Sleep(2 * time.Second)
+
 		// Platform seçimine göre ilk bilgileri gönder
-		if platform == "postgres" {
-			// İlk PostgreSQL bilgilerini gönder
-			if err := r.SendPostgresInfo(); err != nil {
-				log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
-			}
-		} else if platform == "mongo" {
-			// İlk MongoDB bilgilerini gönder
-			if err := r.SendMongoInfo(); err != nil {
-				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
-			}
-		} else if platform == "mssql" {
-			// İlk MSSQL bilgilerini gönder
-			if err := r.SendMSSQLInfo(); err != nil {
-				log.Printf("MSSQL bilgileri gönderilemedi: %v", err)
-			}
-		}
+		// NOT: İlk bilgileri artık periyodik raporlama içinde gönder, burada değil
+		// Bu sayede hem duplike isteği önlemiş oluruz, hem de akış sırasını korumuş oluruz
 
 		// Alarm izleme sistemini başlat
 		agentID := "agent_" + hostname
@@ -2907,8 +2910,8 @@ func (r *Reporter) reconnect() error {
 	}
 
 	// Yeniden bağlantı için bir kaç deneme yapalım
-	maxRetries := 5
-	retryDelay := 2 * time.Second
+	maxRetries := 3               // 5'ten 3'e düşürüldü - daha az deneme yapalım
+	retryDelay := 3 * time.Second // Daha uzun bekleme süresi
 
 	var err error
 	for i := 0; i < maxRetries; i++ {
@@ -2926,7 +2929,7 @@ func (r *Reporter) reconnect() error {
 		if i < maxRetries-1 {
 			time.Sleep(retryDelay)
 			// Her denemede bekleme süresini artır (exponential backoff)
-			retryDelay = time.Duration(float64(retryDelay) * 1.5)
+			retryDelay = time.Duration(float64(retryDelay) * 2.0) // 1.5 yerine 2.0 çarpanı kullan
 		}
 	}
 
@@ -2934,16 +2937,15 @@ func (r *Reporter) reconnect() error {
 		return fmt.Errorf("maksimum yeniden bağlantı denemesi aşıldı: %v", err)
 	}
 
+	// Kısa bir süre bekleyelim - sunucunun hazır olmasını garantilemek için
+	time.Sleep(1 * time.Second)
+
 	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
 	// Mevcut platform bilgisini kullanarak agent kaydını yenile
+	// NOT: İki yeniden kayıt denemesi yerine tek deneme yapalım
 	if err := r.AgentRegistration("reconnected", r.platform); err != nil {
-		log.Printf("Agent yeniden kaydı başarısız: %v. Tekrar deneniyor...", err)
-
-		// Agent kaydı için bir deneme daha yap
-		time.Sleep(2 * time.Second)
-		if err := r.AgentRegistration("reconnected", r.platform); err != nil {
-			return fmt.Errorf("agent yeniden kaydı başarısız: %v", err)
-		}
+		log.Printf("Agent yeniden kaydı başarısız: %v", err)
+		return fmt.Errorf("agent yeniden kaydı başarısız: %v", err)
 	}
 
 	// Alarm monitörünün client'ını güncelle
@@ -3165,10 +3167,16 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 	}
 
 	// Platform'a göre raporlama aralığını ayarla
-	// MSSQL için daha uzun aralık kullan - CPU kullanımını azaltmak için
+	// Tüm platformlar için daha uzun aralık kullan - API yükünü azaltmak için
 	if platform == "mssql" && runtime.GOOS == "windows" {
-		interval = 1 * time.Minute
-		logger.Info("MSSQL platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+		interval = 2 * time.Minute // 1 dakikadan 2 dakikaya çıkarıldı
+		logger.Info("MSSQL platformu için raporlama aralığı 2 dakika olarak ayarlandı")
+	} else if platform == "postgres" {
+		interval = 1 * time.Minute // 30 saniyeden 1 dakikaya çıkarıldı
+		logger.Info("PostgreSQL platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+	} else if platform == "mongo" {
+		interval = 1 * time.Minute // 30 saniyeden 1 dakikaya çıkarıldı
+		logger.Info("MongoDB platformu için raporlama aralığı 1 dakika olarak ayarlandı")
 	}
 
 	// Raporlama başlatıldığını göster
@@ -3178,11 +3186,20 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 	r.reportTicker = time.NewTicker(interval)
 
 	// watchdog timer - periyodik raporlama çalışmazsa zorla tekrar başlat
-	watchdogTicker := time.NewTicker(2 * time.Minute)
+	// Watchdog aralığını normal interval'in 3 katı olarak ayarla
+	watchdogInterval := 3 * interval
+	watchdogTicker := time.NewTicker(watchdogInterval)
+	logger.Info("Watchdog timer aralığı %v olarak ayarlandı", watchdogInterval)
 
 	// Başlangıç değerleri
 	lastReportTime := time.Time{} // sıfır zaman = hiç rapor edilmedi
 	reportCount := 0
+
+	// Son yeniden bağlantı zamanını izle
+	lastReconnectTime := time.Time{}
+
+	// Minimum rapor etme aralığı - ardışık raporlar arasında en az bu kadar zaman olmalı
+	minReportInterval := interval / 2
 
 	// Heartbeat ticker - periyodik raporlamanın çalıştığını görmek için log
 	heartbeatTicker := time.NewTicker(30 * time.Second)
@@ -3214,9 +3231,9 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		logger.Info("İlk veri toplama ve raporlama başlatılıyor (platform: %s)...", platform)
 		var firstErr error
 
-		// 3 kez deneme yap, başarısız olursa devam et
-		maxRetries := 3
-		retryDelay := 3 * time.Second
+		// 2 kez deneme yap (3 yerine), başarısız olursa devam et
+		maxRetries := 2
+		retryDelay := 5 * time.Second // Daha uzun bekleme süresi
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			if attempt > 0 {
@@ -3254,6 +3271,14 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		for {
 			select {
 			case <-r.reportTicker.C:
+				// Son raporlamadan bu yana minimum süre geçmiş mi kontrol et
+				timeSinceLastReport := time.Since(lastReportTime)
+				if !lastReportTime.IsZero() && timeSinceLastReport < minReportInterval {
+					logger.Warning("Son raporlamadan bu yana çok kısa süre geçti (%v < %v), raporlama atlanıyor",
+						timeSinceLastReport, minReportInterval)
+					continue
+				}
+
 				logger.Info("Periyodik raporlama başlatılıyor (platform: %s)...", platform)
 				var err error
 
@@ -3274,11 +3299,18 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 						strings.Contains(err.Error(), "connection") ||
 						strings.Contains(err.Error(), "unavailable") {
 
-						logger.Warning("Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
-						if reconnErr := r.reconnect(); reconnErr != nil {
-							logger.Error("Yeniden bağlantı başarısız: %v", reconnErr)
+						// Son reconnect'ten belli bir süre geçtiyse yeniden bağlan
+						if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > 30*time.Second {
+							logger.Warning("Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
+
+							if reconnErr := r.reconnect(); reconnErr != nil {
+								logger.Error("Yeniden bağlantı başarısız: %v", reconnErr)
+							} else {
+								logger.Info("Yeniden bağlantı başarılı")
+								lastReconnectTime = time.Now()
+							}
 						} else {
-							logger.Info("Yeniden bağlantı başarılı")
+							logger.Warning("Son yeniden bağlantıdan bu yana çok kısa süre geçti, yeniden bağlantı atlanıyor")
 						}
 					}
 				} else {
@@ -3303,6 +3335,12 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 			case <-watchdogTicker.C:
 				// Son raporlama üzerinden çok zaman geçtiyse, zorla yeni bir raporlama başlat
 				if !lastReportTime.IsZero() && time.Since(lastReportTime) > 2*interval {
+					// Son raporlamadan bu yana minimum süre geçmiş mi kontrol et
+					if time.Since(lastReportTime) < minReportInterval {
+						logger.Warning("Watchdog: Son raporlamadan bu yana çok kısa süre geçti, zorla raporlama atlanıyor")
+						continue
+					}
+
 					logger.Warning("Watchdog: Son başarılı raporlamadan bu yana çok uzun süre geçti (%v), zorla yeni raporlama başlatılıyor...",
 						time.Since(lastReportTime))
 
@@ -3321,6 +3359,24 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 						reportCount++
 					} else {
 						logger.Warning("Watchdog tarafından başlatılan raporlama başarısız: %v", err)
+
+						// Watchdog başarısız olursa ve bağlantı sorunu varsa yeniden bağlan
+						if strings.Contains(err.Error(), "transport") ||
+							strings.Contains(err.Error(), "connection") ||
+							strings.Contains(err.Error(), "unavailable") {
+
+							// Son reconnect'ten belli bir süre geçtiyse yeniden bağlan
+							if lastReconnectTime.IsZero() || time.Since(lastReconnectTime) > 30*time.Second {
+								logger.Warning("Watchdog: Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
+
+								if reconnErr := r.reconnect(); reconnErr != nil {
+									logger.Error("Watchdog: Yeniden bağlantı başarısız: %v", reconnErr)
+								} else {
+									logger.Info("Watchdog: Yeniden bağlantı başarılı")
+									lastReconnectTime = time.Now()
+								}
+							}
+						}
 					}
 				}
 

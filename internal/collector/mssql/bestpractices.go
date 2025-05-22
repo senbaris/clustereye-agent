@@ -579,7 +579,9 @@ func (b *BestPracticesCollector) collectHighAvailabilityStatus() {
 		defer rows.Close()
 		var agInfo []map[string]interface{}
 		for rows.Next() {
-			var agName, replicaServer, roleDesc, operationalState, connectedState, agSyncHealth string
+			var agName, replicaServer sql.NullString
+			var roleDesc, operationalState, connectedState sql.NullString
+			var agSyncHealth sql.NullString
 			var dbName, syncState, dbSyncHealth sql.NullString
 			var logSendQueueSize, logSendRate, redoQueueSize, redoRate, secondsBehind float64
 
@@ -587,6 +589,37 @@ func (b *BestPracticesCollector) collectHighAvailabilityStatus() {
 				&agName, &replicaServer, &roleDesc, &operationalState, &connectedState, &agSyncHealth,
 				&dbName, &syncState, &dbSyncHealth, &logSendQueueSize, &logSendRate,
 				&redoQueueSize, &redoRate, &secondsBehind); err == nil {
+
+				// NULL değerleri güvenli şekilde işle
+				agNameStr := ""
+				if agName.Valid {
+					agNameStr = agName.String
+				}
+
+				replicaServerStr := ""
+				if replicaServer.Valid {
+					replicaServerStr = replicaServer.String
+				}
+
+				roleDescStr := ""
+				if roleDesc.Valid {
+					roleDescStr = roleDesc.String
+				}
+
+				operationalStateStr := ""
+				if operationalState.Valid {
+					operationalStateStr = operationalState.String
+				}
+
+				connectedStateStr := ""
+				if connectedState.Valid {
+					connectedStateStr = connectedState.String
+				}
+
+				agSyncHealthStr := ""
+				if agSyncHealth.Valid {
+					agSyncHealthStr = agSyncHealth.String
+				}
 
 				dbNameStr := ""
 				if dbName.Valid {
@@ -604,12 +637,12 @@ func (b *BestPracticesCollector) collectHighAvailabilityStatus() {
 				}
 
 				agInfo = append(agInfo, map[string]interface{}{
-					"ag_name":                agName,
-					"replica_server":         replicaServer,
-					"role":                   roleDesc,
-					"operational_state":      operationalState,
-					"connected_state":        connectedState,
-					"ag_sync_health":         agSyncHealth,
+					"ag_name":                agNameStr,
+					"replica_server":         replicaServerStr,
+					"role":                   roleDescStr,
+					"operational_state":      operationalStateStr,
+					"connected_state":        connectedStateStr,
+					"ag_sync_health":         agSyncHealthStr,
 					"database_name":          dbNameStr,
 					"sync_state":             syncStateStr,
 					"db_sync_health":         dbSyncHealthStr,
@@ -619,6 +652,8 @@ func (b *BestPracticesCollector) collectHighAvailabilityStatus() {
 					"redo_rate_kb_sec":       redoRate,
 					"seconds_behind":         secondsBehind,
 				})
+			} else {
+				log.Printf("[ERROR] MSSQL AlwaysOn satırı okunamadı: %v", err)
 			}
 		}
 		haStatus["availability_groups"] = agInfo

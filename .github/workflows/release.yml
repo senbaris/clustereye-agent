@@ -15,10 +15,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v4
         with:
           go-version: '1.21'
           
@@ -43,9 +43,12 @@ jobs:
           cp cmd/agent/agent.yml.example build/
           
       - name: Create Release
-        uses: ncipollo/release-action@v1
+        uses: softprops/action-gh-release@v1
         with:
-          artifacts: "build/clustereye-agent-linux-amd64,build/clustereye-agent-linux-arm64,build/agent.yml.example"
+          files: |
+            build/clustereye-agent-linux-amd64
+            build/clustereye-agent-linux-arm64
+            build/agent.yml.example
           token: ${{ secrets.GITHUB_TOKEN }}
           name: Release ${{ env.VERSION }}
           draft: false
