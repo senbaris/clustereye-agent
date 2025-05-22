@@ -18,6 +18,7 @@ import (
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
+	"github.com/senbaris/clustereye-agent/internal/collector/utils"
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/logger" // New logger package
 	"go.mongodb.org/mongo-driver/bson"
@@ -158,11 +159,27 @@ func (m *AlarmMonitor) Stop() {
 
 // SetCheckInterval alarm kontrol aralığını değiştirir
 func (m *AlarmMonitor) SetCheckInterval(interval time.Duration) {
+	// Minimum kontrol aralığı sınırlaması ekle
+	if m.platform == "mssql" && runtime.GOOS == "windows" {
+		// MSSQL için minimum 30 saniye kontrol aralığı (Windows'ta yüksek CPU kullanımını önlemek için)
+		if interval < 30*time.Second {
+			interval = 30 * time.Second
+			logger.Info("MSSQL Windows optimizasyonu: Kontrol aralığı minimum %v olarak ayarlandı", interval)
+		}
+	}
+
 	m.checkInterval = interval
 }
 
 // monitorLoop periyodik olarak sistemdeki alarm durumlarını kontrol eder
 func (m *AlarmMonitor) monitorLoop() {
+	// Platform bazlı kontrol aralığı ayarla
+	if m.platform == "mssql" && runtime.GOOS == "windows" {
+		// Windows + MSSQL için daha uzun kontrol aralığı (60 saniye -> 120 saniye)
+		m.checkInterval = 120 * time.Second
+		logger.Info("MSSQL Windows platform için optimizasyon: Kontrol aralığı %v olarak ayarlandı", m.checkInterval)
+	}
+
 	ticker := time.NewTicker(m.checkInterval)
 	thresholdUpdateTicker := time.NewTicker(5 * time.Minute) // Her 5 dakikada bir threshold değerlerini güncelle
 	defer ticker.Stop()
@@ -203,16 +220,63 @@ func (m *AlarmMonitor) checkAlarms() {
 		// Disk kullanımını kontrol et
 		m.checkDiskUsage()
 	} else if m.platform == "mssql" {
-		// MSSQL kontrolleri
-		m.checkDiskUsage()
-		m.checkMSSQLServiceStatus() // Servis durumu kontrolünü ekledik
-		m.checkMSSQLFailover()      // Failover kontrolünü ekledik
-		m.checkMSSQLBlockingQueries()
-		m.checkMSSQLCPUUsage()
-		m.checkMSSQLSlowQueries()
-		m.checkMSSQLDeadlocks()
+		// MSSQL için statik check aralıklarını ilk kez başlat
+		if windowsOptimizeCalls == nil {
+			windowsOptimizeCalls = make(map[string]time.Time)
 
-		logger.Debug("MSSQL alarm kontrolleri yapılıyor...")
+			// İlk çalıştırmada bazı kontrolleri farklı zamanlarda planlayarak yük dengelemesi yap
+			// Her kontrol türü farklı bir başlangıç zamanından başlayacak
+			now := time.Now()
+			windowsOptimizeCalls["failover"] = now.Add(-4 * time.Minute)
+			windowsOptimizeCalls["blocking"] = now.Add(-3 * time.Minute)
+			windowsOptimizeCalls["cpu"] = now.Add(-2 * time.Minute)
+			windowsOptimizeCalls["slow"] = now.Add(-8 * time.Minute)
+			windowsOptimizeCalls["deadlock"] = now.Add(-13 * time.Minute)
+		}
+
+		// Optimize edilmiş aralıkları al
+		checkIntervals := initWindowsCheckIntervals()
+
+		// Ortak kontroller - her zaman çalışacak kontroller - disk kullanımı her seferinde kontrol edilebilir
+		m.checkDiskUsage()
+
+		// Servis durumunu az sayıda çağrı ile (her 3 dakikada bir) kontrol et
+		if shouldRunCheck("service", 3*time.Minute) {
+			m.checkMSSQLServiceStatus()
+			windowsOptimizeCalls["service"] = time.Now()
+		}
+
+		// Failover kontrolü - ayarlanan aralıkta bir
+		if shouldRunCheck("failover", checkIntervals["failover"]) {
+			m.checkMSSQLFailover()
+			windowsOptimizeCalls["failover"] = time.Now()
+		}
+
+		// Blocking sorguları - ayarlanan aralıkta bir
+		if shouldRunCheck("blocking", checkIntervals["blocking"]) {
+			m.checkMSSQLBlockingQueries()
+			windowsOptimizeCalls["blocking"] = time.Now()
+		}
+
+		// CPU kullanımı - ayarlanan aralıkta bir
+		if shouldRunCheck("cpu", checkIntervals["cpu"]) {
+			m.checkMSSQLCPUUsage()
+			windowsOptimizeCalls["cpu"] = time.Now()
+		}
+
+		// Yavaş sorgular - ayarlanan aralıkta bir
+		if shouldRunCheck("slow", checkIntervals["slow"]) {
+			m.checkMSSQLSlowQueries()
+			windowsOptimizeCalls["slow"] = time.Now()
+		}
+
+		// Deadlock kontrolü - ayarlanan aralıkta bir
+		if shouldRunCheck("deadlock", checkIntervals["deadlock"]) {
+			m.checkMSSQLDeadlocks()
+			windowsOptimizeCalls["deadlock"] = time.Now()
+		}
+
+		logger.Debug("MSSQL optimizasyon: Kontroller sıralı olarak çalıştırıldı")
 	} else {
 		logger.Warning("Bilinmeyen platform: %s", m.platform)
 	}
@@ -963,65 +1027,122 @@ func (m *AlarmMonitor) checkDiskUsage() {
 	var maxUsageFS string
 
 	if runtime.GOOS == "windows" {
-		// Windows için PowerShell kullan
-		cmd := exec.Command("powershell", "-Command",
-			"Get-Volume | Where-Object {$_.DriveLetter} | Select-Object DriveLetter, @{Name='UsedPercent';Expression={100 - (100 * $_.SizeRemaining / $_.Size)}}, @{Name='Size';Expression={$_.Size}}, @{Name='FreeSpace';Expression={$_.SizeRemaining}} | ConvertTo-Json")
-		output, err := cmd.Output()
-		if err != nil {
-			logger.Error("Windows disk kullanımı alınamadı: %v", err)
-			return
-		}
+		// First try using the optimized Windows performance metrics
+		metrics, err := utils.CollectWindowsMetrics()
+		if err == nil && metrics != nil && metrics.DiskTotal > 0 {
+			// We have metrics from the optimized method
+			diskUsage := metrics.DiskUsage
+			diskTotal := metrics.DiskTotal
+			diskFree := metrics.DiskFree
 
-		// JSON çıktısını parse et
-		var volumes []map[string]interface{}
-		err = json.Unmarshal(output, &volumes)
-		if err != nil {
-			// Tek bir volume için farklı format
-			var singleVolume map[string]interface{}
-			if err := json.Unmarshal(output, &singleVolume); err != nil {
-				logger.Error("Windows disk kullanım bilgisi parse edilemedi: %v", err)
-				return
-			}
-			volumes = []map[string]interface{}{singleVolume}
-		}
+			// Check if the usage is above threshold
+			if diskUsage >= m.thresholds.DiskThreshold {
+				// Format disk space in human-readable format
+				totalStr := formatBytes(float64(diskTotal))
+				freeStr := formatBytes(float64(diskFree))
 
-		for _, volume := range volumes {
-			driveLetter, ok := volume["DriveLetter"].(string)
-			if !ok || driveLetter == "" {
-				continue
-			}
-
-			usedPercent, ok := volume["UsedPercent"].(float64)
-			if !ok {
-				continue
-			}
-
-			// Size ve FreeSpace'i formatla
-			var sizeBytes, freeBytes float64
-			size, ok := volume["Size"].(float64)
-			if ok {
-				sizeBytes = size
-			}
-
-			freeSpace, ok := volume["FreeSpace"].(float64)
-			if ok {
-				freeBytes = freeSpace
-			}
-
-			// Threshold'u aşan sürücüleri kaydet
-			if usedPercent >= m.thresholds.DiskThreshold {
-				// İnsan tarafından okunabilir formata çevir
-				sizeStr := formatBytes(sizeBytes)
-				freeStr := formatBytes(freeBytes)
-
-				fsInfo := fmt.Sprintf("Drive %s: %.2f%% used (Size: %s, Free: %s)",
-					driveLetter, usedPercent, sizeStr, freeStr)
+				// Build filesystem info string
+				fsInfo := fmt.Sprintf("System Drive: %.2f%% used (Size: %s, Free: %s)",
+					diskUsage, totalStr, freeStr)
 				highUsageFilesystems = append(highUsageFilesystems, fsInfo)
 
-				// En yüksek kullanımı takip et
-				if usedPercent > maxUsage {
-					maxUsage = usedPercent
-					maxUsageFS = fmt.Sprintf("Drive %s", driveLetter)
+				// Update max usage
+				maxUsage = diskUsage
+				maxUsageFS = "System Drive"
+			}
+
+			logger.Debug("Disk space checked using optimized Windows metrics: %.2f%% used", diskUsage)
+		} else {
+			// Try the efficient method directly
+			total, free, err := utils.GetDiskInfoEfficient()
+			if err == nil && total > 0 {
+				// Calculate percentage used
+				used := total - free
+				diskUsage := float64(used) / float64(total) * 100.0
+
+				// Check if the usage is above threshold
+				if diskUsage >= m.thresholds.DiskThreshold {
+					// Format disk space in human-readable format
+					totalStr := formatBytes(float64(total))
+					freeStr := formatBytes(float64(free))
+
+					// Build filesystem info string
+					fsInfo := fmt.Sprintf("System Drive: %.2f%% used (Size: %s, Free: %s)",
+						diskUsage, totalStr, freeStr)
+					highUsageFilesystems = append(highUsageFilesystems, fsInfo)
+
+					// Update max usage
+					maxUsage = diskUsage
+					maxUsageFS = "System Drive"
+				}
+
+				logger.Debug("Disk space checked using efficient method: %.2f%% used", diskUsage)
+			} else {
+				// Fallback to original method if both optimized methods fail
+				logger.Warning("Optimized disk check methods failed, falling back to legacy method: %v", err)
+
+				// Original Windows PowerShell-based code
+				outputStr, err := utils.GetDiskInfo(15) // 15 saniye timeout
+				if err != nil {
+					logger.Error("Windows disk kullanımı alınamadı: %v", err)
+					return
+				}
+
+				// String çıktıyı byte array'e dönüştür
+				output := []byte(outputStr)
+
+				// JSON çıktısını parse et
+				var volumes []map[string]interface{}
+				err = json.Unmarshal(output, &volumes)
+				if err != nil {
+					// Tek bir volume için farklı format
+					var singleVolume map[string]interface{}
+					if err := json.Unmarshal(output, &singleVolume); err != nil {
+						logger.Error("Windows disk kullanım bilgisi parse edilemedi: %v", err)
+						return
+					}
+					volumes = []map[string]interface{}{singleVolume}
+				}
+
+				for _, volume := range volumes {
+					driveLetter, ok := volume["DriveLetter"].(string)
+					if !ok || driveLetter == "" {
+						continue
+					}
+
+					usedPercent, ok := volume["UsedPercent"].(float64)
+					if !ok {
+						continue
+					}
+
+					// Size ve FreeSpace'i formatla
+					var sizeBytes, freeBytes float64
+					size, ok := volume["Size"].(float64)
+					if ok {
+						sizeBytes = size
+					}
+
+					freeSpace, ok := volume["FreeSpace"].(float64)
+					if ok {
+						freeBytes = freeSpace
+					}
+
+					// Threshold'u aşan sürücüleri kaydet
+					if usedPercent >= m.thresholds.DiskThreshold {
+						// İnsan tarafından okunabilir formata çevir
+						sizeStr := formatBytes(sizeBytes)
+						freeStr := formatBytes(freeBytes)
+
+						fsInfo := fmt.Sprintf("Drive %s: %.2f%% used (Size: %s, Free: %s)",
+							driveLetter, usedPercent, sizeStr, freeStr)
+						highUsageFilesystems = append(highUsageFilesystems, fsInfo)
+
+						// En yüksek kullanımı takip et
+						if usedPercent > maxUsage {
+							maxUsage = usedPercent
+							maxUsageFS = fmt.Sprintf("Drive %s", driveLetter)
+						}
+					}
 				}
 			}
 		}
@@ -1288,6 +1409,36 @@ func (m *AlarmMonitor) UpdateClient(client pb.AgentServiceClient) {
 
 // getCPUUsage sistem CPU kullanımını yüzde olarak döndürür
 func getCPUUsage() (float64, error) {
+	// First try using the optimized Windows performance metrics on Windows
+	if runtime.GOOS == "windows" {
+		// Try the optimized metrics collection method
+		metrics, err := utils.CollectWindowsMetrics()
+		if err == nil && metrics != nil {
+			logger.Debug("CPU usage obtained from optimized Windows metrics: %.2f%%", metrics.CPUUsage)
+			return metrics.CPUUsage, nil
+		}
+		logger.Warning("Failed to get CPU usage from optimized metrics: %v, trying alternative methods", err)
+
+		// Try the efficient method directly
+		cpuUsage, err := utils.GetCPUUsageEfficient()
+		if err == nil {
+			logger.Debug("CPU usage obtained from efficient method: %.2f%%", cpuUsage)
+			return cpuUsage, nil
+		}
+		logger.Warning("Failed to get CPU usage from efficient method: %v, falling back to legacy method", err)
+
+		// Fallback to traditional PowerShell
+		output, err := utils.GetCPUUsage(15) // 15 second timeout
+		if err == nil {
+			cpuUsage, err := strconv.ParseFloat(strings.TrimSpace(output), 64)
+			if err == nil {
+				logger.Debug("CPU usage obtained from legacy method: %.2f%%", cpuUsage)
+				return cpuUsage, nil
+			}
+		}
+		return 0, fmt.Errorf("all CPU usage collection methods failed on Windows")
+	}
+
 	// Linux için /proc/stat kullan
 	if _, err := os.Stat("/proc/stat"); err == nil {
 		// Linux sistemi
@@ -1748,8 +1899,8 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	// 1. Yöntem: sys.dm_os_ring_buffers (En doğru metot, tüm SQL Server versiyonlarında çalışır)
 	resourceQuery := `SELECT TOP 1
 		CAST(record.value('(./Record/@id)[1]', 'int') AS int) AS record_id,
-		CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS int) AS cpu_utilization,
-		CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS int) AS system_idle,
+		CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'bigint') AS bigint) AS cpu_utilization,
+		CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'bigint') AS bigint) AS system_idle,
 		DATEADD(ms, -1 * (SELECT ms_ticks FROM sys.dm_os_sys_info), 
 				GETDATE()) AS event_time
 	FROM (
@@ -1781,7 +1932,7 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 			100 - SystemIdle AS SqlCpuUtilization
 		FROM (
 			SELECT 
-				record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS SystemIdle
+				record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'bigint') AS SystemIdle
 			FROM (
 				SELECT TOP(1) CONVERT(xml, record) AS record 
 				FROM sys.dm_os_ring_buffers 
@@ -1831,6 +1982,62 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 			logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Active queries)", cpuUsage)
 		} else {
 			logger.Warning("Aktif sorgular ile MSSQL CPU kullanımı alınamadı: %v", err)
+
+			// 3.1 Yöntem: Alternatif performans sayacı sorgusu dene
+			altPerfQuery := `
+			SELECT 
+				cntr_value AS CpuUsage
+			FROM sys.dm_os_performance_counters
+			WHERE counter_name = 'SQL Server CPU utilization'`
+
+			var cpuUtil sql.NullFloat64
+			err = db.QueryRow(altPerfQuery).Scan(&cpuUtil)
+
+			if err == nil && cpuUtil.Valid {
+				cpuUsage = cpuUtil.Float64
+				cpuUsageObtained = true
+				logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Performance counter)", cpuUsage)
+			} else {
+				logger.Warning("Alternatif performans sayacı ile CPU kullanımı alınamadı: %v", err)
+
+				// 3.2 Yöntem: DMV kullanarak CPU kullanımını hesapla
+				dmvQuery := `
+				SELECT 
+					(SELECT cpu_count FROM sys.dm_os_sys_info),
+					(SELECT AVG(cpu_percent) FROM sys.dm_db_resource_stats)`
+
+				var cpuCount int
+				var cpuPercent sql.NullFloat64
+				err = db.QueryRow(dmvQuery).Scan(&cpuCount, &cpuPercent)
+
+				if err == nil && cpuPercent.Valid {
+					cpuUsage = cpuPercent.Float64
+					cpuUsageObtained = true
+					logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Resource stats)", cpuUsage)
+				} else {
+					logger.Warning("DMV ile CPU kullanımı alınamadı: %v", err)
+
+					// 3.3 Yöntem: En basit yöntem - sys.sysprocesses tablosundan
+					simpleQuery := `
+					SELECT 
+						100.0 * (
+							SELECT cpu_busy FROM sys.sysprocesses WHERE spid = 1
+						) / (
+							SELECT cpu_busy + idle FROM sys.sysprocesses WHERE spid = 1
+						) AS cpu_usage`
+
+					var simpleCpu sql.NullFloat64
+					err = db.QueryRow(simpleQuery).Scan(&simpleCpu)
+
+					if err == nil && simpleCpu.Valid {
+						cpuUsage = simpleCpu.Float64
+						cpuUsageObtained = true
+						logger.Info("[DEBUG] MSSQL sunucusu CPU kullanımı: %.2f%% (Simple method)", cpuUsage)
+					} else {
+						logger.Warning("En basit yöntem ile CPU kullanımı alınamadı: %v", err)
+					}
+				}
+			}
 		}
 	}
 
@@ -2824,5 +3031,28 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 		}
 	} else {
 		logger.Info("Son 1 saat içinde deadlock bulunmadı")
+	}
+}
+
+// MSSQL Windows kontrol çağrılarını optimize etmek için durum takibi
+var windowsOptimizeCalls map[string]time.Time
+
+// shouldRunCheck belirli bir kontrolün çalıştırılıp çalıştırılmayacağını belirlemeye yardımcı olur
+func shouldRunCheck(checkName string, minInterval time.Duration) bool {
+	lastRun, exists := windowsOptimizeCalls[checkName]
+	if !exists || time.Since(lastRun) >= minInterval {
+		return true
+	}
+	return false
+}
+
+// Kontrol aralıklarını optimize eden ek yardımcı fonksiyon
+func initWindowsCheckIntervals() map[string]time.Duration {
+	return map[string]time.Duration{
+		"failover": 2 * time.Minute,  // Her 6 dakikada bir (önceden 3 dk)
+		"blocking": 2 * time.Minute,  // Her 5 dakikada bir (önceden 2 dk)
+		"cpu":      3 * time.Minute,  // Her 3 dakikada bir (önceden 1 dk)
+		"slow":     5 * time.Minute,  // Her 10 dakikada bir (önceden 5 dk)
+		"deadlock": 15 * time.Minute, // Her 15 dakikada bir (önceden 10 dk)
 	}
 }

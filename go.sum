@@ -48,6 +48,12 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/sefaphlvn/clustereye-test v1.0.27 h1:5yPfPS42fgQgvPTUl4qcnbRlRUEK5RSAz8bEH1r9ImA=
 github.com/sefaphlvn/clustereye-test v1.0.27/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.32-0.20250520191554-7c0aa95cd837 h1:83nCaymxcleN94MKJxMVsWY7lg5BCKOqSel4e0fCbyg=
+github.com/sefaphlvn/clustereye-test v1.0.32-0.20250520191554-7c0aa95cd837/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.32-0.20250520192208-0eb8a55347a4 h1:mRZflGtTCgyh1LLRHxAQBlVB5J54pOAOVNF6QUAaxbc=
+github.com/sefaphlvn/clustereye-test v1.0.32-0.20250520192208-0eb8a55347a4/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
+github.com/sefaphlvn/clustereye-test v1.0.38 h1:O3dXxXE0wM7KzzQiT+wBhEVvys8/2IGLIUW8uerF1as=
+github.com/sefaphlvn/clustereye-test v1.0.38/go.mod h1:UjoAlO4qkWZ20LSP7b28L24Pgp9J2wklAeVtZdCfC6A=
 github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsTg=
 github.com/stretchr/testify v1.9.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=

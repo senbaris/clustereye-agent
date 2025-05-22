@@ -28,6 +28,7 @@ func (b *BestPracticesCollector) CollectAll() map[string]interface{} {
 	b.collectHighAvailabilityStatus()
 	b.collectSecuritySettings()
 	b.collectSystemMetrics()
+	b.collectBackupStatus()
 
 	return b.results
 }
@@ -714,6 +715,165 @@ func (b *BestPracticesCollector) collectSystemMetrics() {
 	}
 
 	b.results["SystemMetrics"] = systemMetrics
+}
+
+// collectBackupStatus yedekleme durumunu kontrol eder ve raporlar
+func (b *BestPracticesCollector) collectBackupStatus() {
+	db, err := b.collector.GetClient()
+	if err != nil {
+		log.Printf("Yedekleme durumu toplanamadı: %v", err)
+		return
+	}
+	defer db.Close()
+
+	backupStatus := make(map[string]interface{})
+
+	// Veritabanı yedekleme durumlarını sorgula
+	rows, err := db.Query(`
+		SELECT 
+			d.name AS database_name,
+			ISNULL(MAX(CASE WHEN b.type = 'D' THEN b.backup_finish_date END), '1900-01-01') as last_full_backup,
+			ISNULL(MAX(CASE WHEN b.type = 'I' THEN b.backup_finish_date END), '1900-01-01') as last_diff_backup,
+			ISNULL(MAX(CASE WHEN b.type = 'L' THEN b.backup_finish_date END), '1900-01-01') as last_log_backup,
+			d.recovery_model_desc
+		FROM 
+			sys.databases d
+		LEFT JOIN msdb.dbo.backupset b 
+			ON d.name = b.database_name
+		WHERE
+			d.database_id > 4 -- Sistem veritabanlarını hariç tut
+			AND d.state_desc = 'ONLINE' -- Sadece online veritabanları
+			AND d.name NOT IN ('tempdb') -- tempdb hariç tut
+		GROUP BY 
+			d.name, d.recovery_model_desc
+		ORDER BY 
+			d.name
+	`)
+
+	if err != nil {
+		log.Printf("Yedekleme sorgusu çalıştırılamadı: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	// Her veritabanı için yedekleme bilgilerini topla
+	for rows.Next() {
+		var (
+			dbName         string
+			lastFullBackup time.Time
+			lastDiffBackup time.Time
+			lastLogBackup  time.Time
+			recoveryModel  string
+		)
+
+		if err := rows.Scan(&dbName, &lastFullBackup, &lastDiffBackup, &lastLogBackup, &recoveryModel); err != nil {
+			log.Printf("Veritabanı yedekleme bilgisi okunamadı: %v", err)
+			continue
+		}
+
+		// En son alınan yedeklemeyi belirle
+		var lastBackupDate time.Time
+		var backupType string
+
+		if lastFullBackup.After(time.Date(1900, 1, 2, 0, 0, 0, 0, time.UTC)) {
+			lastBackupDate = lastFullBackup
+			backupType = "Full"
+		}
+
+		if lastDiffBackup.After(lastBackupDate) {
+			lastBackupDate = lastDiffBackup
+			backupType = "Differential"
+		}
+
+		if lastLogBackup.After(lastBackupDate) && recoveryModel == "FULL" {
+			lastBackupDate = lastLogBackup
+			backupType = "Log"
+		}
+
+		dbBackupInfo := make(map[string]interface{})
+
+		// Eğer hiç yedek yoksa
+		if lastBackupDate.Before(time.Date(1900, 1, 2, 0, 0, 0, 0, time.UTC)) {
+			dbBackupInfo["last_backup_date"] = ""
+			dbBackupInfo["backup_type"] = "None"
+			dbBackupInfo["days_since_last_backup"] = -1
+			dbBackupInfo["has_backup"] = false
+		} else {
+			// RFC3339 formatında tarih - reporter.go bu formatı bekliyor
+			dbBackupInfo["last_backup_date"] = lastBackupDate.Format(time.RFC3339)
+			dbBackupInfo["backup_type"] = backupType
+			dbBackupInfo["days_since_last_backup"] = int(time.Since(lastBackupDate).Hours() / 24)
+			dbBackupInfo["has_backup"] = true
+		}
+
+		// Recovery model'i de ekle
+		dbBackupInfo["recovery_model"] = recoveryModel
+
+		// Full/Diff/Log yedekleme tarihlerini de ayrı ayrı ekle
+		if lastFullBackup.After(time.Date(1900, 1, 2, 0, 0, 0, 0, time.UTC)) {
+			dbBackupInfo["last_full_backup"] = lastFullBackup.Format(time.RFC3339)
+			dbBackupInfo["days_since_full_backup"] = int(time.Since(lastFullBackup).Hours() / 24)
+		} else {
+			dbBackupInfo["last_full_backup"] = ""
+			dbBackupInfo["days_since_full_backup"] = -1
+		}
+
+		if lastDiffBackup.After(time.Date(1900, 1, 2, 0, 0, 0, 0, time.UTC)) {
+			dbBackupInfo["last_diff_backup"] = lastDiffBackup.Format(time.RFC3339)
+			dbBackupInfo["days_since_diff_backup"] = int(time.Since(lastDiffBackup).Hours() / 24)
+		} else {
+			dbBackupInfo["last_diff_backup"] = ""
+			dbBackupInfo["days_since_diff_backup"] = -1
+		}
+
+		if lastLogBackup.After(time.Date(1900, 1, 2, 0, 0, 0, 0, time.UTC)) {
+			dbBackupInfo["last_log_backup"] = lastLogBackup.Format(time.RFC3339)
+			dbBackupInfo["days_since_log_backup"] = int(time.Since(lastLogBackup).Hours() / 24)
+		} else {
+			dbBackupInfo["last_log_backup"] = ""
+			dbBackupInfo["days_since_log_backup"] = -1
+		}
+
+		// Bu veritabanının yedekleme bilgilerini map'e ekle
+		backupStatus[dbName] = dbBackupInfo
+	}
+
+	// Toplam yedekleme durumunu hesapla
+	var totalDbs, dbsWithBackup, dbsWithRecentBackup int
+	var oldestBackupDays int = -1
+
+	for _, backupInfo := range backupStatus {
+		totalDbs++
+		if dbInfo, ok := backupInfo.(map[string]interface{}); ok {
+			if hasBackup, ok := dbInfo["has_backup"].(bool); ok && hasBackup {
+				dbsWithBackup++
+
+				// Son 7 gün içinde yedek alındı mı kontrol et
+				if days, ok := dbInfo["days_since_last_backup"].(int); ok {
+					if days >= 0 && days <= 7 {
+						dbsWithRecentBackup++
+					}
+
+					// En eski yedeği bul
+					if oldestBackupDays == -1 || days > oldestBackupDays {
+						oldestBackupDays = days
+					}
+				}
+			}
+		}
+	}
+
+	// Özet bilgi
+	backupStatus["summary"] = map[string]interface{}{
+		"total_databases":              totalDbs,
+		"databases_with_backup":        dbsWithBackup,
+		"databases_with_recent_backup": dbsWithRecentBackup,
+		"oldest_backup_days":           oldestBackupDays,
+		"backup_coverage_percent":      float64(dbsWithBackup) / float64(totalDbs) * 100,
+	}
+
+	// Tüm sonuçları kaydet
+	b.results["BackupStatus"] = backupStatus
 }
 
 // min iki sayının küçük olanını döndürür

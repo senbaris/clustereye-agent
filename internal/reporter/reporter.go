@@ -14,11 +14,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/mssql"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
+	"github.com/senbaris/clustereye-agent/internal/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -529,20 +531,53 @@ func (r *Reporter) Report(data *pb.PostgresInfo) error {
 // SendMSSQLInfo MSSQL bilgilerini toplar ve sunucuya gönderir
 func (r *Reporter) SendMSSQLInfo() error {
 	// MSSQL kolektörünü oluştur
-	log.Printf("MSSQL bilgileri toplanıyor...")
+	logger.Info("MSSQL bilgileri toplanıyor...")
+
+	// Başlangıç zamanını kaydet - uzun sürerse logla
+	startTime := time.Now()
+
+	// Retry mekanizması
+	maxRetries := 2
+	retryDelay := 2 * time.Second
+	var lastError error
+	var mssqlInfo *mssql.MSSQLInfo
+
+	// MSSQL kolektörünü oluştur - singleton pattern kullanıyoruz
 	collector := mssql.NewMSSQLCollector(r.cfg)
 
-	// MSSQL bilgilerini al
-	mssqlInfo := collector.GetMSSQLInfo()
-	if mssqlInfo == nil {
-		return fmt.Errorf("MSSQL bilgileri alınamadı")
+	// Birkaç kez deneme yap
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			logger.Info("MSSQL bilgileri toplama yeniden deneniyor (%d/%d)...", attempt+1, maxRetries)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Her denemede bekleme süresini arttır
+		}
+
+		// MSSQL bilgilerini al - cache'den alınacak
+		mssqlInfo = collector.GetMSSQLInfo()
+		if mssqlInfo != nil {
+			break
+		}
+
+		lastError = fmt.Errorf("Deneme %d: MSSQL bilgileri alınamadı", attempt+1)
+		logger.Warning("%v", lastError)
 	}
+
+	// Son kontrol
+	if mssqlInfo == nil {
+		elapsedTime := time.Since(startTime)
+		return fmt.Errorf("Tüm denemeler sonucu MSSQL bilgileri alınamadı (%v içinde): %v", elapsedTime, lastError)
+	}
+
+	// Toplama süresini logla
+	collectionTime := time.Since(startTime)
+	logger.Info("MSSQL bilgileri %v içinde toplandı", collectionTime)
 
 	// MSSQL bilgilerini protobuf mesajına dönüştür
 	protoInfo := mssqlInfo.ToProto()
 
 	// MSSQL bilgilerini log'a yaz
-	log.Printf("MSSQL bilgileri: IP=%s, Hostname=%s, NodeStatus=%s, Version=%s, Status=%s, Instance=%s",
+	logger.Info("MSSQL bilgileri: IP=%s, Hostname=%s, NodeStatus=%s, Version=%s, Status=%s, Instance=%s",
 		protoInfo.Ip, protoInfo.Hostname, protoInfo.NodeStatus, protoInfo.Version, protoInfo.Status, protoInfo.Instance)
 
 	// Yeni SendMSSQLInfo RPC'sini kullanarak verileri gönder
@@ -556,40 +591,85 @@ func (r *Reporter) SendMSSQLInfo() error {
 	// SendMSSQLInfo RPC'sini çağır
 	response, err := client.SendMSSQLInfo(context.Background(), request)
 	if err != nil {
-		log.Printf("MSSQL bilgileri yeni RPC ile gönderilemedi: %v. Eski yöntem deneniyor...", err)
+		logger.Warning("MSSQL bilgileri yeni RPC ile gönderilemedi: %v. Eski yöntem deneniyor...", err)
 
 		// Eski yöntem: Stream üzerinden gönder
-		err = r.ReportMSSQLInfo(protoInfo)
+		err = r.ReportMSSQL(protoInfo)
 		if err != nil {
-			log.Printf("MSSQL bilgileri eski yöntemle de gönderilemedi: %v", err)
+			logger.Error("MSSQL bilgileri eski yöntemle de gönderilemedi: %v", err)
 			return err
 		}
 
-		log.Println("MSSQL bilgileri başarıyla eski yöntemle gönderildi")
+		logger.Info("MSSQL bilgileri başarıyla eski yöntemle gönderildi")
 		return nil
 	}
 
-	log.Printf("MSSQL bilgileri başarıyla gönderildi. Sunucu durumu: %s", response.Status)
+	logger.Info("MSSQL bilgileri başarıyla gönderildi. Sunucu durumu: %s", response.Status)
 	return nil
 }
 
-// ReportMSSQLInfo MSSQL bilgilerini sunucuya gönderir
-func (r *Reporter) ReportMSSQLInfo(data *pb.MSSQLInfo) error {
-	// Create the complete AgentMessage with MSSQLInfo as the payload
-	message := &pb.AgentMessage{
-		Payload: &pb.AgentMessage_MssqlInfo{
-			MssqlInfo: data,
-		},
+// ReportMSSQL MSSQL verilerini merkezi sunucuya gönderir (eski yöntem)
+func (r *Reporter) ReportMSSQL(data *pb.MSSQLInfo) error {
+	// Retry logic for stream sends
+	maxRetries := 3
+	retryDelay := 1 * time.Second
+
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Create the complete AgentMessage with MSSQLInfo as the payload
+		message := &pb.AgentMessage{
+			Payload: &pb.AgentMessage_MssqlInfo{
+				MssqlInfo: data,
+			},
+		}
+
+		// Send the message with timeout via goroutine
+		sendDone := make(chan error, 1)
+		go func() {
+			sendDone <- r.stream.Send(message)
+		}()
+
+		// Wait for send to complete or timeout
+		var err error
+		select {
+		case err = <-sendDone:
+			// Send completed
+		case <-time.After(5 * time.Second):
+			err = fmt.Errorf("stream send timed out")
+		}
+
+		if err != nil {
+			lastErr = err
+			logger.Warning("MSSQL bilgileri gönderilemedi (deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			// Check if we need to reconnect
+			if strings.Contains(err.Error(), "transport") ||
+				strings.Contains(err.Error(), "connection") ||
+				err == io.EOF {
+				logger.Warning("Stream bağlantı hatası, yeniden bağlanılıyor...")
+				if reconnErr := r.reconnect(); reconnErr != nil {
+					logger.Warning("Yeniden bağlantı başarısız: %v", reconnErr)
+				}
+			}
+
+			// Wait before retrying
+			if attempt < maxRetries-1 {
+				time.Sleep(retryDelay)
+				// Increase delay for next attempt
+				retryDelay *= 2
+			}
+			continue
+		}
+
+		// Success
+		logger.Info("MSSQL bilgileri başarıyla raporlandı: %s", data.Hostname)
+		return nil
 	}
 
-	// Send the complete message
-	err := r.stream.Send(message)
-	if err != nil {
-		return fmt.Errorf("MSSQL bilgileri gönderilemedi: %v", err)
-	}
-
-	log.Printf("MSSQL bilgileri başarıyla raporlandı: %s", data.Hostname)
-	return nil
+	// All retries failed
+	return fmt.Errorf("MSSQL bilgileri gönderilemedi (maksimum deneme sayısı aşıldı): %v", lastErr)
 }
 
 // AgentRegistration agent bilgilerini sunucuya gönderir
@@ -682,8 +762,14 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			log.Println("Sunucudan komut dinleme başlatıldı")
 		}
 
-		// Periyodik raporlamayı başlat
-		r.StartPeriodicReporting(30*time.Second, platform)
+		// Periyodik raporlamayı başlat - önce bir log yazdıralım
+		logger.Info("Periyodik raporlama başlatılıyor - %s platformu için (agent.AgentRegistration'dan)", platform)
+		go func() {
+			// Kısa bir gecikmeden sonra başlat (GRPC işlemlerinin tamamlanması için)
+			time.Sleep(3 * time.Second)
+			r.StartPeriodicReporting(30*time.Second, platform)
+			logger.Info("Periyodik raporlama başlatıldı (AgentRegistration içinden)")
+		}()
 
 		// Platform seçimine göre ilk bilgileri gönder
 		if platform == "postgres" {
@@ -740,22 +826,6 @@ func (r *Reporter) SendSystemMetrics(ctx context.Context, req *pb.SystemMetricsR
 	// Sistem metriklerini topla
 	metrics := postgres.GetSystemMetrics()
 
-	// Metrik içeriğini logla
-	log.Printf("Gönderilen metrikler boyutları:")
-	log.Printf("  cpu_usage: %v (size: ~8 bytes)", metrics.CpuUsage)
-	log.Printf("  cpu_cores: %v (size: ~4 bytes)", metrics.CpuCores)
-	log.Printf("  memory_usage: %v (size: ~8 bytes)", metrics.MemoryUsage)
-	log.Printf("  total_memory: %v (size: ~8 bytes)", metrics.TotalMemory)
-	log.Printf("  free_memory: %v (size: ~8 bytes)", metrics.FreeMemory)
-	log.Printf("  load_average_1m: %v (size: ~8 bytes)", metrics.LoadAverage_1M)
-	log.Printf("  load_average_5m: %v (size: ~8 bytes)", metrics.LoadAverage_5M)
-	log.Printf("  load_average_15m: %v (size: ~8 bytes)", metrics.LoadAverage_15M)
-	log.Printf("  total_disk: %v (size: ~8 bytes)", metrics.TotalDisk)
-	log.Printf("  free_disk: %v (size: ~8 bytes)", metrics.FreeDisk)
-	log.Printf("  os_version: %v (size: %d bytes)", metrics.OsVersion, len(metrics.OsVersion))
-	log.Printf("  kernel_version: %v (size: %d bytes)", metrics.KernelVersion, len(metrics.KernelVersion))
-	log.Printf("  uptime: %v (size: ~8 bytes)", metrics.Uptime)
-
 	// Yanıtı oluştur
 	response := &pb.SystemMetricsResponse{
 		Status:  "success",
@@ -782,14 +852,16 @@ func (r *Reporter) listenForCommands() {
 			log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
 			return
 		}
-		defer db.Close()
+		// NOT: MSSQL optimizasyonları ile uyumlu olması için PostgreSQL bağlantısını kapatmıyoruz
+		// İleri optimizasyonlarda PostgreSQL için de singleton pattern eklenebilir
+		// defer db.Close()
 
 		// Sorgu işleyiciyi oluştur
 		processor = NewQueryProcessor(db, r.cfg)
 	} else if r.platform == "mssql" {
-		// MSSQL sorgu işleyiciyi oluştur
+		// MSSQL sorgu işleyiciyi oluştur - singleton olarak oluşturulacak
 		mssqlProcessor = NewMSSQLQueryProcessor(r.cfg)
-		log.Println("MSSQL sorgu işleyicisi oluşturuldu")
+		logger.Info("MSSQL sorgu işleyicisi oluşturuldu (singleton)")
 	}
 
 	// Mesaj işleme durumu
@@ -1463,7 +1535,6 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
-				// Ping sorgusunu özel olarak işle
 				if strings.ToLower(query.Command) == "ping" {
 					log.Printf("Ping komutu algılandı, özel yanıt gönderiliyor")
 
@@ -3052,15 +3123,97 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 		r.reportTicker.Stop()
 	}
 
+	// Platform'a göre raporlama aralığını ayarla
+	// MSSQL için daha uzun aralık kullan - CPU kullanımını azaltmak için
+	if platform == "mssql" && runtime.GOOS == "windows" {
+		interval = 1 * time.Minute
+		logger.Info("MSSQL platformu için raporlama aralığı 1 dakika olarak ayarlandı")
+	}
+
+	// Raporlama başlatıldığını göster
+	logger.Info("Periyodik raporlama başlatılıyor: Platform=%s, Aralık=%v", platform, interval)
+
 	// Yeni bir timer başlat
 	r.reportTicker = time.NewTicker(interval)
 
+	// watchdog timer - periyodik raporlama çalışmazsa zorla tekrar başlat
+	watchdogTicker := time.NewTicker(2 * time.Minute)
+
+	// Başlangıç değerleri
+	lastReportTime := time.Time{} // sıfır zaman = hiç rapor edilmedi
+	reportCount := 0
+
+	// Heartbeat ticker - periyodik raporlamanın çalıştığını görmek için log
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+
 	// Timer için dinleme işlemi başlat
 	go func() {
+		// Panic recovery - çökerse yeniden başlat
+		defer func() {
+			if panicVal := recover(); panicVal != nil {
+				logger.Error("Periyodik raporlama panic ile durdu: %v - Yeniden başlatılıyor", panicVal)
+				// Küçük bir gecikme sonra yeniden başlat
+				time.Sleep(5 * time.Second)
+				go r.StartPeriodicReporting(interval, platform)
+			}
+		}()
+
+		// İlk çalıştırmada daha uzun bir gecikme ekle - sistemin tam olarak başlaması için
+		initialDelay := 15 * time.Second
+		if platform == "mssql" && runtime.GOOS == "windows" {
+			// MSSQL için daha uzun bir başlangıç gecikmesi kullan
+			initialDelay = 30 * time.Second
+			logger.Info("MSSQL platformu için ilk raporlamaya kadar %v bekleniyor...", initialDelay)
+		} else {
+			logger.Info("%s platformu için ilk raporlamaya kadar %v bekleniyor...", platform, initialDelay)
+		}
+		time.Sleep(initialDelay)
+
+		// İlk veri toplama ve raporlama - belirli bir gecikmeden sonra başlat
+		logger.Info("İlk veri toplama ve raporlama başlatılıyor (platform: %s)...", platform)
+		var firstErr error
+
+		// 3 kez deneme yap, başarısız olursa devam et
+		maxRetries := 3
+		retryDelay := 3 * time.Second
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				logger.Info("İlk raporlama yeniden deneniyor (%d/%d)...", attempt+1, maxRetries)
+				time.Sleep(retryDelay)
+				// Her denemede bekleme süresini arttır
+				retryDelay *= 2
+			}
+
+			if platform == "postgres" {
+				firstErr = r.SendPostgresInfo()
+			} else if platform == "mongo" {
+				firstErr = r.SendMongoInfo()
+			} else if platform == "mssql" {
+				firstErr = r.SendMSSQLInfo()
+			}
+
+			if firstErr == nil {
+				logger.Info("İlk periyodik raporlama başarılı")
+				lastReportTime = time.Now()
+				reportCount++
+				break
+			}
+
+			logger.Warning("İlk periyodik raporlama hatası (deneme %d/%d): %v",
+				attempt+1, maxRetries, firstErr)
+
+			// Hata durumunda reconnect ihtiyacını kontrol et
+			if strings.Contains(firstErr.Error(), "database is closed") {
+				logger.Warning("Veritabanı bağlantısı kapalı, yeniden deneme öncesi kısa bir bekleme yapılıyor...")
+			}
+		}
+
+		// Periyodik döngü
 		for {
 			select {
 			case <-r.reportTicker.C:
-				log.Printf("Periyodik raporlama başlatılıyor (platform: %s)...", platform)
+				logger.Info("Periyodik raporlama başlatılıyor (platform: %s)...", platform)
 				var err error
 
 				// Platform tipine göre verileri topla ve gönder
@@ -3073,18 +3226,76 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 				}
 
 				if err != nil {
-					log.Printf("Periyodik raporlama hatası: %v", err)
+					logger.Warning("Periyodik raporlama hatası: %v", err)
+
+					// Hata durumunda reconnect ihtiyacını kontrol et
+					if strings.Contains(err.Error(), "transport") ||
+						strings.Contains(err.Error(), "connection") ||
+						strings.Contains(err.Error(), "unavailable") {
+
+						logger.Warning("Bağlantı hatası algılandı, yeniden bağlanma deneniyor...")
+						if reconnErr := r.reconnect(); reconnErr != nil {
+							logger.Error("Yeniden bağlantı başarısız: %v", reconnErr)
+						} else {
+							logger.Info("Yeniden bağlantı başarılı")
+						}
+					}
+				} else {
+					logger.Info("Periyodik raporlama başarıyla tamamlandı")
+					lastReportTime = time.Now()
+					reportCount++
 				}
+
+			case <-heartbeatTicker.C:
+				// Periyodik raporlamanın durumunu logla
+				timeSinceLastReport := time.Since(lastReportTime)
+				if lastReportTime.IsZero() {
+					logger.Warning("Henüz hiç başarılı periyodik raporlama yapılmadı! Platform: %s", platform)
+				} else if timeSinceLastReport > 2*interval {
+					logger.Warning("Son başarılı periyodik raporlamadan bu yana uzun süre geçti: %v (Toplam: %d)",
+						timeSinceLastReport, reportCount)
+				} else {
+					logger.Debug("Periyodik raporlama aktif: Son rapor %v önce, Toplam: %d",
+						timeSinceLastReport, reportCount)
+				}
+
+			case <-watchdogTicker.C:
+				// Son raporlama üzerinden çok zaman geçtiyse, zorla yeni bir raporlama başlat
+				if !lastReportTime.IsZero() && time.Since(lastReportTime) > 2*interval {
+					logger.Warning("Watchdog: Son başarılı raporlamadan bu yana çok uzun süre geçti (%v), zorla yeni raporlama başlatılıyor...",
+						time.Since(lastReportTime))
+
+					var err error
+					if platform == "postgres" {
+						err = r.SendPostgresInfo()
+					} else if platform == "mongo" {
+						err = r.SendMongoInfo()
+					} else if platform == "mssql" {
+						err = r.SendMSSQLInfo()
+					}
+
+					if err == nil {
+						logger.Info("Watchdog tarafından başlatılan raporlama başarılı")
+						lastReportTime = time.Now()
+						reportCount++
+					} else {
+						logger.Warning("Watchdog tarafından başlatılan raporlama başarısız: %v", err)
+					}
+				}
+
 			case <-r.stopCh:
 				if r.reportTicker != nil {
 					r.reportTicker.Stop()
 				}
+				watchdogTicker.Stop()
+				heartbeatTicker.Stop()
+				logger.Info("Periyodik raporlama durduruldu")
 				return
 			}
 		}
 	}()
 
-	log.Printf("Periyodik raporlama başlatıldı: Her %v", interval)
+	logger.Info("Periyodik raporlama başlatıldı: Her %v", interval)
 }
 
 // AnalyzeMongoLog, MongoDB log dosyasını analiz eder ve önemli log girdilerini döndürür
@@ -4006,13 +4217,39 @@ func createReadablePlan(resultBytes []byte) string {
 // MSSQLQueryProcessor, MSSQL sorgu işleme mantığını temsil eder
 type MSSQLQueryProcessor struct {
 	cfg *config.AgentConfig
+
+	// SQL bağlantı yönetimi için
+	sqlConn   *sql.DB
+	connMutex sync.Mutex
 }
 
-// NewMSSQLQueryProcessor, yeni bir MSSQL sorgu işleyici oluşturur
+// Global singleton processor
+var (
+	globalProcessor *MSSQLQueryProcessor
+	processorMutex  sync.Mutex
+)
+
+// NewMSSQLQueryProcessor, yeni bir MSSQL sorgu işleyici oluşturur veya mevcut singleton işleyiciyi döndürür
 func NewMSSQLQueryProcessor(cfg *config.AgentConfig) *MSSQLQueryProcessor {
-	return &MSSQLQueryProcessor{
+	processorMutex.Lock()
+	defer processorMutex.Unlock()
+
+	// Eğer mevcut bir işleyici varsa, bunu yeniden kullan
+	if globalProcessor != nil {
+		log.Println("Returning existing MSSQL query processor instance")
+		return globalProcessor
+	}
+
+	// Yeni işleyici oluştur
+	processor := &MSSQLQueryProcessor{
 		cfg: cfg,
 	}
+
+	// Global işleyiciyi güncelle
+	globalProcessor = processor
+	log.Println("Created new MSSQL query processor instance")
+
+	return processor
 }
 
 // processExplainMSSQLQuery, MSSQL sorgusunun execution planını XML formatında döndürür
@@ -4023,19 +4260,53 @@ func (p *MSSQLQueryProcessor) processExplainMSSQLQuery(query string, database st
 	// İşlem başlangıç zamanını kaydet
 	startTime := time.Now()
 
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(p.cfg)
+	// Mevcut SQL bağlantısını kullan veya yeni bağlantı aç
+	p.connMutex.Lock()
 
-	// MSSQL bağlantısını aç
-	db, err := collector.GetClient()
-	if err != nil {
-		log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
-		return map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+	// Bağlantıyı kontrol et
+	var db *sql.DB
+	var err error
+
+	if p.sqlConn != nil {
+		// Ping ile bağlantının hala açık olduğunu kontrol et
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		pingErr := p.sqlConn.PingContext(pingCtx)
+		cancel()
+
+		if pingErr != nil {
+			log.Printf("[WARNING] Mevcut SQL bağlantısı geçersiz (ping başarısız): %v, yeni bağlantı açılıyor", pingErr)
+			// Bağlantıyı kapat ve temizle
+			p.sqlConn.Close()
+			p.sqlConn = nil
+		} else {
+			// Mevcut bağlantı geçerli
+			db = p.sqlConn
 		}
 	}
-	defer db.Close()
+
+	// Eğer bağlantı yoksa veya geçersizse, yeni bağlantı aç
+	if db == nil {
+		// MSSQL kolektörünü oluştur - bu aynı zamanda veritabanı bağlantısını da sağlar
+		collector := mssql.NewMSSQLCollector(p.cfg)
+
+		// MSSQL bağlantısını aç
+		db, err = collector.GetClient()
+		if err != nil {
+			p.connMutex.Unlock()
+			log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+			}
+		}
+
+		// Bağlantıyı singleton processor'da sakla
+		p.sqlConn = db
+	}
+
+	p.connMutex.Unlock()
+
+	// Not: defer db.Close() çağrısı yapmıyoruz çünkü bağlantıyı singleton olarak tutuyoruz
 
 	// Veritabanını kullanmaya ayarla
 	if database != "" {
@@ -4087,7 +4358,7 @@ SET STATISTICS XML OFF;`, query)
 			// Dinamik olarak sütunları oku
 			values := make([]interface{}, len(columns))
 			valuePtrs := make([]interface{}, len(columns))
-			for i := range columns {
+			for i := range values {
 				valuePtrs[i] = &values[i]
 			}
 
@@ -4248,19 +4519,53 @@ func (p *MSSQLQueryProcessor) processMSSQLQuery(command string, database string)
 	// İşlem başlangıç zamanını kaydet
 	startTime := time.Now()
 
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(p.cfg)
+	// Mevcut SQL bağlantısını kullan veya yeni bağlantı aç
+	p.connMutex.Lock()
 
-	// MSSQL bağlantısını aç
-	db, err := collector.GetClient()
-	if err != nil {
-		log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
-		return map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+	// Bağlantıyı kontrol et
+	var db *sql.DB
+	var err error
+
+	if p.sqlConn != nil {
+		// Ping ile bağlantının hala açık olduğunu kontrol et
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		pingErr := p.sqlConn.PingContext(pingCtx)
+		cancel()
+
+		if pingErr != nil {
+			log.Printf("[WARNING] Mevcut SQL bağlantısı geçersiz (ping başarısız): %v, yeni bağlantı açılıyor", pingErr)
+			// Bağlantıyı kapat ve temizle
+			p.sqlConn.Close()
+			p.sqlConn = nil
+		} else {
+			// Mevcut bağlantı geçerli
+			db = p.sqlConn
 		}
 	}
-	defer db.Close()
+
+	// Eğer bağlantı yoksa veya geçersizse, yeni bağlantı aç
+	if db == nil {
+		// MSSQL kolektörünü oluştur - bu aynı zamanda veritabanı bağlantısını da sağlar
+		collector := mssql.NewMSSQLCollector(p.cfg)
+
+		// MSSQL bağlantısını aç
+		db, err = collector.GetClient()
+		if err != nil {
+			p.connMutex.Unlock()
+			log.Printf("[ERROR] MSSQL bağlantısı kurulamadı: %v", err)
+			return map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("MSSQL bağlantısı kurulamadı: %v", err),
+			}
+		}
+
+		// Bağlantıyı singleton processor'da sakla
+		p.sqlConn = db
+	}
+
+	p.connMutex.Unlock()
+
+	// Not: defer db.Close() çağrısı yapmıyoruz çünkü bağlantıyı singleton olarak tutuyoruz
 
 	// Veritabanını kullanmaya ayarla (eğer belirtilmişse)
 	if database != "" {

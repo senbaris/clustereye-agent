@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"               // PostgreSQL sürücüsü
@@ -214,29 +215,78 @@ func (c *Collector) TestMongoConnection() (string, error) {
 
 // TestMSSQLConnection MSSQL bağlantısını test eder
 func (c *Collector) TestMSSQLConnection() string {
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(c.cfg)
+	// Bağlantı denemeleri için değişkenler
+	maxRetries := 3
+	retryDelay := 2 * time.Second
 
-	// Bağlantıyı test et
-	db, err := collector.GetClient()
-	if err != nil {
-		errMsg := fmt.Sprintf("fail:connection_error:%v", err)
-		log.Printf("MSSQL bağlantısı açılamadı: %v", err)
-		return errMsg
+	// Birkaç kez deneme yapalım
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("MSSQL bağlantısı yeniden deneniyor (%d/%d)...", attempt+1, maxRetries)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Her denemede bekleme süresini arttır
+		}
+
+		// MSSQL kolektörünü oluştur
+		collector := mssql.NewMSSQLCollector(c.cfg)
+
+		// Bağlantıyı test et
+		db, err := collector.GetClient()
+		if err != nil {
+			log.Printf("MSSQL bağlantısı açılamadı (deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			if attempt == maxRetries-1 {
+				// Son denemede de başarısız olduysa hata döndür
+				errMsg := fmt.Sprintf("fail:connection_error:%v", err)
+				log.Printf("MSSQL bağlantısı tüm denemelerde başarısız oldu: %v", err)
+				return errMsg
+			}
+
+			// Sonraki denemeye geç
+			continue
+		}
+
+		// Bağlantıyı kapatma işlemini garanti et
+		defer func(database *sql.DB) {
+			if err := database.Close(); err != nil {
+				log.Printf("MSSQL bağlantısı kapatılırken hata: %v", err)
+			}
+		}(db)
+
+		// Basit bir sorgu çalıştır
+		var version string
+		err = db.QueryRow("SELECT @@VERSION").Scan(&version)
+		if err != nil {
+			log.Printf("MSSQL sorgusu başarısız (deneme %d/%d): %v",
+				attempt+1, maxRetries, err)
+
+			// "database is closed" hatası mı kontrol et
+			if strings.Contains(err.Error(), "database is closed") ||
+				strings.Contains(err.Error(), "connection is closed") {
+				// Veritabanı bağlantısı kapanmış, yeniden deneyelim
+				log.Printf("Veritabanı bağlantısı kapanmış, yeniden deneniyor...")
+				continue
+			}
+
+			if attempt == maxRetries-1 {
+				// Son denemede de başarısız olduysa hata döndür
+				errMsg := fmt.Sprintf("fail:query_error:%v", err)
+				log.Printf("MSSQL sorgusu tüm denemelerde başarısız oldu: %v", err)
+				return errMsg
+			}
+
+			// Sonraki denemeye geç
+			continue
+		}
+
+		// Başarılı sonuç
+		log.Printf("MSSQL bağlantısı başarılı. Versiyon: %s", version)
+		return "success"
 	}
-	defer db.Close()
 
-	// Basit bir sorgu çalıştır
-	var version string
-	err = db.QueryRow("SELECT @@VERSION").Scan(&version)
-	if err != nil {
-		errMsg := fmt.Sprintf("fail:query_error:%v", err)
-		log.Printf("MSSQL sorgusu başarısız: %v", err)
-		return errMsg
-	}
-
-	log.Printf("MSSQL bağlantısı başarılı. Versiyon: %s", version)
-	return "success"
+	// Buraya ulaşılmamalı, ama her ihtimale karşı
+	return "fail:unexpected:maximum_retries_exceeded"
 }
 
 // collectSystemData sistem verilerini toplar

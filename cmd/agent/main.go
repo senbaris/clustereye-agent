@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/kardianos/service"
 	"github.com/senbaris/clustereye-agent/internal/agent"
@@ -26,6 +27,20 @@ func (p *program) Start(s service.Service) error {
 }
 
 func (p *program) run() {
+	// Üst seviye panic recovery - agent çökerse bile servis çalışmaya devam etsin
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("AGENT PANIC RECOVERY: Agent çöktü: %v", r)
+			logger.Error("Agent yeniden başlatılıyor...")
+
+			// Kısa bir gecikme sonra agent'ı yeniden başlat
+			go func() {
+				time.Sleep(5 * time.Second)
+				p.run() // Recursively restart
+			}()
+		}
+	}()
+
 	logger.Info("ClusterEye Agent starting... Platform: %s", p.platform)
 
 	a := agent.NewAgent(p.cfg)
@@ -49,13 +64,24 @@ func (p *program) Stop(s service.Service) error {
 }
 
 func main() {
+	// En üst düzey panic recovery - tamamen çökmeyi önlemek için
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL PANIC RECOVERY: Ana uygulama çöktü: %v", r)
+			log.Println("Uygulama yeniden başlatılacak...")
+
+			// OS'a hata kodu döndür - Windows servisi otomatik yeniden başlatır
+			os.Exit(1)
+		}
+	}()
+
 	initLogging()
 
 	platformFlag := flag.String("platform", "mssql", "Target platform (postgres, mongo, mssql)")
 	helpFlag := flag.Bool("help", false, "Show help")
 	versionFlag := flag.Bool("version", false, "Show version")
 	svcFlag := flag.String("service", "", "Control the system service: install, uninstall, start, stop")
-	logLevelFlag := flag.String("loglevel", "WARNING", "Log level: DEBUG, INFO, WARNING, ERROR, FATAL")
+	logLevelFlag := flag.String("loglevel", "INFO", "Log level: DEBUG, INFO, WARNING, ERROR, FATAL")
 
 	flag.Parse()
 
