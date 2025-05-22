@@ -140,20 +140,33 @@ func main() {
 const maxLogSize = 10 * 1024 * 1024 // 10 MB
 
 func initLogging() {
+	// Non-Windows platformları için dosya loglama kullan
 	if runtime.GOOS != "windows" {
-		// Linux/Mac için basit dosya log kurulumu
 		setupFileLogging()
 		return
 	}
 
-	// Windows Event Log'unu kullanmayı dene
-	if setupWindowsEventLog() {
-		// Başarılı, Event Log kullanılıyor
-		return
+	// Windows için - önce EventLog deneyip, başarısız olursa dosya loglamaya dön
+	var useEventLog bool
+	if runtime.GOOS == "windows" {
+		// Bu kod yalnızca Windows'ta derlenecek ve çalışacak
+		useEventLog = setupWindowsEventLogWrapper()
+		if useEventLog {
+			return // Windows EventLog başarıyla ayarlandı
+		}
 	}
 
-	// Event Log başarısız olursa dosya log sistemini kullan
+	// Fallback - her durumda dosya loglama kullanılabilir
 	setupFileLogging()
+}
+
+// setupWindowsEventLogWrapper Windows platformlarında Event Log kurulumunu çağırır
+// Bu wrapper, Windows-specific kodun doğrudan çağrılmasını önler
+func setupWindowsEventLogWrapper() bool {
+	if runtime.GOOS == "windows" {
+		return setupWindowsEventLog()
+	}
+	return false
 }
 
 // Dosya log sistemini kurma yardımcı fonksiyonu
