@@ -234,8 +234,9 @@ func (c *PostgresCollector) openDB() (*sql.DB, error) {
 func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 	// Check if we should skip collection due to rate limiting or health issues
 	if c.ShouldSkipCollection() {
-		logger.Debug("PostgreSQL collection skipped due to rate limiting or health checks")
-		return c.getLastKnownGoodInfo() // Return cached info instead
+		logger.Warning("PostgreSQL collection skipped due to rate limiting or health checks - providing fallback info")
+		// Instead of returning full cached info, provide minimal service status
+		return c.getMinimalServiceInfo()
 	}
 
 	// Update collection time at the start to prevent concurrent collections
@@ -282,6 +283,61 @@ func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 	logger.Info("PostgreSQL bilgileri başarıyla toplandı. Status=%s, Version=%s",
 		info["service_status"], info["version"])
 
+	return info
+}
+
+// getMinimalServiceInfo returns minimal service information when rate limited
+func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
+	hostname, _ := os.Hostname()
+
+	// Provide minimal but useful information even when rate limited
+	info := map[string]interface{}{
+		"hostname":              hostname,
+		"service_status":        "CHECKING", // Instead of RATE_LIMITED which causes alarms
+		"version":               "Checking",
+		"node_status":           "Checking",
+		"replication_lag":       0.0,
+		"total_memory":          GetTotalMemory(),
+		"total_vcpu":            GetTotalvCpu(),
+		"cluster_name":          "",
+		"location":              "",
+		"ip":                    c.getLocalIP(),
+		"timestamp":             time.Now().Unix(),
+		"rate_limited":          true,
+		"collection_successful": false,
+	}
+
+	// Try to at least get service status without rate limiting
+	cfg, err := config.LoadAgentConfig()
+	if err == nil && cfg.PostgreSQL.Host != "" {
+		host := cfg.PostgreSQL.Host
+		if host == "" {
+			host = "localhost"
+		}
+		port := cfg.PostgreSQL.Port
+		if port == "" {
+			port = "5432"
+		}
+
+		// Quick TCP check without rate limiting
+		address := fmt.Sprintf("%s:%s", host, port)
+		conn, err := net.DialTimeout("tcp", address, 1*time.Second)
+		if err == nil && conn != nil {
+			conn.Close()
+			info["service_status"] = "RUNNING"
+		} else {
+			info["service_status"] = "FAIL!"
+		}
+
+		if cfg.PostgreSQL.Cluster != "" {
+			info["cluster_name"] = cfg.PostgreSQL.Cluster
+		}
+		if cfg.PostgreSQL.Location != "" {
+			info["location"] = cfg.PostgreSQL.Location
+		}
+	}
+
+	logger.Debug("Returned minimal service info to prevent alarm while rate limited")
 	return info
 }
 
@@ -428,6 +484,16 @@ func init() {
 	}
 	collectorMutex.Unlock()
 	log.Printf("PostgreSQL default collector initialized in init() with thread safety")
+
+	// Perform immediate startup recovery in background
+	go func() {
+		// Wait for a short time to ensure initialization is complete
+		time.Sleep(500 * time.Millisecond)
+		if defaultPostgresCollector != nil {
+			log.Printf("PostgreSQL collector performing immediate startup recovery...")
+			defaultPostgresCollector.StartupRecovery()
+		}
+	}()
 }
 
 // EnsureDefaultCollector ensures the default collector is initialized (thread-safe)
@@ -545,17 +611,8 @@ func (p *PostgresLogFile) ToProto() map[string]interface{} {
 
 // OpenDB veritabanı bağlantısını açar
 func OpenDB() (*sql.DB, error) {
-	// Check rate limiting first - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
-		return nil, fmt.Errorf("PostgreSQL collection rate limited or collector unhealthy")
-	}
-
-	// Update collection time - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil {
-		collectorMutex.Lock()
-		collector.SetCollectionTime()
-		collectorMutex.Unlock()
-	}
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
 
 	// Implement panic recovery to prevent crash
 	defer func() {
@@ -616,11 +673,6 @@ func GetPGServiceStatus() string {
 		}
 	}()
 
-	// Check rate limiting - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
-		return "RATE_LIMITED"
-	}
-
 	// Konfigürasyonu yükle
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
@@ -671,11 +723,6 @@ func GetPGVersion() string {
 			}
 		}
 	}()
-
-	// Check rate limiting - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
-		return "Rate Limited"
-	}
 
 	db, err := openDBDirect() // Use direct connection for version check
 	if err != nil {
@@ -747,13 +794,6 @@ func GetNodeStatus() string {
 		}
 	}
 	logger.Debug("GetNodeStatus: Collector state validated")
-
-	// Check rate limiting - thread-safe
-	if collector.ShouldSkipCollection() {
-		logger.Debug("GetNodeStatus: Rate limited, returning")
-		return "Rate Limited"
-	}
-	logger.Debug("GetNodeStatus: Rate limiting check passed")
 
 	// Extra validation before DB connection
 	logger.Debug("GetNodeStatus: About to call openDBDirect")
@@ -979,11 +1019,6 @@ func GetReplicationLagSec() float64 {
 			}
 		}
 	}()
-
-	// Check rate limiting - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
-		return 0
-	}
 
 	db, err := openDBDirect() // Use direct connection for lag check
 	if err != nil {
