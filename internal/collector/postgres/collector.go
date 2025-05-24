@@ -69,22 +69,44 @@ func (c *PostgresCollector) IsHealthy() bool {
 	return c.isHealthy
 }
 
-// checkHealth performs a simple health check
+// checkHealth performs a simple health check - INDEPENDENT of rate limiting
 func (c *PostgresCollector) checkHealth() {
 	c.lastHealthCheck = time.Now()
 
-	// Simple connectivity test
-	db, err := c.openDB()
+	// CRITICAL: Health check must be independent of rate limiting to allow recovery
+	// Don't use c.openDB() because it checks ShouldSkipCollection
+	cfg, err := config.LoadAgentConfig()
 	if err != nil {
 		c.isHealthy = false
-		logger.Warning("PostgreSQL health check failed - marking collector as unhealthy: %v", err)
-		// Increase collection interval when unhealthy
+		logger.Warning("PostgreSQL health check failed - config load error: %v", err)
 		c.collectionInterval = 2 * time.Minute
 		return
 	}
 
-	// Quick test query
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Direct connection for health check - bypass all rate limiting
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=3",
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check failed - connection open error: %v", err)
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Set minimal connection limits for health check
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(5 * time.Second)
+
+	// Quick test query with very short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	var result int
@@ -96,10 +118,20 @@ func (c *PostgresCollector) checkHealth() {
 		logger.Warning("PostgreSQL health check query failed - marking collector as unhealthy: %v", err)
 		c.collectionInterval = 2 * time.Minute
 	} else {
+		// RECOVERY: If we were unhealthy, log recovery
+		if !c.isHealthy {
+			logger.Info("PostgreSQL collector RECOVERED - marking as healthy")
+		}
 		c.isHealthy = true
 		logger.Debug("PostgreSQL health check passed - collector is healthy")
 		c.collectionInterval = 30 * time.Second // Reset to normal interval
 	}
+}
+
+// ForceHealthCheck forces an immediate health check - useful for recovery
+func (c *PostgresCollector) ForceHealthCheck() {
+	logger.Info("PostgreSQL collector forcing health check for recovery")
+	c.checkHealth()
 }
 
 // ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
@@ -108,9 +140,23 @@ func (c *PostgresCollector) ShouldSkipCollection() bool {
 		return true
 	}
 
+	// Check health but allow periodic recovery attempts
 	if !c.IsHealthy() {
-		logger.Debug("Skipping PostgreSQL collection due to unhealthy state")
-		return true
+		// If we've been unhealthy for more than 5 minutes, try a recovery
+		if time.Since(c.lastHealthCheck) > 5*time.Minute {
+			logger.Info("PostgreSQL collector has been unhealthy for 5+ minutes, attempting recovery...")
+			c.ForceHealthCheck()
+
+			// If still unhealthy after forced check, skip collection
+			if !c.isHealthy {
+				logger.Debug("PostgreSQL recovery attempt failed, skipping collection")
+				return true
+			}
+			logger.Info("PostgreSQL collector successfully recovered!")
+		} else {
+			logger.Debug("Skipping PostgreSQL collection due to unhealthy state")
+			return true
+		}
 	}
 
 	return false
@@ -317,6 +363,26 @@ var defaultPostgresCollector *PostgresCollector
 var collectorMutex sync.RWMutex // Thread-safe access
 
 func init() {
+	// Initialize default collector with panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in PostgreSQL collector init(): %v", r)
+			// Try to create a minimal collector as last resort
+			collectorMutex.Lock()
+			if defaultPostgresCollector == nil {
+				defaultPostgresCollector = &PostgresCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+			}
+			collectorMutex.Unlock()
+			log.Printf("PostgreSQL collector init() recovered from panic")
+		}
+	}()
+
 	// Initialize default collector - will be updated when config is available
 	collectorMutex.Lock()
 	defaultPostgresCollector = &PostgresCollector{
@@ -332,12 +398,16 @@ func init() {
 
 // EnsureDefaultCollector ensures the default collector is initialized (thread-safe)
 func EnsureDefaultCollector() {
+	// First quick read-only check
 	collectorMutex.RLock()
 	if defaultPostgresCollector != nil {
+		logger.Debug("EnsureDefaultCollector: Collector already exists")
 		collectorMutex.RUnlock()
 		return
 	}
 	collectorMutex.RUnlock()
+
+	logger.Debug("EnsureDefaultCollector: Collector is nil, acquiring write lock")
 
 	// Need to create new collector
 	collectorMutex.Lock()
@@ -345,21 +415,56 @@ func EnsureDefaultCollector() {
 
 	// Double-check in case another goroutine created it
 	if defaultPostgresCollector == nil {
-		log.Printf("WARNING: defaultPostgresCollector was nil, reinitializing with thread safety...")
+		logger.Warning("EnsureDefaultCollector: Creating new collector - this should only happen once")
+
+		// Try to create with proper recovery
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("PANIC in EnsureDefaultCollector: %v", r)
+				// Create minimal collector as fallback
+				defaultPostgresCollector = &PostgresCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+				logger.Error("EnsureDefaultCollector: Created fallback collector after panic")
+			}
+		}()
+
 		defaultPostgresCollector = &PostgresCollector{
 			collectionInterval: 30 * time.Second,
 			maxRetries:         3,
-			backoffDuration:    5 * time.Second,
-			isHealthy:          true,
-			lastHealthCheck:    time.Now(),
+
+			backoffDuration: 5 * time.Second,
+			isHealthy:       true,
+			lastHealthCheck: time.Now(),
 		}
+		logger.Info("EnsureDefaultCollector: Successfully created new collector")
+	} else {
+		logger.Debug("EnsureDefaultCollector: Another goroutine already created collector")
 	}
 }
 
 // GetDefaultCollectorSafe returns the default collector in a thread-safe manner
 func GetDefaultCollectorSafe() *PostgresCollector {
+	// Implement panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetDefaultCollectorSafe: %v", r)
+		}
+	}()
+
 	collectorMutex.RLock()
 	defer collectorMutex.RUnlock()
+
+	if defaultPostgresCollector == nil {
+		logger.Error("GetDefaultCollectorSafe: Collector is nil - this should not happen!")
+		return nil
+	}
+
+	logger.Debug("GetDefaultCollectorSafe: Returning healthy collector")
 	return defaultPostgresCollector
 }
 
@@ -558,75 +663,137 @@ func GetPGVersion() string {
 
 // GetNodeStatus node'un master/slave durumunu döndürür
 func GetNodeStatus() string {
+	// Comprehensive debug logging
+	logger.Debug("GetNodeStatus: Starting function")
+
 	// Ensure collector is initialized
 	EnsureDefaultCollector()
+	logger.Debug("GetNodeStatus: EnsureDefaultCollector completed")
 
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetNodeStatus: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("GetNodeStatus STACK TRACE: %s", string(buf[:n]))
+
 			// Mark as unhealthy after panic - thread-safe
 			if collector := GetDefaultCollectorSafe(); collector != nil {
 				collectorMutex.Lock()
 				collector.isHealthy = false
 				collector.collectionInterval = 5 * time.Minute
 				collectorMutex.Unlock()
+				logger.Error("GetNodeStatus: Marked collector as unhealthy after panic")
+			} else {
+				logger.Error("GetNodeStatus: Collector is nil after panic!")
 			}
 		}
 	}()
 
+	// Check collector state
+	collector := GetDefaultCollectorSafe()
+	if collector == nil {
+		logger.Error("GetNodeStatus: Collector is nil, attempting re-initialization")
+		EnsureDefaultCollector()
+		collector = GetDefaultCollectorSafe()
+		if collector == nil {
+			logger.Error("GetNodeStatus: Collector still nil after re-initialization")
+			return "Unknown"
+		}
+	}
+	logger.Debug("GetNodeStatus: Collector state validated")
+
 	// Check rate limiting - thread-safe
-	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
+	if collector.ShouldSkipCollection() {
+		logger.Debug("GetNodeStatus: Rate limited, returning")
 		return "Rate Limited"
 	}
+	logger.Debug("GetNodeStatus: Rate limiting check passed")
 
+	// Extra validation before DB connection
+	logger.Debug("GetNodeStatus: About to call openDBDirect")
 	db, err := openDBDirect() // Use direct connection for status check
 	if err != nil {
-		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+		logger.Error("GetNodeStatus: Database connection failed: %v", err)
 		return "Unknown"
 	}
-	defer db.Close()
+	if db == nil {
+		logger.Error("GetNodeStatus: Database connection is nil")
+		return "Unknown"
+	}
+	defer func() {
+		logger.Debug("GetNodeStatus: Closing database connection")
+		if closeErr := db.Close(); closeErr != nil {
+			logger.Error("GetNodeStatus: Error closing DB: %v", closeErr)
+		}
+	}()
+	logger.Debug("GetNodeStatus: Database connection established")
 
 	// PostgreSQL 10 ve üzeri için
 	var inRecovery bool
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	logger.Debug("GetNodeStatus: About to execute pg_is_in_recovery query")
 	err = db.QueryRowContext(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery)
 	if err != nil {
-		log.Printf("Node durumu alınamadı: %v", err)
+		logger.Error("GetNodeStatus: Query failed: %v", err)
 		return "Unknown"
 	}
+	logger.Debug("GetNodeStatus: Query completed, inRecovery=%v", inRecovery)
 
 	if inRecovery {
+		logger.Debug("GetNodeStatus: Returning SLAVE")
 		return "SLAVE"
 	}
+	logger.Debug("GetNodeStatus: Returning MASTER")
 	return "MASTER"
 }
 
 // openDBDirect creates a database connection without rate limiting for critical operations
 func openDBDirect() (*sql.DB, error) {
+	// Comprehensive debug logging
+	logger.Debug("openDBDirect: Starting function")
+
 	// Ensure collector is initialized with thread safety
 	EnsureDefaultCollector()
+	logger.Debug("openDBDirect: EnsureDefaultCollector completed")
 
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in openDBDirect: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("openDBDirect STACK TRACE: %s", string(buf[:n]))
+
 			// Mark as unhealthy after panic - but check for nil first with thread safety
 			if collector := GetDefaultCollectorSafe(); collector != nil {
 				collectorMutex.Lock()
 				collector.isHealthy = false
 				collector.collectionInterval = 5 * time.Minute
 				collectorMutex.Unlock()
+				logger.Error("openDBDirect: Marked collector as unhealthy after panic")
+			} else {
+				logger.Error("openDBDirect: Collector is nil after panic!")
 			}
 		}
 	}()
 
+	logger.Debug("openDBDirect: About to load agent config")
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
+		logger.Error("openDBDirect: Config load failed: %v", err)
 		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
 	}
+	if cfg == nil {
+		logger.Error("openDBDirect: Config is nil")
+		return nil, fmt.Errorf("config is nil")
+	}
+	logger.Debug("openDBDirect: Config loaded successfully - Host: %s, Port: %s", cfg.PostgreSQL.Host, cfg.PostgreSQL.Port)
 
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=5",
 		cfg.PostgreSQL.Host,
@@ -635,26 +802,37 @@ func openDBDirect() (*sql.DB, error) {
 		cfg.PostgreSQL.Pass,
 		"postgres",
 	)
+	logger.Debug("openDBDirect: About to open database connection")
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
+		logger.Error("openDBDirect: sql.Open failed: %v", err)
 		return nil, err
 	}
+	if db == nil {
+		logger.Error("openDBDirect: sql.Open returned nil db")
+		return nil, fmt.Errorf("database connection is nil")
+	}
+	logger.Debug("openDBDirect: Database opened successfully")
 
 	// Set conservative limits
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(10 * time.Second)
+	logger.Debug("openDBDirect: Connection limits set")
 
 	// Test connection with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	logger.Debug("openDBDirect: About to test connection with ping")
 	err = db.PingContext(ctx)
 	if err != nil {
+		logger.Error("openDBDirect: Ping failed: %v", err)
 		db.Close()
 		return nil, fmt.Errorf("PostgreSQL direct connection test failed: %w", err)
 	}
+	logger.Debug("openDBDirect: Connection test successful")
 
 	return db, nil
 }
