@@ -68,11 +68,11 @@ type MSSQLInfo struct {
 	AlwaysOn    *AlwaysOnMetrics // Detailed AlwaysOn metrics
 }
 
-// NewMSSQLCollector yeni bir MSSQLCollector oluşturur
+// NewMSSQLCollector creates a new MSSQL collector with rate limiting
 func NewMSSQLCollector(cfg *config.AgentConfig) *MSSQLCollector {
 	return &MSSQLCollector{
 		cfg:                cfg,
-		collectionInterval: 30 * time.Second, // Minimum 30 seconds between collections
+		collectionInterval: 25 * time.Second, // Reduced from 30s to 25s to prevent conflict with 30s periodic reporting
 		maxRetries:         3,
 		backoffDuration:    5 * time.Second,
 		isHealthy:          true,
@@ -3335,7 +3335,7 @@ func (c *MSSQLCollector) checkHealth() {
 		}
 		c.isHealthy = true
 		logger.Debug("MSSQL health check passed - collector is healthy")
-		c.collectionInterval = 30 * time.Second // Reset to normal interval
+		c.collectionInterval = 25 * time.Second // Reset to optimized interval to prevent timing conflicts
 	}
 }
 
@@ -3377,7 +3377,7 @@ func (c *MSSQLCollector) ForceHealthCheck() {
 func (c *MSSQLCollector) ResetToHealthy() {
 	if c != nil {
 		c.isHealthy = true
-		c.collectionInterval = 30 * time.Second
+		c.collectionInterval = 25 * time.Second // Reduced from 30s to prevent timing conflicts with periodic reporting
 		c.lastHealthCheck = time.Now()
 		c.lastCollectionTime = time.Time{} // Reset to allow immediate collection
 		logger.Info("MSSQL collector forcefully reset to healthy state")
@@ -3495,7 +3495,7 @@ func init() {
 			collectorMutex.Lock()
 			if defaultMSSQLCollector == nil {
 				defaultMSSQLCollector = &MSSQLCollector{
-					collectionInterval: 30 * time.Second,
+					collectionInterval: 25 * time.Second, // Reduced from 30s to prevent timing conflicts
 					maxRetries:         3,
 					backoffDuration:    5 * time.Second,
 					isHealthy:          true,
@@ -3510,7 +3510,7 @@ func init() {
 	// Initialize default collector - will be updated when config is available
 	collectorMutex.Lock()
 	defaultMSSQLCollector = &MSSQLCollector{
-		collectionInterval: 30 * time.Second,
+		collectionInterval: 25 * time.Second, // Reduced from 30s to prevent timing conflicts with 30s periodic reporting
 		maxRetries:         3,
 		backoffDuration:    5 * time.Second,
 		isHealthy:          true,
@@ -3552,7 +3552,7 @@ func EnsureDefaultCollector() {
 				logger.Error("PANIC in EnsureDefaultCollector: %v", r)
 				// Create minimal collector as fallback
 				defaultMSSQLCollector = &MSSQLCollector{
-					collectionInterval: 30 * time.Second,
+					collectionInterval: 25 * time.Second, // Reduced from 30s to prevent timing conflicts
 					maxRetries:         3,
 					backoffDuration:    5 * time.Second,
 					isHealthy:          true,
@@ -3563,7 +3563,7 @@ func EnsureDefaultCollector() {
 		}()
 
 		defaultMSSQLCollector = &MSSQLCollector{
-			collectionInterval: 30 * time.Second,
+			collectionInterval: 25 * time.Second, // Reduced from 30s to prevent timing conflicts with 30s periodic reporting
 			maxRetries:         3,
 			backoffDuration:    5 * time.Second,
 			isHealthy:          true,
