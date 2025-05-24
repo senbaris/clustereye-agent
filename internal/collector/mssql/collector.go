@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb" // MSSQL driver
@@ -25,6 +26,13 @@ import (
 
 // Windows platformu için gerekli paketleri koşullu olarak yükleyeceğiz
 var useWMI = runtime.GOOS == "windows"
+
+// Global collector instance for backward compatibility and thread safety
+var defaultMSSQLCollector *MSSQLCollector
+var collectorMutex sync.RWMutex // Thread-safe access to collector instance
+
+// Global collector instance management functions for thread safety
+var startupRecoveryOnce sync.Once // Prevent multiple startup recovery goroutines
 
 // MSSQLCollector mssql için veri toplama yapısı
 type MSSQLCollector struct {
@@ -74,6 +82,23 @@ func NewMSSQLCollector(cfg *config.AgentConfig) *MSSQLCollector {
 
 // GetClient returns a SQL Server connection
 func (c *MSSQLCollector) GetClient() (*sql.DB, error) {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetClient: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
 	var connStr string
 
 	// Connection string components
@@ -145,6 +170,23 @@ func (c *MSSQLCollector) GetClient() (*sql.DB, error) {
 
 // GetMSSQLStatus checks if SQL Server service is running by checking if the configured host:port is accessible
 func (c *MSSQLCollector) GetMSSQLStatus() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetMSSQLStatus: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
 	// First try to establish a DB connection
 	db, err := c.GetClient()
 	if err == nil {
@@ -192,6 +234,23 @@ func (c *MSSQLCollector) GetMSSQLStatus() string {
 
 // GetMSSQLVersion returns SQL Server version information
 func (c *MSSQLCollector) GetMSSQLVersion() (string, string) {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetMSSQLVersion: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
 	db, err := c.GetClient()
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
@@ -236,6 +295,48 @@ func (c *MSSQLCollector) GetMSSQLVersion() (string, string) {
 
 // GetNodeStatus returns the node's role in HA configuration
 func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
+	// Comprehensive debug logging
+	logger.Debug("GetNodeStatus: Starting function")
+
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+	logger.Debug("GetNodeStatus: EnsureDefaultCollector completed")
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetNodeStatus: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("GetNodeStatus STACK TRACE: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+				logger.Error("GetNodeStatus: Marked collector as unhealthy after panic")
+			} else {
+				logger.Error("GetNodeStatus: Collector is nil after panic!")
+			}
+		}
+	}()
+
+	// Check collector state
+	collector := GetDefaultCollectorSafe()
+	if collector == nil {
+		logger.Error("GetNodeStatus: Collector is nil, attempting re-initialization")
+		EnsureDefaultCollector()
+		collector = GetDefaultCollectorSafe()
+		if collector == nil {
+			logger.Error("GetNodeStatus: Collector still nil after re-initialization")
+			return "UNKNOWN", false
+		}
+	}
+	logger.Debug("GetNodeStatus: Collector state validated")
+
 	// Önce önbellekteki bilgileri kontrol et
 	haStateKey := "mssql_ha_state"
 
@@ -243,9 +344,10 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 	haState, hasHAState := c.getHAStateFromCache(haStateKey)
 
 	// Bağlantı dene
+	logger.Debug("GetNodeStatus: About to call GetClient")
 	db, err := c.GetClient()
 	if err != nil {
-		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+		logger.Error("GetNodeStatus: Database connection failed: %v", err)
 
 		// Önbellekte HA bilgisi varsa onu kullan
 		if hasHAState {
@@ -255,11 +357,21 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 
 		return "STANDALONE", false
 	}
-	defer db.Close()
+	defer func() {
+		logger.Debug("GetNodeStatus: Closing database connection")
+		if closeErr := db.Close(); closeErr != nil {
+			logger.Error("GetNodeStatus: Error closing DB: %v", closeErr)
+		}
+	}()
+	logger.Debug("GetNodeStatus: Database connection established")
 
 	// Check if AlwaysOn is enabled
 	var isHAEnabled int
-	err = db.QueryRow(`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	logger.Debug("GetNodeStatus: About to execute IsHadrEnabled query")
+	err = db.QueryRowContext(ctx, `
 		SELECT CASE 
 			WHEN SERVERPROPERTY('IsHadrEnabled') = 1 THEN 1
 			ELSE 0
@@ -275,7 +387,8 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 
 	// If AlwaysOn is enabled, check if this is a primary or secondary replica with a more reliable query
 	var role string
-	err = db.QueryRow(`
+	logger.Debug("GetNodeStatus: About to execute role query")
+	err = db.QueryRowContext(ctx, `
 		SELECT
 			CASE WHEN dm_hadr_availability_replica_states.role_desc IS NULL THEN 'UNKNOWN'
 			     ELSE dm_hadr_availability_replica_states.role_desc 
@@ -290,7 +403,7 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 		log.Printf("Node role could not be determined: %v", err)
 
 		// Fallback için alternatif sorgu
-		err = db.QueryRow(`
+		err = db.QueryRowContext(ctx, `
 			SELECT CASE 
 				WHEN EXISTS (
 					SELECT 1 FROM sys.dm_hadr_availability_replica_states ars
@@ -306,6 +419,7 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 		}
 	}
 
+	logger.Debug("GetNodeStatus: Query completed, role=%s", role)
 	log.Printf("Node rolü tespit edildi: %s", role)
 	return role, true
 }
@@ -3136,22 +3250,74 @@ func (c *MSSQLCollector) IsHealthy() bool {
 	return c.isHealthy
 }
 
-// checkHealth performs a simple health check
+// checkHealth performs a simple health check - INDEPENDENT of rate limiting
 func (c *MSSQLCollector) checkHealth() {
 	c.lastHealthCheck = time.Now()
 
-	// Simple connectivity test
-	db, err := c.GetClient()
+	// CRITICAL: Health check must be independent of rate limiting to allow recovery
+	// Don't use c.GetClient() because it might check rate limiting
+	cfg, err := config.LoadAgentConfig()
 	if err != nil {
 		c.isHealthy = false
-		logger.Warning("Health check failed - marking collector as unhealthy: %v", err)
-		// Increase collection interval when unhealthy
+		logger.Warning("MSSQL health check failed - config load error: %v", err)
 		c.collectionInterval = 2 * time.Minute
 		return
 	}
 
-	// Quick test query
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Direct connection for health check - bypass all rate limiting
+	var connStr string
+	host := cfg.MSSQL.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := cfg.MSSQL.Port
+	if port == "" {
+		port = "1433"
+	}
+
+	instance := cfg.MSSQL.Instance
+	database := cfg.MSSQL.Database
+	if database == "" {
+		database = "master"
+	}
+
+	// Build connection string for health check
+	if cfg.MSSQL.WindowsAuth {
+		if instance != "" {
+			connStr = fmt.Sprintf("server=%s\\%s;database=%s;trusted_connection=yes;connection timeout=3", host, instance, database)
+		} else {
+			connStr = fmt.Sprintf("server=%s,%s;database=%s;trusted_connection=yes;connection timeout=3", host, port, database)
+		}
+	} else {
+		if instance != "" {
+			connStr = fmt.Sprintf("server=%s\\%s;user id=%s;password=%s;database=%s;connection timeout=3",
+				host, instance, cfg.MSSQL.User, cfg.MSSQL.Pass, database)
+		} else {
+			connStr = fmt.Sprintf("server=%s,%s;user id=%s;password=%s;database=%s;connection timeout=3",
+				host, port, cfg.MSSQL.User, cfg.MSSQL.Pass, database)
+		}
+	}
+
+	if cfg.MSSQL.TrustCert {
+		connStr += ";trustservercertificate=true"
+	}
+
+	db, err := sql.Open("sqlserver", connStr)
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("MSSQL health check failed - connection open error: %v", err)
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Set minimal connection limits for health check
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(5 * time.Second)
+
+	// Quick test query with very short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	var result int
@@ -3160,11 +3326,15 @@ func (c *MSSQLCollector) checkHealth() {
 
 	if err != nil {
 		c.isHealthy = false
-		logger.Warning("Health check query failed - marking collector as unhealthy: %v", err)
+		logger.Warning("MSSQL health check query failed - marking collector as unhealthy: %v", err)
 		c.collectionInterval = 2 * time.Minute
 	} else {
+		// RECOVERY: If we were unhealthy, log recovery
+		if !c.isHealthy {
+			logger.Info("MSSQL collector RECOVERED - marking as healthy")
+		}
 		c.isHealthy = true
-		logger.Debug("Health check passed - collector is healthy")
+		logger.Debug("MSSQL health check passed - collector is healthy")
 		c.collectionInterval = 30 * time.Second // Reset to normal interval
 	}
 }
@@ -3313,4 +3483,154 @@ func (c *MSSQLCollector) getLastKnownGoodInfo() *MSSQLInfo {
 
 	logger.Debug("Returned cached/rate-limited info to prevent overload")
 	return info
+}
+
+// Global collector instance management functions for thread safety
+func init() {
+	// Initialize default collector with panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in MSSQL collector init(): %v", r)
+			// Try to create a minimal collector as last resort
+			collectorMutex.Lock()
+			if defaultMSSQLCollector == nil {
+				defaultMSSQLCollector = &MSSQLCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+			}
+			collectorMutex.Unlock()
+			log.Printf("MSSQL collector init() recovered from panic")
+		}
+	}()
+
+	// Initialize default collector - will be updated when config is available
+	collectorMutex.Lock()
+	defaultMSSQLCollector = &MSSQLCollector{
+		collectionInterval: 30 * time.Second,
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+	}
+	collectorMutex.Unlock()
+	log.Printf("MSSQL default collector initialized in init() with thread safety")
+
+	// DON'T perform startup recovery automatically in init()
+	// Let the agent explicitly decide when to start collector based on platform
+	// This prevents MSSQL collector from starting in PostgreSQL agents
+	log.Printf("MSSQL collector init() completed - startup recovery will be triggered by agent if needed")
+}
+
+// EnsureDefaultCollector ensures the default collector is initialized (thread-safe)
+func EnsureDefaultCollector() {
+	// First quick read-only check
+	collectorMutex.RLock()
+	if defaultMSSQLCollector != nil {
+		logger.Debug("EnsureDefaultCollector: Collector already exists")
+		collectorMutex.RUnlock()
+		return
+	}
+	collectorMutex.RUnlock()
+
+	logger.Debug("EnsureDefaultCollector: Collector is nil, acquiring write lock")
+
+	// Need to create new collector
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+
+	// Double-check in case another goroutine created it
+	if defaultMSSQLCollector == nil {
+		logger.Warning("EnsureDefaultCollector: Creating new collector - this should only happen once")
+
+		// Try to create with proper recovery
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("PANIC in EnsureDefaultCollector: %v", r)
+				// Create minimal collector as fallback
+				defaultMSSQLCollector = &MSSQLCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+				logger.Error("EnsureDefaultCollector: Created fallback collector after panic")
+			}
+		}()
+
+		defaultMSSQLCollector = &MSSQLCollector{
+			collectionInterval: 30 * time.Second,
+			maxRetries:         3,
+			backoffDuration:    5 * time.Second,
+			isHealthy:          true,
+			lastHealthCheck:    time.Now(),
+		}
+		logger.Info("EnsureDefaultCollector: Successfully created new collector")
+	} else {
+		logger.Debug("EnsureDefaultCollector: Another goroutine already created collector")
+	}
+}
+
+// GetDefaultCollectorSafe returns the default collector in a thread-safe manner
+func GetDefaultCollectorSafe() *MSSQLCollector {
+	// Implement panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetDefaultCollectorSafe: %v", r)
+		}
+	}()
+
+	collectorMutex.RLock()
+	defer collectorMutex.RUnlock()
+
+	if defaultMSSQLCollector == nil {
+		logger.Error("GetDefaultCollectorSafe: Collector is nil - this should not happen!")
+		return nil
+	}
+
+	logger.Debug("GetDefaultCollectorSafe: Returning healthy collector")
+	return defaultMSSQLCollector
+}
+
+// UpdateDefaultMSSQLCollector updates the default collector with proper config (thread-safe)
+func UpdateDefaultMSSQLCollector(cfg *config.AgentConfig) {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+	defaultMSSQLCollector = NewMSSQLCollector(cfg)
+	log.Printf("MSSQL default collector updated with new config (thread-safe)")
+
+	// Perform startup recovery ONLY ONCE to prevent multiple goroutines and race conditions
+	// This prevents the request storm issue when agent restarts
+	startupRecoveryOnce.Do(func() {
+		go func() {
+			// Wait a bit for initialization to complete
+			time.Sleep(1 * time.Second)
+
+			// Re-acquire the collector safely
+			collectorMutex.RLock()
+			collector := defaultMSSQLCollector
+			collectorMutex.RUnlock()
+
+			if collector != nil {
+				// Check if this is a MSSQL agent before running startup recovery
+				if cfg.MSSQL.Host == "" {
+					log.Printf("MSSQL collector update: No MSSQL config found, skipping startup recovery for non-MSSQL agent")
+					return
+				}
+
+				log.Printf("MSSQL collector performing ONE-TIME startup recovery after config update...")
+				collector.StartupRecovery()
+				log.Printf("MSSQL collector one-time startup recovery completed")
+			}
+		}()
+	})
+}
+
+// GetDefaultMSSQLCollector returns the default collector instance (thread-safe)
+func GetDefaultMSSQLCollector() *MSSQLCollector {
+	return GetDefaultCollectorSafe()
 }

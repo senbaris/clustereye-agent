@@ -655,31 +655,10 @@ func init() {
 	collectorMutex.Unlock()
 	log.Printf("PostgreSQL default collector initialized in init() with thread safety")
 
-	// Perform immediate startup recovery in background - ONLY for PostgreSQL agents
-	go func() {
-		// Wait for a short time to ensure initialization is complete
-		time.Sleep(500 * time.Millisecond)
-
-		// Check if this is a PostgreSQL agent before running startup recovery
-		if defaultPostgresCollector != nil {
-			// Check platform from config before running PostgreSQL startup recovery
-			cfg, err := config.LoadAgentConfig()
-			if err != nil {
-				log.Printf("PostgreSQL collector init: Config load failed, skipping startup recovery: %v", err)
-				return
-			}
-
-			// Check if this agent is configured for PostgreSQL
-			// If PostgreSQL config exists and has proper settings, this is likely a PostgreSQL agent
-			if cfg.PostgreSQL.Host == "" || cfg.PostgreSQL.User == "" {
-				log.Printf("PostgreSQL collector init: No PostgreSQL config found, skipping startup recovery for non-PostgreSQL agent")
-				return
-			}
-
-			log.Printf("PostgreSQL collector performing immediate startup recovery...")
-			defaultPostgresCollector.StartupRecovery()
-		}
-	}()
+	// DON'T perform startup recovery automatically in init()
+	// Let the agent explicitly decide when to start collector based on platform
+	// This prevents PostgreSQL collector from starting in MSSQL agents
+	log.Printf("PostgreSQL collector init() completed - startup recovery will be triggered by agent if needed")
 }
 
 // EnsureDefaultCollector ensures the default collector is initialized (thread-safe)

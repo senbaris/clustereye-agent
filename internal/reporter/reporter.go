@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
@@ -32,6 +33,10 @@ import (
 	"github.com/senbaris/clustereye-agent/pkg/utils"
 	"google.golang.org/grpc/backoff"
 )
+
+// Global reporter instance management for thread safety
+var globalReporter *Reporter
+var reporterMutex sync.RWMutex
 
 // QueryProcessor, sorgu işleme mantığını temsil eder
 type QueryProcessor struct {
@@ -425,6 +430,11 @@ type Reporter struct {
 	lastHealthCheck        time.Time
 	consecutiveFailures    int
 	maxConsecutiveFailures int
+
+	// Thread-safe periodic reporting control
+	periodicReportingOnce sync.Once    // Prevent multiple periodic reporting goroutines
+	isPeriodicRunning     bool         // Track if periodic reporting is running
+	periodicMutex         sync.RWMutex // Protect periodic reporting state
 }
 
 // NewReporter yeni bir Reporter örneği oluşturur
@@ -440,7 +450,41 @@ func NewReporter(cfg *config.AgentConfig) *Reporter {
 		lastHealthCheck:        time.Now(),
 		consecutiveFailures:    0,
 		maxConsecutiveFailures: 3,
+
+		// Initialize thread-safe periodic reporting control
+		isPeriodicRunning: false,
 	}
+}
+
+// GetGlobalReporter returns the global reporter instance (thread-safe)
+func GetGlobalReporter(cfg *config.AgentConfig) *Reporter {
+	// First try with read lock
+	reporterMutex.RLock()
+	if globalReporter != nil {
+		reporterMutex.RUnlock()
+		return globalReporter
+	}
+	reporterMutex.RUnlock()
+
+	// Need to create new reporter
+	reporterMutex.Lock()
+	defer reporterMutex.Unlock()
+
+	// Double-check in case another goroutine created it
+	if globalReporter == nil {
+		log.Printf("Creating new global reporter instance")
+		globalReporter = NewReporter(cfg)
+	}
+
+	return globalReporter
+}
+
+// UpdateGlobalReporter updates the global reporter instance (thread-safe)
+func UpdateGlobalReporter(cfg *config.AgentConfig) {
+	reporterMutex.Lock()
+	defer reporterMutex.Unlock()
+	globalReporter = NewReporter(cfg)
+	log.Printf("Global reporter instance updated")
 }
 
 // CanConnect checks if enough time has passed since last connection attempt
@@ -688,7 +732,11 @@ func (r *Reporter) SendMSSQLInfo() error {
 
 	// MSSQL kolektörünü oluştur
 	log.Printf("MSSQL bilgileri toplanıyor...")
-	collector := mssql.NewMSSQLCollector(r.cfg)
+	// Thread-safe global MSSQL kolektörünü kullan - already initialized in AgentRegistration
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		return fmt.Errorf("MSSQL collector could not be initialized")
+	}
 
 	// MSSQL bilgilerini al
 	mssqlInfo := collector.GetMSSQLInfo()
@@ -842,6 +890,31 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 
 		// Periyodik raporlamayı başlat
 		r.StartPeriodicReporting(30*time.Second, platform)
+
+		// Platform-specific collector startup recovery
+		log.Printf("Starting platform-specific collector initialization for: %s", platform)
+		if platform == "postgres" {
+			// PostgreSQL collector startup recovery
+			log.Printf("Initializing PostgreSQL collector...")
+			postgres.UpdateDefaultPostgresCollector(r.cfg)
+			if collector := postgres.GetDefaultPostgresCollector(); collector != nil {
+				collector.StartupRecovery()
+				log.Printf("PostgreSQL collector startup recovery completed")
+			} else {
+				log.Printf("PostgreSQL collector initialization failed")
+			}
+		} else if platform == "mssql" {
+			// MSSQL collector startup recovery
+			log.Printf("Initializing MSSQL collector...")
+			mssql.UpdateDefaultMSSQLCollector(r.cfg)
+			if collector := mssql.GetDefaultMSSQLCollector(); collector != nil {
+				// UpdateDefaultMSSQLCollector already handles startup recovery with sync.Once
+				// No need to call StartupRecovery again to avoid duplicate goroutines
+				log.Printf("MSSQL collector initialization completed")
+			} else {
+				log.Printf("MSSQL collector initialization failed")
+			}
+		}
 
 		// Platform seçimine göre ilk bilgileri gönder
 		if platform == "postgres" {
@@ -3261,6 +3334,27 @@ func (r *Reporter) ListMongoLogs(ctx context.Context, req *pb.MongoLogListReques
 
 // StartPeriodicReporting periyodik raporlamayı başlatır
 func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform string) {
+	// Check if periodic reporting is already running (thread-safe)
+	r.periodicMutex.RLock()
+	isRunning := r.isPeriodicRunning
+	r.periodicMutex.RUnlock()
+
+	if isRunning {
+		log.Printf("Periodic reporting is already running for platform: %s, skipping duplicate", platform)
+		return
+	}
+
+	// Set running state (thread-safe)
+	r.periodicMutex.Lock()
+	if r.isPeriodicRunning {
+		// Double-check after acquiring lock
+		r.periodicMutex.Unlock()
+		log.Printf("Periodic reporting was started by another goroutine for platform: %s", platform)
+		return
+	}
+	r.isPeriodicRunning = true
+	r.periodicMutex.Unlock()
+
 	// Önceki timer varsa durdur
 	if r.reportTicker != nil {
 		r.reportTicker.Stop()
@@ -3269,8 +3363,16 @@ func (r *Reporter) StartPeriodicReporting(interval time.Duration, platform strin
 	// Yeni bir timer başlat
 	r.reportTicker = time.NewTicker(interval)
 
-	// Timer için dinleme işlemi başlat
+	// Timer için dinleme işlemi başlat - ONLY ONE GOROUTINE
 	go func() {
+		defer func() {
+			// Cleanup when goroutine exits
+			r.periodicMutex.Lock()
+			r.isPeriodicRunning = false
+			r.periodicMutex.Unlock()
+			log.Printf("Periodic reporting goroutine exited for platform: %s", platform)
+		}()
+
 		for {
 			select {
 			case <-r.reportTicker.C:
@@ -4260,8 +4362,16 @@ func (p *MSSQLQueryProcessor) processExplainMSSQLQuery(query string, database st
 	// İşlem başlangıç zamanını kaydet
 	startTime := time.Now()
 
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(p.cfg)
+	// Thread-safe global MSSQL kolektörünü kullan
+	mssql.UpdateDefaultMSSQLCollector(p.cfg)
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		log.Printf("[ERROR] MSSQL collector could not be initialized")
+		return map[string]interface{}{
+			"status":  "error",
+			"message": "MSSQL collector could not be initialized",
+		}
+	}
 
 	// MSSQL bağlantısını aç
 	db, err := collector.GetClient()
@@ -4400,7 +4510,7 @@ SET STATISTICS XML OFF;`, query)
 				return createBasicPlanXML(query, database, startTime)
 			}
 
-			log.Printf("[DEBUG] XML plan başarıyla okundu, uzunluk: %d karakterr", len(xmlPlan))
+			log.Printf("[DEBUG] XML plan başarıyla okundu, uzunluk: %d karakter", len(xmlPlan))
 		} else {
 			log.Printf("[WARN] İkinci result sette satır yok")
 			return createBasicPlanXML(query, database, startTime)
@@ -4485,8 +4595,16 @@ func (p *MSSQLQueryProcessor) processMSSQLQuery(command string, database string)
 	// İşlem başlangıç zamanını kaydet
 	startTime := time.Now()
 
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(p.cfg)
+	// Thread-safe global MSSQL kolektörünü kullan
+	mssql.UpdateDefaultMSSQLCollector(p.cfg)
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		log.Printf("[ERROR] MSSQL collector could not be initialized")
+		return map[string]interface{}{
+			"status":  "error",
+			"message": "MSSQL collector could not be initialized",
+		}
+	}
 
 	// MSSQL bağlantısını aç
 	db, err := collector.GetClient()

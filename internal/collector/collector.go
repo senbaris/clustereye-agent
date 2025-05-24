@@ -160,8 +160,13 @@ func (c *Collector) collectMongoData() (*model.MongoDBData, error) {
 // collectMSSQLData MSSQL verilerini toplar
 func (c *Collector) collectMSSQLData() (*model.MSSQLData, error) {
 	// Şimdilik basit bir durum kontrolü yapalım
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(c.cfg)
+	// Thread-safe global MSSQL kolektörünü kullan
+	mssql.UpdateDefaultMSSQLCollector(c.cfg)
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		log.Printf("MSSQL collector could not be initialized")
+		return &model.MSSQLData{Status: "error"}, nil
+	}
 
 	// Bağlantıyı test et
 	db, err := collector.GetClient()
@@ -214,8 +219,14 @@ func (c *Collector) TestMongoConnection() (string, error) {
 
 // TestMSSQLConnection MSSQL bağlantısını test eder
 func (c *Collector) TestMSSQLConnection() string {
-	// MSSQL kolektörünü oluştur
-	collector := mssql.NewMSSQLCollector(c.cfg)
+	// Thread-safe global MSSQL kolektörünü kullan
+	mssql.UpdateDefaultMSSQLCollector(c.cfg)
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		errMsg := "fail:collector_initialization_error"
+		log.Printf("MSSQL collector could not be initialized")
+		return errMsg
+	}
 
 	// Bağlantıyı test et
 	db, err := collector.GetClient()
