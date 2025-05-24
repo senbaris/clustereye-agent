@@ -140,11 +140,11 @@ func (c *PostgresCollector) ShouldSkipCollection() bool {
 		return true
 	}
 
-	// Check health but allow periodic recovery attempts
+	// Check health but allow more frequent recovery attempts
 	if !c.IsHealthy() {
-		// If we've been unhealthy for more than 5 minutes, try a recovery
-		if time.Since(c.lastHealthCheck) > 5*time.Minute {
-			logger.Info("PostgreSQL collector has been unhealthy for 5+ minutes, attempting recovery...")
+		// AGGRESSIVE RECOVERY: Try recovery every 2 minutes instead of 5
+		if time.Since(c.lastHealthCheck) > 2*time.Minute {
+			logger.Info("PostgreSQL collector has been unhealthy for 2+ minutes, attempting aggressive recovery...")
 			c.ForceHealthCheck()
 
 			// If still unhealthy after forced check, skip collection
@@ -160,6 +160,40 @@ func (c *PostgresCollector) ShouldSkipCollection() bool {
 	}
 
 	return false
+}
+
+// ResetToHealthy forces the collector to healthy state - useful for startup recovery
+func (c *PostgresCollector) ResetToHealthy() {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+
+	if c != nil {
+		c.isHealthy = true
+		c.collectionInterval = 30 * time.Second
+		c.lastHealthCheck = time.Now()
+		c.lastCollectionTime = time.Time{} // Reset to allow immediate collection
+		logger.Info("PostgreSQL collector forcefully reset to healthy state")
+	}
+}
+
+// StartupRecovery performs recovery checks at agent startup
+func (c *PostgresCollector) StartupRecovery() {
+	logger.Info("PostgreSQL collector performing startup recovery check...")
+
+	// Give it 3 attempts at startup
+	for i := 0; i < 3; i++ {
+		c.ForceHealthCheck()
+		if c.isHealthy {
+			logger.Info("PostgreSQL collector startup recovery successful on attempt %d", i+1)
+			return
+		}
+		logger.Warning("PostgreSQL collector startup recovery attempt %d failed, retrying...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	// If all attempts failed, force reset to healthy
+	logger.Warning("PostgreSQL collector startup recovery failed after 3 attempts, forcing healthy state")
+	c.ResetToHealthy()
 }
 
 // openDB creates a database connection with proper timeouts and limits
@@ -474,6 +508,15 @@ func UpdateDefaultPostgresCollector(cfg *config.AgentConfig) {
 	defer collectorMutex.Unlock()
 	defaultPostgresCollector = NewPostgresCollector(cfg)
 	log.Printf("PostgreSQL default collector updated with new config (thread-safe)")
+
+	// Perform startup recovery to ensure collector starts healthy
+	go func() {
+		// Wait a bit for initialization to complete
+		time.Sleep(1 * time.Second)
+		if defaultPostgresCollector != nil {
+			defaultPostgresCollector.StartupRecovery()
+		}
+	}()
 }
 
 // GetDefaultPostgresCollector returns the default collector instance (thread-safe)

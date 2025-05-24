@@ -3099,12 +3099,63 @@ func (c *MSSQLCollector) ShouldSkipCollection() bool {
 		return true
 	}
 
+	// Check health but allow more frequent recovery attempts
 	if !c.IsHealthy() {
-		logger.Debug("Skipping collection due to unhealthy state")
-		return true
+		// AGGRESSIVE RECOVERY: Try recovery every 2 minutes instead of 5
+		if time.Since(c.lastHealthCheck) > 2*time.Minute {
+			logger.Info("MSSQL collector has been unhealthy for 2+ minutes, attempting aggressive recovery...")
+			c.ForceHealthCheck()
+
+			// If still unhealthy after forced check, skip collection
+			if !c.isHealthy {
+				logger.Debug("MSSQL recovery attempt failed, skipping collection")
+				return true
+			}
+			logger.Info("MSSQL collector successfully recovered!")
+		} else {
+			logger.Debug("Skipping MSSQL collection due to unhealthy state")
+			return true
+		}
 	}
 
 	return false
+}
+
+// ForceHealthCheck forces an immediate health check - useful for recovery
+func (c *MSSQLCollector) ForceHealthCheck() {
+	logger.Info("MSSQL collector forcing health check for recovery")
+	c.checkHealth()
+}
+
+// ResetToHealthy forces the collector to healthy state - useful for startup recovery
+func (c *MSSQLCollector) ResetToHealthy() {
+	if c != nil {
+		c.isHealthy = true
+		c.collectionInterval = 30 * time.Second
+		c.lastHealthCheck = time.Now()
+		c.lastCollectionTime = time.Time{} // Reset to allow immediate collection
+		logger.Info("MSSQL collector forcefully reset to healthy state")
+	}
+}
+
+// StartupRecovery performs recovery checks at agent startup
+func (c *MSSQLCollector) StartupRecovery() {
+	logger.Info("MSSQL collector performing startup recovery check...")
+
+	// Give it 3 attempts at startup
+	for i := 0; i < 3; i++ {
+		c.ForceHealthCheck()
+		if c.isHealthy {
+			logger.Info("MSSQL collector startup recovery successful on attempt %d", i+1)
+			return
+		}
+		logger.Warning("MSSQL collector startup recovery attempt %d failed, retrying...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	// If all attempts failed, force reset to healthy
+	logger.Warning("MSSQL collector startup recovery failed after 3 attempts, forcing healthy state")
+	c.ResetToHealthy()
 }
 
 // getLastKnownGoodInfo returns the last cached information to avoid excessive DB calls

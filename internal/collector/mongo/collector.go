@@ -18,6 +18,7 @@ import (
 
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -143,7 +144,12 @@ func (c *MongoCollector) GetMongoStatus() string {
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in GetMongoStatus: %v", r)
+			logger.Error("PANIC in GetMongoStatus: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("MongoDB GetMongoStatus STACK TRACE: %s", string(buf[:n]))
+
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
@@ -154,6 +160,7 @@ func (c *MongoCollector) GetMongoStatus() string {
 
 	// Check rate limiting
 	if c.ShouldSkipCollection() {
+		logger.Debug("MongoDB GetMongoStatus: Rate limited, returning")
 		return "RATE_LIMITED"
 	}
 
@@ -172,13 +179,14 @@ func (c *MongoCollector) GetMongoStatus() string {
 	address := fmt.Sprintf("%s:%s", host, port)
 	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
-		log.Printf("MongoDB at %s is not accessible: %v", address, err)
+		logger.Warning("MongoDB at %s is not accessible: %v", address, err)
 		return "FAIL!"
 	}
 	if conn != nil {
 		conn.Close()
 	}
 
+	logger.Debug("MongoDB service at %s is running", address)
 	return "RUNNING"
 }
 
@@ -187,7 +195,12 @@ func (c *MongoCollector) GetMongoVersion() string {
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in GetMongoVersion: %v", r)
+			logger.Error("PANIC in GetMongoVersion: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("MongoDB GetMongoVersion STACK TRACE: %s", string(buf[:n]))
+
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
@@ -198,109 +211,163 @@ func (c *MongoCollector) GetMongoVersion() string {
 
 	// Check rate limiting
 	if c.ShouldSkipCollection() {
+		logger.Debug("MongoDB GetMongoVersion: Rate limited, returning")
 		return "Rate Limited"
 	}
 
+	logger.Debug("MongoDB GetMongoVersion: Getting version info")
 	client, err := c.openDBDirect() // Use direct connection for version check
 	if err != nil {
-		log.Printf("MongoDB bağlantısı kurulamadı: %v", err)
+		logger.Error("MongoDB GetMongoVersion: Connection failed: %v", err)
 		return "Unknown"
 	}
 	defer func() {
 		if err := client.Disconnect(context.Background()); err != nil {
-			log.Printf("MongoDB bağlantısı kapatılamadı: %v", err)
+			logger.Error("MongoDB GetMongoVersion: Error closing connection: %v", err)
 		}
 	}()
 
 	// BuildInfo'yu çalıştır
+	logger.Debug("MongoDB GetMongoVersion: Running buildInfo command")
 	buildInfo, err := c.runAdminCommand(client, bson.D{{Key: "buildInfo", Value: 1}})
 	if err != nil {
-		log.Printf("BuildInfo komutu çalıştırılamadı: %v", err)
+		logger.Error("MongoDB GetMongoVersion: buildInfo command failed: %v", err)
 		return "Unknown"
 	}
 
 	// Versiyon bilgisini al
 	version, ok := buildInfo["version"].(string)
 	if !ok {
-		log.Printf("Versiyon bilgisi string değil")
+		logger.Error("MongoDB GetMongoVersion: version field is not a string")
 		return "Unknown"
 	}
 
+	logger.Debug("MongoDB GetMongoVersion: Found version: %s", version)
 	return version
 }
 
 // GetNodeStatus MongoDB node'un durumunu döndürür (PRIMARY, SECONDARY, ARBITER vs.)
 func (c *MongoCollector) GetNodeStatus() string {
-	client, err := c.OpenDB()
-	if err != nil {
-		log.Printf("MongoDB bağlantısı kurulamadı: %v", err)
-		return "Unknown"
-	}
+	// Comprehensive debug logging
+	logger.Debug("MongoDB GetNodeStatus: Starting function")
+
+	// Implement panic recovery to prevent crash
 	defer func() {
-		if err := client.Disconnect(context.Background()); err != nil {
-			log.Printf("MongoDB bağlantısı kapatılamadı: %v", err)
+		if r := recover(); r != nil {
+			logger.Error("PANIC in MongoDB GetNodeStatus: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("MongoDB GetNodeStatus STACK TRACE: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+				logger.Error("MongoDB GetNodeStatus: Marked collector as unhealthy after panic")
+			}
 		}
 	}()
 
-	// İlk olarak serverStatus komutunu çalıştır - bu bize bağlı olduğumuz node'un bilgisini verecek
-	serverStatus, err := c.runAdminCommand(client, bson.D{{Key: "serverStatus", Value: 1}})
+	// Check rate limiting
+	if c.ShouldSkipCollection() {
+		logger.Debug("MongoDB GetNodeStatus: Rate limited, returning")
+		return "Rate Limited"
+	}
+	logger.Debug("MongoDB GetNodeStatus: Rate limiting check passed")
+
+	logger.Debug("MongoDB GetNodeStatus: About to open database connection")
+	client, err := c.OpenDB()
 	if err != nil {
-		log.Printf("serverStatus komutu çalıştırılamadı: %v", err)
+		logger.Error("MongoDB GetNodeStatus: Database connection failed: %v", err)
 		return "Unknown"
 	}
+	if client == nil {
+		logger.Error("MongoDB GetNodeStatus: Database client is nil")
+		return "Unknown"
+	}
+	defer func() {
+		logger.Debug("MongoDB GetNodeStatus: Closing database connection")
+		if err := client.Disconnect(context.Background()); err != nil {
+			logger.Error("MongoDB GetNodeStatus: Error closing connection: %v", err)
+		}
+	}()
+	logger.Debug("MongoDB GetNodeStatus: Database connection established")
+
+	// İlk olarak serverStatus komutunu çalıştır - bu bize bağlı olduğumuz node'un bilgisini verecek
+	logger.Debug("MongoDB GetNodeStatus: Running serverStatus command")
+	serverStatus, err := c.runAdminCommand(client, bson.D{{Key: "serverStatus", Value: 1}})
+	if err != nil {
+		logger.Error("MongoDB GetNodeStatus: serverStatus command failed: %v", err)
+		return "Unknown"
+	}
+	logger.Debug("MongoDB GetNodeStatus: serverStatus command completed")
 
 	// replSetGetStatus komutunu çalıştır
+	logger.Debug("MongoDB GetNodeStatus: Running replSetGetStatus command")
 	status, err := c.runAdminCommand(client, bson.D{{Key: "replSetGetStatus", Value: 1}})
 	if err != nil {
-		log.Printf("replSetGetStatus komutu çalıştırılamadı: %v", err)
+		logger.Warning("MongoDB GetNodeStatus: replSetGetStatus command failed: %v", err)
+		logger.Debug("MongoDB GetNodeStatus: Returning STANDALONE")
 		return "STANDALONE"
 	}
+	logger.Debug("MongoDB GetNodeStatus: replSetGetStatus command completed")
 
 	// Şimdiki bağlantının MongoDB instance bilgilerini alıyoruz
 	process, ok := serverStatus["process"].(string)
 	if !ok {
-		log.Printf("process bilgisi bulunamadı")
+		logger.Warning("MongoDB GetNodeStatus: process info not found")
 		process = "mongod"
 	}
 
 	host, ok := serverStatus["host"].(string)
 	if !ok {
-		log.Printf("host bilgisi bulunamadı")
+		logger.Warning("MongoDB GetNodeStatus: host info not found")
 		host = "localhost"
 	}
+	logger.Debug("MongoDB GetNodeStatus: Current host: %s, process: %s", host, process)
 
 	// myState değerini doğrudan almaya çalış
 	if replication, ok := status["myState"]; ok {
 		state, ok := replication.(int32)
 		if ok {
+			logger.Debug("MongoDB GetNodeStatus: Found myState: %d", state)
 			switch state {
 			case 1:
+				logger.Debug("MongoDB GetNodeStatus: Returning PRIMARY")
 				return "PRIMARY"
 			case 2:
+				logger.Debug("MongoDB GetNodeStatus: Returning SECONDARY")
 				return "SECONDARY"
 			case 7:
+				logger.Debug("MongoDB GetNodeStatus: Returning ARBITER")
 				return "ARBITER"
 			default:
-				return fmt.Sprintf("STATE_%d", state)
+				stateStr := fmt.Sprintf("STATE_%d", state)
+				logger.Debug("MongoDB GetNodeStatus: Returning %s", stateStr)
+				return stateStr
 			}
 		}
 	}
 
 	// myState yoksa members içinde arama yapalım
+	logger.Debug("MongoDB GetNodeStatus: myState not found, searching in members")
 	members, ok := status["members"].(bson.A)
 	if !ok {
-		log.Printf("members dizisi bulunamadı")
+		logger.Warning("MongoDB GetNodeStatus: members array not found")
 		return "Unknown"
 	}
 
 	// Process ID ve host bilgisine göre kendimizi bulalım
 	currentHost := fmt.Sprintf("%s", host)
-	log.Printf("Mevcut MongoDB host: %s, process: %s", currentHost, process)
+	logger.Debug("MongoDB GetNodeStatus: Searching for current host: %s in members", currentHost)
 
 	// Tüm member'ları dönerek durumu bulalım
-	for _, member := range members {
+	for i, member := range members {
+		logger.Debug("MongoDB GetNodeStatus: Checking member %d", i)
 		memberDoc, ok := member.(bson.D)
 		if !ok {
+			logger.Debug("MongoDB GetNodeStatus: Member %d is not a document", i)
 			continue
 		}
 		memberMap := memberDoc.Map()
@@ -308,54 +375,73 @@ func (c *MongoCollector) GetNodeStatus() string {
 		// Host bilgisini kontrol et
 		memberHost, ok := memberMap["name"].(string)
 		if !ok {
+			logger.Debug("MongoDB GetNodeStatus: Member %d has no name field", i)
 			continue
 		}
+		logger.Debug("MongoDB GetNodeStatus: Member %d host: %s", i, memberHost)
 
 		// StateStr varsa direkt onu kullan
 		if stateStr, ok := memberMap["stateStr"].(string); ok {
-			log.Printf("MongoDB node %s durumu: %s", memberHost, stateStr)
+			logger.Debug("MongoDB GetNodeStatus: Member %s state: %s", memberHost, stateStr)
 		}
 
 		// Kendimizi kontrol et (host name'e göre)
 		if strings.Contains(memberHost, currentHost) || strings.Contains(currentHost, memberHost) {
+			logger.Debug("MongoDB GetNodeStatus: Found current member: %s", memberHost)
+
 			// StateStr varsa direkt onu kullan
 			if stateStr, ok := memberMap["stateStr"].(string); ok {
+				logger.Debug("MongoDB GetNodeStatus: Returning stateStr: %s", stateStr)
 				return stateStr
 			}
 
 			// State değerine göre durum belirle
 			state, ok := memberMap["state"].(int32)
 			if !ok {
+				logger.Debug("MongoDB GetNodeStatus: Member has no state field")
 				continue
 			}
 
+			logger.Debug("MongoDB GetNodeStatus: Found state: %d", state)
 			switch state {
 			case 1:
+				logger.Debug("MongoDB GetNodeStatus: Returning PRIMARY")
 				return "PRIMARY"
 			case 2:
+				logger.Debug("MongoDB GetNodeStatus: Returning SECONDARY")
 				return "SECONDARY"
 			case 7:
+				logger.Debug("MongoDB GetNodeStatus: Returning ARBITER")
 				return "ARBITER"
 			default:
-				return fmt.Sprintf("STATE_%d", state)
+				stateStr := fmt.Sprintf("STATE_%d", state)
+				logger.Debug("MongoDB GetNodeStatus: Returning %s", stateStr)
+				return stateStr
 			}
 		}
 	}
 
 	// Son çare - isMaster komutu ile durumu kontrol et
+	logger.Debug("MongoDB GetNodeStatus: Trying isMaster command as fallback")
 	isMaster, err := c.runAdminCommand(client, bson.D{{Key: "isMaster", Value: 1}})
 	if err == nil {
 		if ismaster, ok := isMaster["ismaster"].(bool); ok && ismaster {
+			logger.Debug("MongoDB GetNodeStatus: isMaster returned PRIMARY")
 			return "PRIMARY"
 		}
 		if secondary, ok := isMaster["secondary"].(bool); ok && secondary {
+			logger.Debug("MongoDB GetNodeStatus: isMaster returned SECONDARY")
 			return "SECONDARY"
 		}
 		if arbiterOnly, ok := isMaster["arbiterOnly"].(bool); ok && arbiterOnly {
+			logger.Debug("MongoDB GetNodeStatus: isMaster returned ARBITER")
 			return "ARBITER"
 		}
+	} else {
+		logger.Error("MongoDB GetNodeStatus: isMaster command failed: %v", err)
 	}
 
+	logger.Debug("MongoDB GetNodeStatus: Returning Unknown")
 	return "Unknown"
 }
 
@@ -624,7 +710,7 @@ func (c *MongoCollector) getTotalvCpu() int32 {
 		cmd = exec.Command("sh", "-c", "lscpu | grep 'CPU(s):' | head -n 1 | awk '{print $2}'")
 		out, err = cmd.Output()
 		if err != nil {
-			log.Printf("vCPU sayısı alınamadı: %v", err)
+			logger.Warning("MongoDB getTotalvCpu: vCPU sayısı alınamadı: %v", err)
 			return 0
 		}
 	}
@@ -632,7 +718,7 @@ func (c *MongoCollector) getTotalvCpu() int32 {
 	// Çıktıyı int32'ye çevir
 	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
 	if err != nil {
-		log.Printf("vCPU sayısı parse edilemedi: %v", err)
+		logger.Warning("MongoDB getTotalvCpu: vCPU sayısı parse edilemedi: %v", err)
 		return 0
 	}
 
@@ -649,7 +735,7 @@ func (c *MongoCollector) getTotalMemory() int64 {
 		cmd = exec.Command("sh", "-c", "free -b | grep 'Mem:' | awk '{print $2}'")
 		out, err = cmd.Output()
 		if err != nil {
-			log.Printf("Toplam RAM miktarı alınamadı: %v", err)
+			logger.Warning("MongoDB getTotalMemory: Toplam RAM miktarı alınamadı: %v", err)
 			return 0
 		}
 	}
@@ -658,7 +744,7 @@ func (c *MongoCollector) getTotalMemory() int64 {
 	// /proc/meminfo'dan alınan değer KB cinsindendir, byte'a çevirmek için 1024 ile çarp
 	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
-		log.Printf("Toplam RAM miktarı parse edilemedi: %v", err)
+		logger.Warning("MongoDB getTotalMemory: Toplam RAM miktarı parse edilemedi: %v", err)
 		return 0
 	}
 
@@ -674,7 +760,7 @@ func (c *MongoCollector) getTotalMemory() int64 {
 func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 	// Check if we should skip collection due to rate limiting or health issues
 	if c.ShouldSkipCollection() {
-		log.Printf("MongoDB collection skipped due to rate limiting or health checks")
+		logger.Debug("MongoDB collection skipped due to rate limiting or health checks")
 		return c.getLastKnownGoodInfo() // Return cached info instead
 	}
 
@@ -684,11 +770,11 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in GetMongoInfo: %v", r)
+			logger.Error("PANIC in GetMongoInfo: %v", r)
 			// Log call stack for better debugging
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
-			log.Printf("STACK: %s", string(buf[:n]))
+			logger.Error("MongoDB GetMongoInfo STACK: %s", string(buf[:n]))
 
 			// Mark as unhealthy after panic
 			c.isHealthy = false
@@ -696,7 +782,7 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		}
 	}()
 
-	log.Printf("MongoDB bilgileri toplanmaya başlanıyor...")
+	logger.Info("MongoDB bilgileri toplanmaya başlanıyor...")
 
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
@@ -725,7 +811,7 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		ConfigPath:     configPath,
 	}
 
-	log.Printf("MongoDB bilgileri başarıyla toplandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
+	logger.Info("MongoDB bilgileri başarıyla toplandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
 		info.Port, info.MongoStatus, info.MongoVersion, info.TotalvCpu, info.TotalMemory, info.ConfigPath)
 
 	return info
@@ -736,7 +822,7 @@ func (c *MongoCollector) getLocalIP() string {
 	cmd := exec.Command("sh", "-c", "hostname -I | awk '{print $1}'")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("IP adresi alınamadı: %v", err)
+		logger.Warning("MongoDB getLocalIP: IP adresi alınamadı: %v", err)
 		return "Unknown"
 	}
 	return strings.TrimSpace(string(out))
@@ -1893,7 +1979,7 @@ func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, e
 // CanCollect checks if enough time has passed since last collection to prevent rate limiting
 func (c *MongoCollector) CanCollect() bool {
 	if time.Since(c.lastCollectionTime) < c.collectionInterval {
-		log.Printf("MongoDB Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
+		logger.Debug("MongoDB Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
 		return false
 	}
 	return true
@@ -1913,38 +1999,76 @@ func (c *MongoCollector) IsHealthy() bool {
 	return c.isHealthy
 }
 
-// checkHealth performs a simple health check
+// checkHealth performs a simple health check - INDEPENDENT of rate limiting
 func (c *MongoCollector) checkHealth() {
 	c.lastHealthCheck = time.Now()
 
-	// Simple connectivity test
-	client, err := c.openDBDirect()
+	// CRITICAL: Health check must be independent of rate limiting to allow recovery
+	// Don't use c.openDBDirect() if it checks ShouldSkipCollection
+	logger.Debug("MongoDB checkHealth: Starting health check")
+
+	// Direct MongoDB connection for health check - bypass all rate limiting
+	uri := fmt.Sprintf("mongodb://%s:%s@%s:%s/?directConnection=true&connectTimeoutMS=3000&serverSelectionTimeoutMS=3000&maxPoolSize=1",
+		c.cfg.Mongo.User,
+		c.cfg.Mongo.Pass,
+		c.cfg.Mongo.Host,
+		c.cfg.Mongo.Port,
+	)
+
+	// Auth bilgileri boşsa, kimlik doğrulama olmadan bağlan
+	if !c.cfg.Mongo.Auth {
+		uri = fmt.Sprintf("mongodb://%s:%s/?directConnection=true&connectTimeoutMS=3000&serverSelectionTimeoutMS=3000&maxPoolSize=1",
+			c.cfg.Mongo.Host, c.cfg.Mongo.Port)
+	}
+
+	clientOptions := options.Client().ApplyURI(uri)
+
+	// Minimal connection settings for health check
+	clientOptions.SetMaxPoolSize(1)
+	clientOptions.SetMinPoolSize(1)
+	clientOptions.SetMaxConnIdleTime(5 * time.Second)
+	clientOptions.SetConnectTimeout(3 * time.Second)
+	clientOptions.SetServerSelectionTimeout(3 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
 		c.isHealthy = false
-		log.Printf("MongoDB health check failed - marking collector as unhealthy: %v", err)
-		// Increase collection interval when unhealthy
+		logger.Warning("MongoDB health check failed - connection error: %v", err)
 		c.collectionInterval = 2 * time.Minute
 		return
 	}
 
-	// Quick test ping
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Quick test ping with very short timeout
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pingCancel()
 
-	err = client.Ping(ctx, readpref.Primary())
+	err = client.Ping(pingCtx, readpref.Primary())
 	if client != nil {
 		client.Disconnect(ctx)
 	}
 
 	if err != nil {
 		c.isHealthy = false
-		log.Printf("MongoDB health check ping failed - marking collector as unhealthy: %v", err)
+		logger.Warning("MongoDB health check ping failed - marking collector as unhealthy: %v", err)
 		c.collectionInterval = 2 * time.Minute
 	} else {
+		// RECOVERY: If we were unhealthy, log recovery
+		if !c.isHealthy {
+			logger.Info("MongoDB collector RECOVERED - marking as healthy")
+		}
 		c.isHealthy = true
-		log.Printf("MongoDB health check passed - collector is healthy")
+		logger.Debug("MongoDB health check passed - collector is healthy")
 		c.collectionInterval = 30 * time.Second // Reset to normal interval
 	}
+}
+
+// ForceHealthCheck forces an immediate health check - useful for recovery
+func (c *MongoCollector) ForceHealthCheck() {
+	logger.Info("MongoDB collector forcing health check for recovery")
+	c.checkHealth()
 }
 
 // ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
@@ -1953,9 +2077,23 @@ func (c *MongoCollector) ShouldSkipCollection() bool {
 		return true
 	}
 
+	// Check health but allow more frequent recovery attempts
 	if !c.IsHealthy() {
-		log.Printf("Skipping MongoDB collection due to unhealthy state")
-		return true
+		// AGGRESSIVE RECOVERY: Try recovery every 2 minutes instead of 5
+		if time.Since(c.lastHealthCheck) > 2*time.Minute {
+			logger.Info("MongoDB collector has been unhealthy for 2+ minutes, attempting aggressive recovery...")
+			c.ForceHealthCheck()
+
+			// If still unhealthy after forced check, skip collection
+			if !c.isHealthy {
+				logger.Debug("MongoDB recovery attempt failed, skipping collection")
+				return true
+			}
+			logger.Info("MongoDB collector successfully recovered!")
+		} else {
+			logger.Debug("Skipping MongoDB collection due to unhealthy state")
+			return true
+		}
 	}
 
 	return false
@@ -2022,4 +2160,35 @@ func (c *MongoCollector) getLastKnownGoodInfo() *MongoInfo {
 
 	log.Printf("Returned cached/rate-limited MongoDB info to prevent overload")
 	return info
+}
+
+// ResetToHealthy forces the collector to healthy state - useful for startup recovery
+func (c *MongoCollector) ResetToHealthy() {
+	if c != nil {
+		c.isHealthy = true
+		c.collectionInterval = 30 * time.Second
+		c.lastHealthCheck = time.Now()
+		c.lastCollectionTime = time.Time{} // Reset to allow immediate collection
+		logger.Info("MongoDB collector forcefully reset to healthy state")
+	}
+}
+
+// StartupRecovery performs recovery checks at agent startup
+func (c *MongoCollector) StartupRecovery() {
+	logger.Info("MongoDB collector performing startup recovery check...")
+
+	// Give it 3 attempts at startup
+	for i := 0; i < 3; i++ {
+		c.ForceHealthCheck()
+		if c.isHealthy {
+			logger.Info("MongoDB collector startup recovery successful on attempt %d", i+1)
+			return
+		}
+		logger.Warning("MongoDB collector startup recovery attempt %d failed, retrying...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	// If all attempts failed, force reset to healthy
+	logger.Warning("MongoDB collector startup recovery failed after 3 attempts, forcing healthy state")
+	c.ResetToHealthy()
 }
