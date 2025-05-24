@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -18,7 +19,313 @@ import (
 	_ "github.com/lib/pq"
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
 	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger"
 )
+
+// PostgresCollector represents a PostgreSQL collector with rate limiting and circuit breaker
+type PostgresCollector struct {
+	cfg                *config.AgentConfig
+	lastCollectionTime time.Time
+	collectionInterval time.Duration
+	maxRetries         int
+	backoffDuration    time.Duration
+	isHealthy          bool
+	lastHealthCheck    time.Time
+}
+
+// NewPostgresCollector creates a new PostgreSQL collector with rate limiting
+func NewPostgresCollector(cfg *config.AgentConfig) *PostgresCollector {
+	return &PostgresCollector{
+		cfg:                cfg,
+		collectionInterval: 30 * time.Second, // Minimum 30 seconds between collections
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+	}
+}
+
+// CanCollect checks if enough time has passed since last collection to prevent rate limiting
+func (c *PostgresCollector) CanCollect() bool {
+	if time.Since(c.lastCollectionTime) < c.collectionInterval {
+		logger.Debug("PostgreSQL Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
+		return false
+	}
+	return true
+}
+
+// SetCollectionTime updates the last collection time
+func (c *PostgresCollector) SetCollectionTime() {
+	c.lastCollectionTime = time.Now()
+}
+
+// IsHealthy returns the current health state
+func (c *PostgresCollector) IsHealthy() bool {
+	// Check health every 2 minutes
+	if time.Since(c.lastHealthCheck) > 2*time.Minute {
+		c.checkHealth()
+	}
+	return c.isHealthy
+}
+
+// checkHealth performs a simple health check
+func (c *PostgresCollector) checkHealth() {
+	c.lastHealthCheck = time.Now()
+
+	// Simple connectivity test
+	db, err := c.openDB()
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check failed - marking collector as unhealthy: %v", err)
+		// Increase collection interval when unhealthy
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Quick test query
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var result int
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
+	db.Close()
+
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check query failed - marking collector as unhealthy: %v", err)
+		c.collectionInterval = 2 * time.Minute
+	} else {
+		c.isHealthy = true
+		logger.Debug("PostgreSQL health check passed - collector is healthy")
+		c.collectionInterval = 30 * time.Second // Reset to normal interval
+	}
+}
+
+// ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
+func (c *PostgresCollector) ShouldSkipCollection() bool {
+	if !c.CanCollect() {
+		return true
+	}
+
+	if !c.IsHealthy() {
+		logger.Debug("Skipping PostgreSQL collection due to unhealthy state")
+		return true
+	}
+
+	return false
+}
+
+// openDB creates a database connection with proper timeouts and limits
+func (c *PostgresCollector) openDB() (*sql.DB, error) {
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=10",
+		c.cfg.PostgreSQL.Host,
+		c.cfg.PostgreSQL.Port,
+		c.cfg.PostgreSQL.User,
+		c.cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("PostgreSQL connection failed: %w", err)
+	}
+
+	// Set connection pool limits to prevent resource exhaustion
+	db.SetMaxOpenConns(2)                   // Maximum 2 concurrent connections
+	db.SetMaxIdleConns(1)                   // Keep maximum 1 idle connection
+	db.SetConnMaxLifetime(30 * time.Second) // Close connections after 30 seconds
+	db.SetConnMaxIdleTime(10 * time.Second) // Close idle connections after 10 seconds
+
+	// Test the connection with a shorter timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("PostgreSQL connection test failed: %w", err)
+	}
+
+	return db, nil
+}
+
+// GetPostgresInfo collects PostgreSQL information with rate limiting protection
+func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
+	// Check if we should skip collection due to rate limiting or health issues
+	if c.ShouldSkipCollection() {
+		logger.Debug("PostgreSQL collection skipped due to rate limiting or health checks")
+		return c.getLastKnownGoodInfo() // Return cached info instead
+	}
+
+	// Update collection time at the start to prevent concurrent collections
+	c.SetCollectionTime()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPostgresInfo: %v", r)
+			// Log call stack for better debugging
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("STACK: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic
+			c.isHealthy = false
+			c.collectionInterval = 5 * time.Minute // Increase interval significantly
+		}
+	}()
+
+	logger.Info("PostgreSQL bilgileri toplanmaya başlanıyor...")
+
+	// Get hostname
+	hostname, _ := os.Hostname()
+
+	// Create info object with rate-limited wrapper functions
+	info := map[string]interface{}{
+		"hostname":              hostname,
+		"service_status":        c.getServiceStatus(),
+		"version":               c.getVersion(),
+		"node_status":           c.getNodeStatus(),
+		"replication_lag":       c.getReplicationLag(),
+		"total_memory":          c.getTotalMemory(),
+		"total_vcpu":            c.getTotalvCpu(),
+		"cluster_name":          c.cfg.PostgreSQL.Cluster,
+		"location":              c.cfg.PostgreSQL.Location,
+		"ip":                    c.getLocalIP(),
+		"config_path":           c.getConfigPath(),
+		"data_path":             c.getDataPath(),
+		"timestamp":             time.Now().Unix(),
+		"collection_successful": true,
+	}
+
+	logger.Info("PostgreSQL bilgileri başarıyla toplandı. Status=%s, Version=%s",
+		info["service_status"], info["version"])
+
+	return info
+}
+
+// getLastKnownGoodInfo returns cached information to avoid excessive DB calls
+func (c *PostgresCollector) getLastKnownGoodInfo() map[string]interface{} {
+	hostname, _ := os.Hostname()
+
+	return map[string]interface{}{
+		"hostname":        hostname,
+		"service_status":  "RATE_LIMITED",
+		"version":         "Rate Limited",
+		"node_status":     "Rate Limited",
+		"replication_lag": 0.0,
+		"total_memory":    GetTotalMemory(),
+		"total_vcpu":      GetTotalvCpu(),
+		"cluster_name":    c.cfg.PostgreSQL.Cluster,
+		"location":        c.cfg.PostgreSQL.Location,
+		"ip":              c.getLocalIP(),
+		"timestamp":       time.Now().Unix(),
+		"rate_limited":    true,
+	}
+}
+
+// Wrapper methods that use rate limiting
+func (c *PostgresCollector) getServiceStatus() string {
+	// Use existing GetPGServiceStatus function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getServiceStatus: %v", r)
+			c.isHealthy = false
+		}
+	}()
+
+	return GetPGServiceStatus()
+}
+
+func (c *PostgresCollector) getVersion() string {
+	// Use existing GetPGVersion function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getVersion: %v", r)
+			c.isHealthy = false
+		}
+	}()
+
+	return GetPGVersion()
+}
+
+func (c *PostgresCollector) getNodeStatus() string {
+	// Use existing GetNodeStatus function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getNodeStatus: %v", r)
+			c.isHealthy = false
+		}
+	}()
+
+	return GetNodeStatus()
+}
+
+func (c *PostgresCollector) getReplicationLag() float64 {
+	// Use existing GetReplicationLagSec function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getReplicationLag: %v", r)
+			c.isHealthy = false
+		}
+	}()
+
+	return GetReplicationLagSec()
+}
+
+func (c *PostgresCollector) getTotalMemory() int64 {
+	return GetTotalMemory()
+}
+
+func (c *PostgresCollector) getTotalvCpu() int32 {
+	return GetTotalvCpu()
+}
+
+func (c *PostgresCollector) getLocalIP() string {
+	// Simple IP detection
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "Unknown"
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+func (c *PostgresCollector) getConfigPath() string {
+	configPath, _ := FindPostgresConfigFile()
+	return configPath
+}
+
+func (c *PostgresCollector) getDataPath() string {
+	dataPath, _ := GetDataDirectory()
+	return dataPath
+}
+
+// Global collector instance for backward compatibility
+var defaultPostgresCollector *PostgresCollector
+
+func init() {
+	// Initialize default collector - will be updated when config is available
+	defaultPostgresCollector = &PostgresCollector{
+		collectionInterval: 30 * time.Second,
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+	}
+}
+
+// UpdateDefaultPostgresCollector updates the default collector with proper config
+func UpdateDefaultPostgresCollector(cfg *config.AgentConfig) {
+	defaultPostgresCollector = NewPostgresCollector(cfg)
+}
+
+// GetDefaultPostgresCollector returns the default collector instance
+func GetDefaultPostgresCollector() *PostgresCollector {
+	return defaultPostgresCollector
+}
 
 // PostgresLogFile PostgreSQL log dosyasını temsil eder
 type PostgresLogFile struct {
@@ -41,12 +348,34 @@ func (p *PostgresLogFile) ToProto() map[string]interface{} {
 
 // OpenDB veritabanı bağlantısını açar
 func OpenDB() (*sql.DB, error) {
+	// Check rate limiting first
+	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+		return nil, fmt.Errorf("PostgreSQL collection rate limited or collector unhealthy")
+	}
+
+	// Update collection time
+	if defaultPostgresCollector != nil {
+		defaultPostgresCollector.SetCollectionTime()
+	}
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in OpenDB: %v", r)
+			// Mark as unhealthy after panic
+			if defaultPostgresCollector != nil {
+				defaultPostgresCollector.isHealthy = false
+				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
 		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
 	}
 
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=10",
 		cfg.PostgreSQL.Host,
 		cfg.PostgreSQL.Port,
 		cfg.PostgreSQL.User,
@@ -54,10 +383,38 @@ func OpenDB() (*sql.DB, error) {
 		"postgres",
 	)
 
-	return sql.Open("postgres", connStr)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set connection pool limits to prevent resource exhaustion
+	db.SetMaxOpenConns(2)                   // Maximum 2 concurrent connections
+	db.SetMaxIdleConns(1)                   // Keep maximum 1 idle connection
+	db.SetConnMaxLifetime(30 * time.Second) // Close connections after 30 seconds
+	db.SetConnMaxIdleTime(10 * time.Second) // Close idle connections after 10 seconds
+
+	return db, nil
 }
 
 func GetPGServiceStatus() string {
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPGServiceStatus: %v", r)
+			// Mark as unhealthy after panic
+			if defaultPostgresCollector != nil {
+				defaultPostgresCollector.isHealthy = false
+				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+		return "RATE_LIMITED"
+	}
+
 	// Konfigürasyonu yükle
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
@@ -92,7 +449,24 @@ func GetPGServiceStatus() string {
 
 // GetPGVersion PostgreSQL versiyonunu döndürür
 func GetPGVersion() string {
-	db, err := OpenDB()
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPGVersion: %v", r)
+			// Mark as unhealthy after panic
+			if defaultPostgresCollector != nil {
+				defaultPostgresCollector.isHealthy = false
+				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+		return "Rate Limited"
+	}
+
+	db, err := openDBDirect() // Use direct connection for version check
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
 		return "Unknown"
@@ -100,7 +474,10 @@ func GetPGVersion() string {
 	defer db.Close()
 
 	var version string
-	err = db.QueryRow("SELECT version()").Scan(&version)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, "SELECT version()").Scan(&version)
 	if err != nil {
 		log.Printf("Versiyon bilgisi alınamadı: %v", err)
 		return "Unknown"
@@ -118,7 +495,24 @@ func GetPGVersion() string {
 
 // GetNodeStatus node'un master/slave durumunu döndürür
 func GetNodeStatus() string {
-	db, err := OpenDB()
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetNodeStatus: %v", r)
+			// Mark as unhealthy after panic
+			if defaultPostgresCollector != nil {
+				defaultPostgresCollector.isHealthy = false
+				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+		return "Rate Limited"
+	}
+
+	db, err := openDBDirect() // Use direct connection for status check
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
 		return "Unknown"
@@ -127,7 +521,10 @@ func GetNodeStatus() string {
 
 	// PostgreSQL 10 ve üzeri için
 	var inRecovery bool
-	err = db.QueryRow("SELECT pg_is_in_recovery()").Scan(&inRecovery)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery)
 	if err != nil {
 		log.Printf("Node durumu alınamadı: %v", err)
 		return "Unknown"
@@ -137,6 +534,34 @@ func GetNodeStatus() string {
 		return "SLAVE"
 	}
 	return "MASTER"
+}
+
+// openDBDirect creates a database connection without rate limiting for critical operations
+func openDBDirect() (*sql.DB, error) {
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
+	}
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=5",
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set conservative limits
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(10 * time.Second)
+
+	return db, nil
 }
 
 // convertSize bytes cinsinden boyutu okunabilir formata çevirir
@@ -222,7 +647,24 @@ func GetDataDirectory() (string, error) {
 
 // GetReplicationLagSec replication lag'i saniye cinsinden döndürür
 func GetReplicationLagSec() float64 {
-	db, err := OpenDB()
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetReplicationLagSec: %v", r)
+			// Mark as unhealthy after panic
+			if defaultPostgresCollector != nil {
+				defaultPostgresCollector.isHealthy = false
+				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+		return 0
+	}
+
+	db, err := openDBDirect() // Use direct connection for lag check
 	if err != nil {
 		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
 		return 0
@@ -230,12 +672,15 @@ func GetReplicationLagSec() float64 {
 	defer db.Close()
 
 	nodeStatus := GetNodeStatus()
-	if nodeStatus != "Slave" {
+	if nodeStatus != "SLAVE" {
 		return 0
 	}
 
 	var lag float64
-	err = db.QueryRow(`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, `
 		SELECT CASE 
 			WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() 
 			THEN 0 
@@ -262,78 +707,8 @@ func GetPGBouncerStatus() string {
 
 // GetSystemMetrics sistem metriklerini toplar
 func GetSystemMetrics() *pb.SystemMetrics {
-	// Windows veya Unix tabanlı sistemlere göre farklı fonksiyonları çağır
-	if runtime.GOOS == "windows" {
-		return getWindowsSystemMetrics()
-	}
-
 	// Unix/Linux/macOS sistemler için mevcut implementasyon
 	return getUnixSystemMetrics()
-}
-
-// getWindowsSystemMetrics Windows işletim sistemlerinden sistem metriklerini toplar
-func getWindowsSystemMetrics() *pb.SystemMetrics {
-	metrics := &pb.SystemMetrics{}
-
-	// CPU kullanımı
-	cpuPercent, err := getWindowsCPUUsage()
-	if err == nil {
-		metrics.CpuUsage = cpuPercent
-	} else {
-		log.Printf("Windows CPU kullanımı alınamadı: %v", err)
-	}
-
-	// CPU çekirdek sayısı
-	cpuCores, err := getWindowsCPUCores()
-	if err == nil {
-		metrics.CpuCores = cpuCores
-	} else {
-		log.Printf("Windows CPU çekirdek sayısı alınamadı: %v", err)
-	}
-
-	// Windows'ta doğrudan Load Average kavramı yok, ancak benzer bir şey hesaplayabiliriz
-	// CPU kullanımını farklı aralıklarla ölçerek
-	metrics.LoadAverage_1M = metrics.CpuUsage / 100 // 0-1 aralığına normalize et
-	metrics.LoadAverage_5M = metrics.CpuUsage / 100
-	metrics.LoadAverage_15M = metrics.CpuUsage / 100
-
-	// RAM kullanımı
-	ramUsage, err := getWindowsRAMUsage()
-	if err == nil {
-		metrics.TotalMemory = ramUsage["total_mb"].(int64)
-		metrics.FreeMemory = ramUsage["free_mb"].(int64)
-		metrics.MemoryUsage = ramUsage["usage_percent"].(float64)
-	} else {
-		log.Printf("Windows RAM kullanımı alınamadı: %v", err)
-	}
-
-	// Disk kullanımı
-	diskUsage, err := getWindowsDiskUsage()
-	if err == nil {
-		metrics.TotalDisk = diskUsage["total_gb"].(int64)
-		metrics.FreeDisk = diskUsage["avail_gb"].(int64)
-	} else {
-		log.Printf("Windows disk kullanımı alınamadı: %v", err)
-	}
-
-	// OS ve Kernel bilgileri
-	osInfo, err := getWindowsOSInfo()
-	if err == nil {
-		metrics.OsVersion = osInfo["os_version"]
-		metrics.KernelVersion = osInfo["kernel_version"]
-	} else {
-		log.Printf("Windows OS bilgileri alınamadı: %v", err)
-	}
-
-	// Uptime
-	uptime, err := getWindowsUptime()
-	if err == nil {
-		metrics.Uptime = uptime
-	} else {
-		log.Printf("Windows uptime bilgisi alınamadı: %v", err)
-	}
-
-	return metrics
 }
 
 // getUnixSystemMetrics Unix tabanlı işletim sistemlerinden (Linux, macOS) sistem metriklerini toplar
@@ -380,426 +755,6 @@ func getUnixSystemMetrics() *pb.SystemMetrics {
 	}
 
 	return metrics
-}
-
-// Windows için CPU kullanımı
-func getWindowsCPUUsage() (float64, error) {
-	// PowerShell kullanarak CPU kullanımını al
-	cmd := exec.Command("powershell", "-Command", "Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average")
-	out, err := cmd.Output()
-	if err != nil {
-		// Alternatif yöntem - WMIC
-		cmd = exec.Command("wmic", "cpu", "get", "loadpercentage")
-		out, err = cmd.Output()
-		if err != nil {
-			return 0, fmt.Errorf("Windows CPU kullanımı alınamadı: %v", err)
-		}
-
-		// WMIC çıktısını parse et
-		lines := strings.Split(string(out), "\n")
-		if len(lines) < 2 {
-			return 0, fmt.Errorf("Geçersiz WMIC çıktısı")
-		}
-
-		// İkinci satırı al (ilk satır başlık)
-		loadStr := strings.TrimSpace(lines[1])
-		load, err := strconv.ParseFloat(loadStr, 64)
-		if err != nil {
-			return 0, fmt.Errorf("CPU yükü parse edilemedi: %v", err)
-		}
-
-		return load, nil
-	}
-
-	// PowerShell çıktısını parse et
-	cpuPercent, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if err != nil {
-		return 0, fmt.Errorf("CPU yüzdesi parse edilemedi: %v", err)
-	}
-
-	return cpuPercent, nil
-}
-
-// Windows için CPU çekirdek sayısı
-func getWindowsCPUCores() (int32, error) {
-	// PowerShell kullanarak mantıksal işlemci sayısını al
-	cmd := exec.Command("powershell", "-Command", "(Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors")
-	out, err := cmd.Output()
-	if err != nil {
-		// Alternatif yöntem - WMIC
-		cmd = exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors")
-		out, err = cmd.Output()
-		if err != nil {
-			return 0, fmt.Errorf("CPU çekirdek sayısı alınamadı: %v", err)
-		}
-
-		// WMIC çıktısını parse et
-		lines := strings.Split(string(out), "\n")
-		if len(lines) < 2 {
-			return 0, fmt.Errorf("Geçersiz WMIC çıktısı")
-		}
-
-		// İkinci satırı al
-		coresStr := strings.TrimSpace(lines[1])
-		cores, err := strconv.ParseInt(coresStr, 10, 32)
-		if err != nil {
-			return 0, fmt.Errorf("CPU çekirdek sayısı parse edilemedi: %v", err)
-		}
-
-		return int32(cores), nil
-	}
-
-	// PowerShell çıktısını parse et
-	cores, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("CPU çekirdek sayısı parse edilemedi: %v", err)
-	}
-
-	return int32(cores), nil
-}
-
-// Windows için RAM kullanımı
-func getWindowsRAMUsage() (map[string]interface{}, error) {
-	var totalMB, freeMB, usedMB int64
-	var usagePercent float64
-
-	// PowerShell komutlarının çalışması için birden fazla yöntem deneyin
-	methods := []func() (int64, int64, error){
-		// Yöntem 1: Get-CimInstance kullanma
-		func() (int64, int64, error) {
-			cmd := exec.Command("powershell", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory")
-			out, err := cmd.Output()
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// PowerShell çıktısını parse et
-			lines := strings.Split(string(out), "\n")
-			if len(lines) < 3 {
-				return 0, 0, fmt.Errorf("Geçersiz bellek bilgisi çıktısı")
-			}
-
-			var totalMemKB, freeMemKB int64
-
-			// İlk satır başlık, ikinci satır boş, üçüncü satır değerler
-			valueLines := lines[2:]
-			for _, line := range valueLines {
-				if line == "" {
-					continue
-				}
-
-				// Değerleri ayır
-				values := strings.Fields(line)
-				if len(values) >= 2 {
-					totalMemKB, _ = strconv.ParseInt(values[0], 10, 64)
-					freeMemKB, _ = strconv.ParseInt(values[1], 10, 64)
-					break
-				}
-			}
-
-			// KB'den MB'ye çevir
-			totalMB := totalMemKB / 1024
-			freeMB := freeMemKB / 1024
-
-			// Sıfır kontrolü
-			if totalMB <= 0 || freeMB <= 0 {
-				return 0, 0, fmt.Errorf("Geçersiz bellek değerleri")
-			}
-
-			return totalMB, freeMB, nil
-		},
-		// Yöntem 2: WMIC ComputerSystem kullanma
-		func() (int64, int64, error) {
-			// Toplam fiziksel bellek
-			cmd := exec.Command("wmic", "ComputerSystem", "get", "TotalPhysicalMemory")
-			out, err := cmd.Output()
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Çıktıyı parse et
-			lines := strings.Split(string(out), "\n")
-			if len(lines) < 2 {
-				return 0, 0, fmt.Errorf("Geçersiz bellek bilgisi çıktısı")
-			}
-
-			// İkinci satırı al (ilk satır başlık)
-			memStr := strings.TrimSpace(lines[1])
-			totalBytes, err := strconv.ParseInt(memStr, 10, 64)
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Boş bellek için OS kullanma
-			cmd = exec.Command("wmic", "OS", "get", "FreePhysicalMemory")
-			out, err = cmd.Output()
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Çıktıyı parse et
-			lines = strings.Split(string(out), "\n")
-			if len(lines) < 2 {
-				return 0, 0, fmt.Errorf("Geçersiz boş bellek bilgisi çıktısı")
-			}
-
-			// İkinci satırı al
-			freeStr := strings.TrimSpace(lines[1])
-			freeKB, err := strconv.ParseInt(freeStr, 10, 64)
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Byte'dan MB'ye ve KB'den MB'ye çevir
-			totalMB := totalBytes / (1024 * 1024)
-			freeMB := freeKB / 1024
-
-			// Sıfır kontrolü
-			if totalMB <= 0 || freeMB <= 0 {
-				return 0, 0, fmt.Errorf("Geçersiz bellek değerleri")
-			}
-
-			return totalMB, freeMB, nil
-		},
-		// Yöntem 3: memory çiplerini toplama
-		func() (int64, int64, error) {
-			// Toplam RAM'i hafıza çiplerinden hesapla
-			cmd := exec.Command("wmic", "memorychip", "get", "Capacity")
-			out, err := cmd.Output()
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Çıktıyı parse et
-			lines := strings.Split(string(out), "\n")
-			if len(lines) < 2 {
-				return 0, 0, fmt.Errorf("Geçersiz memorychip çıktısı")
-			}
-
-			var totalBytes int64
-			// İlk satır başlık, diğer satırlar RAM modülleri
-			for i := 1; i < len(lines); i++ {
-				line := strings.TrimSpace(lines[i])
-				if line == "" {
-					continue
-				}
-
-				bytes, err := strconv.ParseInt(line, 10, 64)
-				if err != nil {
-					continue
-				}
-				totalBytes += bytes
-			}
-
-			if totalBytes <= 0 {
-				return 0, 0, fmt.Errorf("Geçersiz toplam bellek değeri")
-			}
-
-			// Boş bellek tahmini (genellikle toplam belleğin %25'i kadar)
-			// Daha doğru değer için OS'dan FreePhysicalMemory değerini almalıyız
-			totalMB := totalBytes / (1024 * 1024)
-			freeMB := totalMB / 4 // Yaklaşık tahmin
-
-			return totalMB, freeMB, nil
-		},
-		// Yöntem 4: Systeminformation kullanma (daha yeni PowerShell sürümleri için)
-		func() (int64, int64, error) {
-			cmd := exec.Command("powershell", "-Command", "Get-CimInstance -ClassName Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum | Select-Object -ExpandProperty Sum")
-			out, err := cmd.Output()
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Toplam RAM
-			totalBytes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-			if err != nil {
-				return 0, 0, err
-			}
-
-			// Boş RAM
-			cmd = exec.Command("powershell", "-Command", "[math]::Round((Get-Counter '\\Memory\\Available MBytes').CounterSamples.CookedValue)")
-			out, err = cmd.Output()
-			if err != nil {
-				// Sadece toplam RAM biliniyorsa, yaklaşık değer kullan
-				totalMB := totalBytes / (1024 * 1024)
-				freeMB := totalMB / 4 // Yaklaşık tahmin
-				return totalMB, freeMB, nil
-			}
-
-			freeMB, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-			if err != nil {
-				// Sadece toplam RAM biliniyorsa, yaklaşık değer kullan
-				totalMB := totalBytes / (1024 * 1024)
-				freeMB := totalMB / 4 // Yaklaşık tahmin
-				return totalMB, freeMB, nil
-			}
-
-			totalMB := totalBytes / (1024 * 1024)
-			return totalMB, freeMB, nil
-		},
-	}
-
-	// Tüm yöntemleri dene
-	var methodSuccess bool
-	for _, method := range methods {
-		total, free, methodErr := method()
-		if methodErr == nil && total > 0 && free > 0 {
-			totalMB = total
-			freeMB = free
-			methodSuccess = true
-			log.Printf("RAM bilgisi başarıyla alındı: %d MB toplam, %d MB boş", totalMB, freeMB)
-			break
-		}
-	}
-
-	// Tüm yöntemler başarısız olursa, düşük varsayılan değerler kullan
-	if !methodSuccess || totalMB <= 0 || freeMB <= 0 {
-		log.Printf("Windows RAM bilgisi alınamadı, varsayılan değerler kullanılıyor (4GB)")
-		totalMB = 4096 // 4GB
-		freeMB = 1024  // 1GB
-		usedMB = 3072  // 3GB
-		usagePercent = 75.0
-	} else {
-		// Kullanılan bellek ve yüzde hesapla
-		usedMB = totalMB - freeMB
-		usagePercent = (float64(usedMB) / float64(totalMB)) * 100
-	}
-
-	return map[string]interface{}{
-		"total_mb":      totalMB,
-		"free_mb":       freeMB,
-		"used_mb":       usedMB,
-		"usage_percent": usagePercent,
-	}, nil
-}
-
-// Windows için disk kullanımı
-func getWindowsDiskUsage() (map[string]interface{}, error) {
-	// PowerShell kullanarak C: sürücüsünün kullanımını al
-	cmd := exec.Command("powershell", "-Command", "Get-PSDrive C | Select-Object Used, Free")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("Disk kullanımı alınamadı: %v", err)
-	}
-
-	// PowerShell çıktısını parse et
-	lines := strings.Split(string(out), "\n")
-	if len(lines) < 3 {
-		return nil, fmt.Errorf("Geçersiz disk bilgisi çıktısı")
-	}
-
-	var usedBytes, freeBytes int64
-
-	// İlk satır başlık, ikinci satır boş, üçüncü satır değerler
-	valueLines := lines[2:]
-	for _, line := range valueLines {
-		if line == "" {
-			continue
-		}
-
-		// Değerleri ayır
-		values := strings.Fields(line)
-		if len(values) >= 2 {
-			usedBytes, _ = strconv.ParseInt(values[0], 10, 64)
-			freeBytes, _ = strconv.ParseInt(values[1], 10, 64)
-			break
-		}
-	}
-
-	// Bayt'tan GB'ye çevir
-	usedGB := usedBytes / (1024 * 1024 * 1024)
-	freeGB := freeBytes / (1024 * 1024 * 1024)
-	totalGB := usedGB + freeGB
-
-	return map[string]interface{}{
-		"total_gb": totalGB,
-		"used_gb":  usedGB,
-		"avail_gb": freeGB,
-	}, nil
-}
-
-// Windows için OS bilgileri
-func getWindowsOSInfo() (map[string]string, error) {
-	// Windows sürümünü al
-	cmd := exec.Command("powershell", "-Command", "(Get-CimInstance Win32_OperatingSystem).Caption")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("Windows sürümü alınamadı: %v", err)
-	}
-
-	osVersion := strings.TrimSpace(string(out))
-
-	// Build numarasını al
-	cmd = exec.Command("powershell", "-Command", "(Get-CimInstance Win32_OperatingSystem).BuildNumber")
-	out, err = cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("Windows build numarası alınamadı: %v", err)
-	}
-
-	buildNumber := strings.TrimSpace(string(out))
-
-	// Tam sürüm bilgisini oluştur
-	fullVersion := fmt.Sprintf("%s (Build %s)", osVersion, buildNumber)
-
-	return map[string]string{
-		"os_version":     fullVersion,
-		"kernel_version": buildNumber,
-	}, nil
-}
-
-// Windows için uptime
-func getWindowsUptime() (int64, error) {
-	// Son başlangıç zamanını al
-	cmd := exec.Command("powershell", "-Command", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime")
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("Son başlangıç zamanı alınamadı: %v", err)
-	}
-
-	// Çıktıyı parse et - WMI DateTime formatı: 20210920095731.123456+180
-	bootTimeStr := strings.TrimSpace(string(out))
-
-	// Şu anki zamanı al
-	now := time.Now()
-
-	// ParseDateTime fonksiyonu olmadığından, basit bir yöntem kullanarak tarih/saat bilgisini çıkar
-	// Format: YearMonthDayHourMinuteSecond.Milliseconds+Timezone
-	var bootTime time.Time
-
-	// Format dönüşümü için düzenli ifade
-	re := regexp.MustCompile(`(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})`)
-	matches := re.FindStringSubmatch(bootTimeStr)
-
-	if len(matches) >= 7 {
-		year, _ := strconv.Atoi(matches[1])
-		month, _ := strconv.Atoi(matches[2])
-		day, _ := strconv.Atoi(matches[3])
-		hour, _ := strconv.Atoi(matches[4])
-		minute, _ := strconv.Atoi(matches[5])
-		second, _ := strconv.Atoi(matches[6])
-
-		bootTime = time.Date(year, time.Month(month), day, hour, minute, second, 0, time.Local)
-	} else {
-		// Eğer parse edilemezse alternatif komut dene
-		cmd = exec.Command("powershell", "-Command", "(Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime | Select-Object -ExpandProperty TotalSeconds")
-		out, err = cmd.Output()
-		if err != nil {
-			return 0, fmt.Errorf("Uptime hesaplanamadı: %v", err)
-		}
-
-		uptimeSeconds, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-		if err != nil {
-			return 0, fmt.Errorf("Uptime parse edilemedi: %v", err)
-		}
-
-		return int64(uptimeSeconds), nil
-	}
-
-	// Uptime hesapla (saniye cinsinden)
-	uptimeDuration := now.Sub(bootTime)
-	uptimeSeconds := int64(uptimeDuration.Seconds())
-
-	return uptimeSeconds, nil
 }
 
 // getCPUUsage CPU kullanım yüzdesini döndürür

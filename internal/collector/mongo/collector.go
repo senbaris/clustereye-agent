@@ -26,13 +26,24 @@ import (
 
 // MongoCollector mongodb için veri toplama yapısı
 type MongoCollector struct {
-	cfg *config.AgentConfig
+	cfg                *config.AgentConfig
+	lastCollectionTime time.Time
+	collectionInterval time.Duration
+	maxRetries         int
+	backoffDuration    time.Duration
+	isHealthy          bool
+	lastHealthCheck    time.Time
 }
 
 // NewMongoCollector yeni bir MongoCollector oluşturur
 func NewMongoCollector(cfg *config.AgentConfig) *MongoCollector {
 	return &MongoCollector{
-		cfg: cfg,
+		cfg:                cfg,
+		collectionInterval: 30 * time.Second, // Minimum 30 seconds between collections
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
 	}
 }
 
@@ -66,21 +77,48 @@ type MongoServiceStatus struct {
 
 // OpenDB MongoDB bağlantısını açar
 func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
+	// Check rate limiting first
+	if c.ShouldSkipCollection() {
+		return nil, fmt.Errorf("MongoDB collection rate limited or collector unhealthy")
+	}
+
+	// Update collection time
+	c.SetCollectionTime()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in MongoDB OpenDB: %v", r)
+			// Mark as unhealthy after panic
+			c.isHealthy = false
+			c.collectionInterval = 5 * time.Minute
+		}
+	}()
+
 	// MongoDB URI oluştur
-	uri := fmt.Sprintf("mongodb://%s:%s@%s:%s/?directConnection=true",
+	uri := fmt.Sprintf("mongodb://%s:%s@%s:%s/?directConnection=true&connectTimeoutMS=10000&serverSelectionTimeoutMS=10000&maxPoolSize=2",
 		c.cfg.Mongo.User,
 		c.cfg.Mongo.Pass,
-		c.cfg.Mongo.Host, // Sunucunun adresini config'den al, şimdilik localhost
+		c.cfg.Mongo.Host,
 		c.cfg.Mongo.Port,
 	)
 
 	// Auth bilgileri boşsa, kimlik doğrulama olmadan bağlan
 	if !c.cfg.Mongo.Auth {
-		uri = fmt.Sprintf("mongodb://localhost:%s", c.cfg.Mongo.Port)
+		uri = fmt.Sprintf("mongodb://%s:%s/?directConnection=true&connectTimeoutMS=10000&serverSelectionTimeoutMS=10000&maxPoolSize=2",
+			c.cfg.Mongo.Host, c.cfg.Mongo.Port)
 	}
 
 	clientOptions := options.Client().ApplyURI(uri)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+	// Set connection pool limits to prevent resource exhaustion
+	clientOptions.SetMaxPoolSize(2)                           // Maximum 2 concurrent connections
+	clientOptions.SetMinPoolSize(1)                           // Keep minimum 1 connection
+	clientOptions.SetMaxConnIdleTime(30 * time.Second)        // Close idle connections after 30 seconds
+	clientOptions.SetConnectTimeout(10 * time.Second)         // Connection timeout
+	clientOptions.SetServerSelectionTimeout(10 * time.Second) // Server selection timeout
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, clientOptions)
@@ -88,8 +126,12 @@ func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
 		return nil, fmt.Errorf("MongoDB bağlantısı kurulamadı: %v", err)
 	}
 
-	// Bağlantıyı kontrol et
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
+	// Test the connection with a shorter timeout
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+
+	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
+		client.Disconnect(ctx)
 		return nil, fmt.Errorf("MongoDB ping başarısız: %v", err)
 	}
 
@@ -98,6 +140,23 @@ func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
 
 // GetMongoStatus checks if MongoDB service is running by checking if the configured host:port is accessible
 func (c *MongoCollector) GetMongoStatus() string {
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in GetMongoStatus: %v", r)
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if c.ShouldSkipCollection() {
+		return "RATE_LIMITED"
+	}
+
 	// Get MongoDB connection details from config
 	host := c.cfg.Mongo.Host
 	if host == "" {
@@ -125,7 +184,24 @@ func (c *MongoCollector) GetMongoStatus() string {
 
 // GetMongoVersion MongoDB versiyonunu döndürür
 func (c *MongoCollector) GetMongoVersion() string {
-	client, err := c.OpenDB()
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in GetMongoVersion: %v", r)
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
+	// Check rate limiting
+	if c.ShouldSkipCollection() {
+		return "Rate Limited"
+	}
+
+	client, err := c.openDBDirect() // Use direct connection for version check
 	if err != nil {
 		log.Printf("MongoDB bağlantısı kurulamadı: %v", err)
 		return "Unknown"
@@ -596,6 +672,32 @@ func (c *MongoCollector) getTotalMemory() int64 {
 
 // GetMongoInfo MongoDB bilgilerini toplar
 func (c *MongoCollector) GetMongoInfo() *MongoInfo {
+	// Check if we should skip collection due to rate limiting or health issues
+	if c.ShouldSkipCollection() {
+		log.Printf("MongoDB collection skipped due to rate limiting or health checks")
+		return c.getLastKnownGoodInfo() // Return cached info instead
+	}
+
+	// Update collection time at the start to prevent concurrent collections
+	c.SetCollectionTime()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in GetMongoInfo: %v", r)
+			// Log call stack for better debugging
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			log.Printf("STACK: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic
+			c.isHealthy = false
+			c.collectionInterval = 5 * time.Minute // Increase interval significantly
+		}
+	}()
+
+	log.Printf("MongoDB bilgileri toplanmaya başlanıyor...")
+
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
 	freeDisk, usagePercent := c.GetDiskUsage()
@@ -623,7 +725,7 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		ConfigPath:     configPath,
 	}
 
-	log.Printf("DEBUG: MongoDB bilgileri hazırlandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
+	log.Printf("MongoDB bilgileri başarıyla toplandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
 		info.Port, info.MongoStatus, info.MongoVersion, info.TotalvCpu, info.TotalMemory, info.ConfigPath)
 
 	return info
@@ -721,6 +823,18 @@ func (m *MongoInfo) ToProto() *pb.MongoInfo {
 
 // FindMongoLogFiles MongoDB log dosyalarını bulur ve listeler
 func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, error) {
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in FindMongoLogFiles: %v", r)
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
 	// MongoDB çalışıyor mu kontrol et
 	isMongoRunning := isMongoDBRunning()
 	if !isMongoRunning {
@@ -1543,6 +1657,18 @@ func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServic
 
 // PromoteToPrimary MongoDB standby node'unu primary'ye yükseltir
 func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet string) (string, error) {
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in PromoteToPrimary: %v", r)
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
 	log.Printf("MongoDB node stepDown başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
 		hostname, port, replicaSet)
 
@@ -1598,6 +1724,18 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 
 // FreezeMongoSecondary MongoDB secondary node'larında rs.freeze() komutunu çalıştırır
 func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replicaSet string, seconds int) (string, error) {
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in FreezeMongoSecondary: %v", r)
+			// Mark as unhealthy after panic
+			if c != nil {
+				c.isHealthy = false
+				c.collectionInterval = 5 * time.Minute
+			}
+		}
+	}()
+
 	log.Printf("MongoDB node freeze başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s, Seconds: %d",
 		hostname, port, replicaSet, seconds)
 
@@ -1750,4 +1888,138 @@ func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, e
 
 	// Tüm bölümleri birleştir
 	return strings.Join(planParts, "\n\n"), nil
+}
+
+// CanCollect checks if enough time has passed since last collection to prevent rate limiting
+func (c *MongoCollector) CanCollect() bool {
+	if time.Since(c.lastCollectionTime) < c.collectionInterval {
+		log.Printf("MongoDB Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
+		return false
+	}
+	return true
+}
+
+// SetCollectionTime updates the last collection time
+func (c *MongoCollector) SetCollectionTime() {
+	c.lastCollectionTime = time.Now()
+}
+
+// IsHealthy returns the current health state
+func (c *MongoCollector) IsHealthy() bool {
+	// Check health every 2 minutes
+	if time.Since(c.lastHealthCheck) > 2*time.Minute {
+		c.checkHealth()
+	}
+	return c.isHealthy
+}
+
+// checkHealth performs a simple health check
+func (c *MongoCollector) checkHealth() {
+	c.lastHealthCheck = time.Now()
+
+	// Simple connectivity test
+	client, err := c.openDBDirect()
+	if err != nil {
+		c.isHealthy = false
+		log.Printf("MongoDB health check failed - marking collector as unhealthy: %v", err)
+		// Increase collection interval when unhealthy
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Quick test ping
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = client.Ping(ctx, readpref.Primary())
+	if client != nil {
+		client.Disconnect(ctx)
+	}
+
+	if err != nil {
+		c.isHealthy = false
+		log.Printf("MongoDB health check ping failed - marking collector as unhealthy: %v", err)
+		c.collectionInterval = 2 * time.Minute
+	} else {
+		c.isHealthy = true
+		log.Printf("MongoDB health check passed - collector is healthy")
+		c.collectionInterval = 30 * time.Second // Reset to normal interval
+	}
+}
+
+// ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
+func (c *MongoCollector) ShouldSkipCollection() bool {
+	if !c.CanCollect() {
+		return true
+	}
+
+	if !c.IsHealthy() {
+		log.Printf("Skipping MongoDB collection due to unhealthy state")
+		return true
+	}
+
+	return false
+}
+
+// openDBDirect creates a database connection without rate limiting for health checks and critical operations
+func (c *MongoCollector) openDBDirect() (*mongo.Client, error) {
+	// MongoDB URI oluştur
+	uri := fmt.Sprintf("mongodb://%s:%s@%s:%s/?directConnection=true&connectTimeoutMS=5000&serverSelectionTimeoutMS=5000&maxPoolSize=2",
+		c.cfg.Mongo.User,
+		c.cfg.Mongo.Pass,
+		c.cfg.Mongo.Host,
+		c.cfg.Mongo.Port,
+	)
+
+	// Auth bilgileri boşsa, kimlik doğrulama olmadan bağlan
+	if !c.cfg.Mongo.Auth {
+		uri = fmt.Sprintf("mongodb://%s:%s/?directConnection=true&connectTimeoutMS=5000&serverSelectionTimeoutMS=5000&maxPoolSize=2",
+			c.cfg.Mongo.Host, c.cfg.Mongo.Port)
+	}
+
+	clientOptions := options.Client().ApplyURI(uri)
+
+	// Additional client options for health checks
+	clientOptions.SetMaxPoolSize(2)                          // Maximum 2 connections
+	clientOptions.SetMinPoolSize(1)                          // Minimum 1 connection
+	clientOptions.SetMaxConnIdleTime(10 * time.Second)       // Close idle connections after 10 seconds
+	clientOptions.SetConnectTimeout(5 * time.Second)         // Connection timeout
+	clientOptions.SetServerSelectionTimeout(5 * time.Second) // Server selection timeout
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		return nil, fmt.Errorf("MongoDB direct connection failed: %w", err)
+	}
+
+	return client, nil
+}
+
+// getLastKnownGoodInfo returns cached information to avoid excessive DB calls
+func (c *MongoCollector) getLastKnownGoodInfo() *MongoInfo {
+	hostname, _ := os.Hostname()
+
+	// Create a basic info structure with cached or default values
+	info := &MongoInfo{
+		ClusterName:    c.cfg.Mongo.Replset,
+		IP:             c.getLocalIP(),
+		Hostname:       hostname,
+		NodeStatus:     "RATE_LIMITED",
+		MongoVersion:   "Rate Limited",
+		Location:       c.cfg.Mongo.Location,
+		MongoStatus:    "RATE_LIMITED", // Indicate this is a rate-limited response
+		ReplicaSetName: c.cfg.Mongo.Replset,
+		ReplicaLagSec:  0,
+		FreeDisk:       "Unknown",
+		FdPercent:      0,
+		Port:           c.cfg.Mongo.Port,
+		TotalvCpu:      c.getTotalvCpu(),
+		TotalMemory:    c.getTotalMemory(),
+		ConfigPath:     "",
+	}
+
+	log.Printf("Returned cached/rate-limited MongoDB info to prevent overload")
+	return info
 }

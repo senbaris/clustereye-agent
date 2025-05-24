@@ -23,9 +23,18 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/logger"
 )
 
+// Windows platformu için gerekli paketleri koşullu olarak yükleyeceğiz
+var useWMI = runtime.GOOS == "windows"
+
 // MSSQLCollector mssql için veri toplama yapısı
 type MSSQLCollector struct {
-	cfg *config.AgentConfig
+	cfg                *config.AgentConfig
+	lastCollectionTime time.Time
+	collectionInterval time.Duration
+	maxRetries         int
+	backoffDuration    time.Duration
+	isHealthy          bool
+	lastHealthCheck    time.Time
 }
 
 // MSSQLInfo SQL Server bilgilerini içeren yapı
@@ -39,21 +48,27 @@ type MSSQLInfo struct {
 	Status      string
 	Instance    string
 	FreeDisk    string
-	FdPercent   int32  // File descriptor usage percentage
-	Port        string // SQL Server port
-	TotalvCpu   int32  // Toplam vCPU sayısı
-	TotalMemory int64  // Toplam RAM miktarı (byte cinsinden)
-	ConfigPath  string // SQL Server configuration file path
-	Database    string // Database name
-	IsHAEnabled bool   // AlwaysOn or other HA configuration enabled
-	HARole      string // Role in HA topology (PRIMARY, SECONDARY, etc.)
-	Edition     string // SQL Server edition (Enterprise, Standard, etc.)
+	FdPercent   int32            // File descriptor usage percentage
+	Port        string           // SQL Server port
+	TotalvCpu   int32            // Toplam vCPU sayısı
+	TotalMemory int64            // Toplam RAM miktarı (byte cinsinden)
+	ConfigPath  string           // SQL Server configuration file path
+	Database    string           // Database name
+	IsHAEnabled bool             // AlwaysOn or other HA configuration enabled
+	HARole      string           // Role in HA topology (PRIMARY, SECONDARY, etc.)
+	Edition     string           // SQL Server edition (Enterprise, Standard, etc.)
+	AlwaysOn    *AlwaysOnMetrics // Detailed AlwaysOn metrics
 }
 
 // NewMSSQLCollector yeni bir MSSQLCollector oluşturur
 func NewMSSQLCollector(cfg *config.AgentConfig) *MSSQLCollector {
 	return &MSSQLCollector{
-		cfg: cfg,
+		cfg:                cfg,
+		collectionInterval: 30 * time.Second, // Minimum 30 seconds between collections
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
 	}
 }
 
@@ -101,16 +116,22 @@ func (c *MSSQLCollector) GetClient() (*sql.DB, error) {
 		connStr += ";trustservercertificate=true"
 	}
 
-	// Additional connection parameters
-	connStr += ";connection timeout=10"
+	// Additional connection parameters with aggressive timeouts
+	connStr += ";connection timeout=10;dial timeout=5;keepalive=30"
 
 	db, err := sql.Open("sqlserver", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("MSSQL bağlantısı kurulamadı: %w", err)
 	}
 
-	// Test the connection
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Set connection pool limits to prevent resource exhaustion
+	db.SetMaxOpenConns(2)                   // Maximum 2 concurrent connections
+	db.SetMaxIdleConns(1)                   // Keep maximum 1 idle connection
+	db.SetConnMaxLifetime(30 * time.Second) // Close connections after 30 seconds
+	db.SetConnMaxIdleTime(10 * time.Second) // Close idle connections after 10 seconds
+
+	// Test the connection with a shorter timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	err = db.PingContext(ctx)
@@ -490,63 +511,9 @@ func (c *MSSQLCollector) GetHAClusterName() string {
 	return clusterName
 }
 
-// GetConfigPath returns the SQL Server configuration file path
-func (c *MSSQLCollector) GetConfigPath() string {
-	// Check cache first
-	if cachedPath := c.getCachedConfigPath(); cachedPath != "" {
-		log.Printf("Using cached SQL Server config path: %s", cachedPath)
-		return cachedPath
-	}
-
-	db, err := c.GetClient()
-	if err != nil {
-		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
-		return ""
-	}
-	defer db.Close()
-
-	var configPath string
-	err = db.QueryRow(`
-		SELECT SERVERPROPERTY('ErrorLogFileName')
-	`).Scan(&configPath)
-
-	if err == nil && configPath != "" {
-		configDir := filepath.Dir(configPath)
-		c.cacheConfigPath(configDir)
-		return configDir
-	}
-
-	log.Printf("Error log path could not be determined: %v", err)
-
-	// Try to find the SQL Server registry location
-	if runtime.GOOS == "windows" {
-		instance := c.cfg.MSSQL.Instance
-		regPath := "MSSQL"
-		if instance != "" {
-			regPath = "MSSQL$" + instance
-		}
-
-		// Single optimized command instead of nested pipe operations
-		// Use -NoProfile for faster startup
-		cmd := exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\*\\%s\\Setup' -Name SQLPath | Select-Object -First 1 -ExpandProperty SQLPath", regPath))
-		out, err := cmd.Output()
-		if err == nil {
-			path := strings.TrimSpace(string(out))
-			if path != "" {
-				configDir := filepath.Join(path, "MSSQL")
-				c.cacheConfigPath(configDir)
-				return configDir
-			}
-		}
-	}
-
-	return ""
-}
-
 // Helper function to cache SQL Server config path
 func (c *MSSQLCollector) cacheConfigPath(path string) {
-	cacheDir := getCacheDir()
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("Config path önbellek dizini oluşturulamadı: %v", err)
 		return
@@ -560,7 +527,7 @@ func (c *MSSQLCollector) cacheConfigPath(path string) {
 
 // Helper function to get cached SQL Server config path
 func (c *MSSQLCollector) getCachedConfigPath() string {
-	cacheFile := filepath.Join(getCacheDir(), "mssql_config_path.txt")
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_config_path.txt")
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return ""
@@ -709,52 +676,6 @@ func (c *MSSQLCollector) GetDiskUsage() (string, int) {
 }
 
 // This function has been replaced with an improved version at the bottom of the file
-
-// isClusterVirtualIP checks if the given IP is a cluster virtual IP
-func (c *MSSQLCollector) isClusterVirtualIP(ipAddress string) (bool, error) {
-	// Try to query the cluster resources to see if this IP is a virtual IP
-	db, err := c.GetClient()
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
-
-	// Try to check if the IP is used for availability groups
-	var agIPCount int
-	err = db.QueryRow(`
-		SELECT COUNT(*)
-		FROM sys.availability_group_listener_ip_addresses
-		WHERE ip_address = @ip
-	`, sql.Named("ip", ipAddress)).Scan(&agIPCount)
-
-	if err == nil && agIPCount > 0 {
-		return true, nil // This is an AG listener IP
-	}
-
-	// Try to check if IP belongs to a Windows Failover Cluster resource
-	if c.canExecuteXPCmdShell() {
-		var output sql.NullString
-		err = db.QueryRow(`
-			DECLARE @output TABLE (line nvarchar(512))
-			INSERT INTO @output
-			EXEC xp_cmdshell 'powershell -Command "Get-ClusterResource | Where-Object { $_.ResourceType -eq \"IP Address\" } | Format-List"'
-			
-			SELECT COUNT(*)
-			FROM @output
-			WHERE line LIKE '%' + @ip + '%'
-		`, sql.Named("ip", ipAddress)).Scan(&output)
-
-		if err == nil && output.Valid {
-			ipCount, err := strconv.Atoi(strings.TrimSpace(output.String))
-			if err == nil && ipCount > 0 {
-				return true, nil // This is a cluster resource IP
-			}
-		}
-	}
-
-	return false, nil
-}
-
 // canExecuteXPCmdShell checks if the current connection can execute xp_cmdshell
 func (c *MSSQLCollector) canExecuteXPCmdShell() bool {
 	db, err := c.GetClient()
@@ -775,7 +696,7 @@ func (c *MSSQLCollector) canExecuteXPCmdShell() bool {
 
 // Helper function to cache disk usage information
 func (c *MSSQLCollector) cacheDiskUsage(freeDisk string, usagePercent int) {
-	cacheDir := getCacheDir()
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("Disk usage önbellek dizini oluşturulamadı: %v", err)
 		return
@@ -802,7 +723,7 @@ func (c *MSSQLCollector) cacheDiskUsage(freeDisk string, usagePercent int) {
 
 // Helper function to get cached disk usage information
 func (c *MSSQLCollector) getCachedDiskUsage() map[string]interface{} {
-	cacheFile := filepath.Join(getCacheDir(), "mssql_disk_usage.json")
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_disk_usage.json")
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return nil
@@ -840,45 +761,7 @@ func (c *MSSQLCollector) formatBytes(bytes uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// runPowerShellWithTimeout executes a PowerShell command with a timeout to prevent hanging
-func (c *MSSQLCollector) runPowerShellWithTimeout(command string, timeoutSeconds int) ([]byte, error) {
-	// Add performance optimization flags to PowerShell
-	// -NoProfile: Don't load the PowerShell profile (faster startup)
-	// -NonInteractive: Don't present an interactive prompt to the user
-	// -NoLogo: Don't show the logo
-	// -ExecutionPolicy Bypass: Don't check script execution policy (faster)
-	// -WindowStyle Hidden: Don't show a window
-	// -Command: The command to execute
-	cmd := exec.Command(
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-NoLogo",
-		"-ExecutionPolicy", "Bypass",
-		"-WindowStyle", "Hidden",
-		"-Command", command)
-
-	// Set timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-	defer cancel()
-
-	// Lower process priority to reduce CPU impact - Windows only feature
-	// This is handled differently across operating systems
-	// Only attempt on Windows systems
-
-	// Set the command to run with the timeout context
-	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-
-	// Execute the command
-	out, err := cmdWithTimeout.Output()
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, fmt.Errorf("command timed out after %d seconds", timeoutSeconds)
-	}
-
-	return out, err
-}
-
-// BatchCollectSystemMetrics collects all system metrics with a single PowerShell call
+// BatchCollectSystemMetrics collects all system metrics with more efficient direct commands
 func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 	// Check if we have cached metrics - increase cache duration from 1 hour to 6 hours
 	if cachedMetrics := c.getCachedSystemMetrics(); cachedMetrics != nil {
@@ -892,9 +775,9 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 	if runtime.GOOS != "windows" {
 		log.Printf("Non-Windows system detected, collecting metrics individually")
 		metrics := map[string]interface{}{
-			"cpu_count":    c.getTotalvCpu(),
-			"total_memory": c.getTotalMemory(),
-			"ip_address":   c.getLocalIP(),
+			"cpu_count":    int32(c.getTotalvCpu()),   // Ensure int32
+			"total_memory": int64(c.getTotalMemory()), // Ensure int64
+			"ip_address":   string(c.getLocalIP()),    // Ensure string
 		}
 
 		// Cache the results
@@ -902,9 +785,9 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 		return metrics
 	}
 
-	log.Printf("Collecting system metrics with lighter weight methods")
+	log.Printf("Collecting system metrics with lightweight direct commands")
 
-	// Try to use WMI commands directly instead of PowerShell where possible
+	// Use direct wmic commands for better performance
 	metrics := make(map[string]interface{})
 
 	// 1. Try getting CPU count using direct command
@@ -915,13 +798,20 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 	out, err := cmdWithTimeout.Output()
 	if err == nil {
-		// Parse the output
-		cpuStr := strings.TrimSpace(string(out))
-		parts := strings.Split(cpuStr, "=")
-		if len(parts) == 2 {
-			cpuCount, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-			if err == nil && cpuCount > 0 {
-				metrics["cpu_count"] = int32(cpuCount)
+		// Parse the output line by line
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "NumberOfLogicalProcessors=") {
+				parts := strings.Split(line, "=")
+				if len(parts) == 2 {
+					cpuCountStr := strings.TrimSpace(parts[1])
+					if cpuCountStr != "" {
+						if cpuCount, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && cpuCount > 0 {
+							metrics["cpu_count"] = int32(cpuCount) // Ensure int32 type
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -934,110 +824,78 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 	cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 	out, err = cmdWithTimeout.Output()
 	if err == nil {
-		// Parse the output
-		memStr := strings.TrimSpace(string(out))
-		parts := strings.Split(memStr, "=")
-		if len(parts) == 2 {
-			totalMem, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-			if err == nil && totalMem > 0 {
-				metrics["total_memory"] = totalMem
+		// Parse the output line by line
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "TotalPhysicalMemory=") {
+				parts := strings.Split(line, "=")
+				if len(parts) == 2 {
+					memStr := strings.TrimSpace(parts[1])
+					if memStr != "" {
+						// Parse as int64 to avoid scientific notation
+						if totalMem, err := strconv.ParseInt(memStr, 10, 64); err == nil && totalMem > 0 {
+							metrics["total_memory"] = int64(totalMem) // Ensure int64 type
+							break
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// If we still need to get some metrics, use a simplified PowerShell script
-	// as a fallback, but make it as light as possible
-	if metrics["cpu_count"] == nil || metrics["total_memory"] == nil || metrics["ip_address"] == nil {
-		// Use a simpler, more focused PowerShell script
-		psScript := `
-		$result = @{
-			CpuCount = 0
-			TotalMemory = 0
-			IpAddress = ""
-		}
+	// 3. Try getting IP address using direct ipconfig command
+	cmd = exec.Command("ipconfig", "/all")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-		# Only calculate what we're missing
-		`
+	cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err = cmdWithTimeout.Output()
+	if err == nil {
+		// Parse the output
+		ipStr := string(out)
+		ipv4Regex := regexp.MustCompile(`IPv4 Address[^:]*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+		matches := ipv4Regex.FindAllStringSubmatch(ipStr, -1)
 
-		if metrics["cpu_count"] == nil {
-			psScript += `
-			try { 
-				$result.CpuCount = (Get-WmiObject -Class Win32_Processor -ErrorAction Stop | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum 
-			} catch { 
-				$result.CpuCount = 0 
-			}
-			`
-		}
-
-		if metrics["total_memory"] == nil {
-			psScript += `
-			try {
-				$result.TotalMemory = (Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
-			} catch {
-				$result.TotalMemory = 0
-			}
-			`
-		}
-
-		if metrics["ip_address"] == nil {
-			// Use the DNS method that proved to be the most reliable
-			psScript += `
-			try {
-				$result.IpAddress = ([System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | 
-				Where-Object { $_.AddressFamily -eq 'InterNetwork' -and 
-							 $_.IPAddressToString -notlike '169.254.*' -and 
-							 $_.IPAddressToString -ne '127.0.0.1' } | 
-				Select-Object -First 1).IPAddressToString
-			} catch {
-				$result.IpAddress = ""
-			}
-			`
-		}
-
-		psScript += `ConvertTo-Json -InputObject $result -Compress`
-
-		// Run the minimum required PowerShell commands with reduced timeout
-		out, err := c.runPowerShellWithTimeout(psScript, 5) // 5 seconds timeout instead of 15
-		if err != nil {
-			log.Printf("Lightweight PowerShell metrics collection failed: %v", err)
-		} else {
-			var metricsResult struct {
-				CpuCount    int32  `json:"CpuCount"`
-				TotalMemory int64  `json:"TotalMemory"`
-				IpAddress   string `json:"IpAddress"`
-			}
-
-			if err := json.Unmarshal(out, &metricsResult); err == nil {
-				// Only update metrics that are missing
-				if metrics["cpu_count"] == nil && metricsResult.CpuCount > 0 {
-					metrics["cpu_count"] = metricsResult.CpuCount
-				}
-
-				if metrics["total_memory"] == nil && metricsResult.TotalMemory > 0 {
-					metrics["total_memory"] = metricsResult.TotalMemory
-				}
-
-				if metrics["ip_address"] == nil && metricsResult.IpAddress != "" {
-					metrics["ip_address"] = metricsResult.IpAddress
+		var validIPs []string
+		for _, match := range matches {
+			if len(match) >= 2 {
+				ip := strings.TrimSpace(match[1])
+				if ip != "127.0.0.1" && !strings.HasPrefix(ip, "169.254.") {
+					validIPs = append(validIPs, ip)
 				}
 			}
+		}
+
+		// Sort IPs by preference
+		sort.Slice(validIPs, func(i, j int) bool {
+			if strings.HasPrefix(validIPs[i], "192.168.") && !strings.HasPrefix(validIPs[j], "192.168.") {
+				return true
+			}
+			if strings.HasPrefix(validIPs[i], "10.") && !strings.HasPrefix(validIPs[j], "10.") && !strings.HasPrefix(validIPs[j], "192.168.") {
+				return true
+			}
+			return false
+		})
+
+		if len(validIPs) > 0 {
+			metrics["ip_address"] = string(validIPs[0]) // Ensure string type
 		}
 	}
 
 	// If still missing any values, use existing fallback methods
 	if metrics["cpu_count"] == nil {
 		log.Printf("Using fallback for CPU count")
-		metrics["cpu_count"] = c.getTotalvCpu()
+		metrics["cpu_count"] = int32(c.getTotalvCpu()) // Ensure int32
 	}
 
 	if metrics["total_memory"] == nil {
 		log.Printf("Using fallback for memory")
-		metrics["total_memory"] = c.getTotalMemory()
+		metrics["total_memory"] = int64(c.getTotalMemory()) // Ensure int64
 	}
 
 	if metrics["ip_address"] == nil {
 		log.Printf("Using fallback for IP address")
-		metrics["ip_address"] = c.getLocalIP()
+		metrics["ip_address"] = string(c.getLocalIP()) // Ensure string
 	}
 
 	// Cache the results for a longer period (6 hours)
@@ -1108,7 +966,7 @@ func standardizeMetricTypes(metrics map[string]interface{}) map[string]interface
 
 // Helper function to cache system metrics
 func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
-	cacheDir := getCacheDir()
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("System metrics önbellek dizini oluşturulamadı: %v", err)
 		return
@@ -1135,7 +993,7 @@ func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 
 // Helper function to get cached system metrics
 func (c *MSSQLCollector) getCachedSystemMetrics() map[string]interface{} {
-	cacheFile := filepath.Join(getCacheDir(), "mssql_system_metrics.json")
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_system_metrics.json")
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return nil
@@ -1163,6 +1021,15 @@ func (c *MSSQLCollector) getCachedSystemMetrics() map[string]interface{} {
 
 // GetMSSQLInfo collects SQL Server information
 func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
+	// Check if we should skip collection due to rate limiting or health issues
+	if c.ShouldSkipCollection() {
+		logger.Debug("Collection skipped due to rate limiting or health checks")
+		return c.getLastKnownGoodInfo() // Return cached info instead
+	}
+
+	// Update collection time at the start to prevent concurrent collections
+	c.SetCollectionTime()
+
 	// Use internal logger and set level to INFO just for this function
 	logger.Info("MSSQL bilgileri toplanmaya başlanıyor...")
 
@@ -1174,6 +1041,10 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 			logger.Error("STACK: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic
+			c.isHealthy = false
+			c.collectionInterval = 5 * time.Minute // Increase interval significantly
 		}
 	}()
 
@@ -1214,20 +1085,24 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 
 		// CPU Count
 		if cpuVal, ok := systemMetrics["cpu_count"]; ok {
+			logger.Debug("Raw cached CPU value: %v (type: %T)", cpuVal, cpuVal)
 			switch v := cpuVal.(type) {
 			case int32:
 				totalvCpu = v
+				logger.Debug("CPU converted from int32: %d", totalvCpu)
 			case int:
 				totalvCpu = int32(v)
+				logger.Debug("CPU converted from int: %d", totalvCpu)
 			case int64:
 				totalvCpu = int32(v)
+				logger.Debug("CPU converted from int64: %d", totalvCpu)
 			case float64:
 				totalvCpu = int32(v)
+				logger.Debug("CPU converted from float64: %d", totalvCpu)
 			default:
-				logger.Debug("Cached CPU count has wrong type: %T", cpuVal)
+				logger.Debug("Cached CPU count has wrong type: %T, using fallback", cpuVal)
 				totalvCpu = c.getTotalvCpu() // Fallback
 			}
-			logger.Debug("Using cached CPU count: %d", totalvCpu)
 		} else {
 			logger.Debug("No cached CPU count found")
 			totalvCpu = c.getTotalvCpu() // Fallback
@@ -1235,18 +1110,21 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 
 		// Memory
 		if memVal, ok := systemMetrics["total_memory"]; ok {
+			logger.Debug("Raw cached memory value: %v (type: %T)", memVal, memVal)
 			switch v := memVal.(type) {
 			case int64:
 				totalMemory = v
+				logger.Debug("Memory converted from int64: %d", totalMemory)
 			case int:
 				totalMemory = int64(v)
+				logger.Debug("Memory converted from int: %d", totalMemory)
 			case float64:
 				totalMemory = int64(v)
+				logger.Debug("Memory converted from float64: %d (was: %g)", totalMemory, v)
 			default:
-				logger.Debug("Cached memory has wrong type: %T", memVal)
+				logger.Debug("Cached memory has wrong type: %T, using fallback", memVal)
 				totalMemory = c.getTotalMemory() // Fallback
 			}
-			logger.Debug("Using cached memory: %d bytes", totalMemory)
 		} else {
 			logger.Debug("No cached memory found")
 			totalMemory = c.getTotalMemory() // Fallback
@@ -1265,6 +1143,7 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 	var usagePercent int
 	var clusterName string
 	var isHAEnabled bool
+	var alwaysOnMetrics *AlwaysOnMetrics
 
 	testDb, err := c.GetClient()
 	if err == nil {
@@ -1314,6 +1193,27 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 				logger.Info("Cluster adı: %s, Node rolü: %s", clusterName, nodeStatus)
 				// Cache HA information for when service is down
 				c.saveHAStateToCache(nodeStatus, clusterName)
+
+				// Collect detailed AlwaysOn metrics if HA is enabled
+				// Only collect every 5 minutes to reduce database load
+				if c.shouldCollectAlwaysOnMetrics() {
+					alwaysOnMetrics, err = c.GetAlwaysOnMetrics()
+					if err != nil {
+						logger.Warning("AlwaysOn metrics collection failed: %v", err)
+					} else {
+						logger.Info("AlwaysOn metrics collected successfully")
+
+						// Log AlwaysOn metrics for diagnostic purposes
+						alwaysOnJSON, _ := c.SerializeAlwaysOnMetrics(alwaysOnMetrics)
+						logger.Debug("AlwaysOn metrics: %s", alwaysOnJSON)
+					}
+				} else {
+					// Try to get cached metrics if available
+					alwaysOnMetrics = c.getCachedAlwaysOnMetrics()
+					if alwaysOnMetrics != nil {
+						logger.Debug("Using cached AlwaysOn metrics to reduce load")
+					}
+				}
 			}
 		}
 
@@ -1332,14 +1232,17 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 			if len(configPath) >= 1 {
 				driveLetter := string(configPath[0])
 				freeDisk, usagePercent = c.getSafeDiskUsage(driveLetter)
+				logger.Debug("Disk usage from SQL Server drive %s: FreeDisk=%s, UsagePercent=%d", driveLetter, freeDisk, usagePercent)
 			} else {
 				// Fallback to C drive
 				freeDisk, usagePercent = c.getSafeDiskUsage("C")
+				logger.Debug("Disk usage from fallback C drive: FreeDisk=%s, UsagePercent=%d", freeDisk, usagePercent)
 			}
 		} else {
 			// Fallbacks
 			configPath = c.getCachedConfigPath()
 			freeDisk, usagePercent = c.getSafeDiskUsage("C")
+			logger.Debug("Disk usage from cached/fallback: FreeDisk=%s, UsagePercent=%d", freeDisk, usagePercent)
 		}
 
 		// Clean up
@@ -1388,12 +1291,38 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 		IsHAEnabled: isHAEnabled,
 		HARole:      nodeStatus,
 		Edition:     edition,
+		AlwaysOn:    alwaysOnMetrics,
 	}
+
+	// Debug logging before normalization
+	logger.Debug("BEFORE normalization - TotalMemory: %v (type: %T), TotalvCpu: %v (type: %T), FdPercent: %v (type: %T)",
+		info.TotalMemory, info.TotalMemory, info.TotalvCpu, info.TotalvCpu, info.FdPercent, info.FdPercent)
+
+	// Normalize data to ensure consistent formatting and avoid false change detection
+	info.NormalizeData()
+
+	// Debug logging after normalization
+	logger.Debug("AFTER normalization - TotalMemory: %v (type: %T), TotalvCpu: %v (type: %T), FdPercent: %v (type: %T)",
+		info.TotalMemory, info.TotalMemory, info.TotalvCpu, info.TotalvCpu, info.FdPercent, info.FdPercent)
 
 	logger.Info("MSSQL bilgileri başarıyla toplandı. IP=%s, Status=%s, HAEnabled=%v",
 		info.IP, info.Status, info.IsHAEnabled)
 
 	return info
+}
+
+// SerializeAlwaysOnMetrics converts AlwaysOnMetrics to a JSON string for logging and diagnostics
+func (c *MSSQLCollector) SerializeAlwaysOnMetrics(metrics *AlwaysOnMetrics) (string, error) {
+	if metrics == nil {
+		return "{}", nil
+	}
+
+	data, err := json.MarshalIndent(metrics, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("error serializing AlwaysOn metrics: %w", err)
+	}
+
+	return string(data), nil
 }
 
 // Helper function to get map keys for debugging
@@ -1428,80 +1357,51 @@ func (c *MSSQLCollector) getSafeDiskUsage(driveLetter string) (string, int) {
 	driveLetter = strings.ToUpper(string(driveLetter[0]))
 	log.Printf("Getting disk usage for drive %s:", driveLetter)
 
-	// Try to get disk usage from PowerShell safely
-	// Use a more robust PowerShell script with error handling
-	psScript := fmt.Sprintf(`
-	try {
-		$vol = Get-Volume -DriveLetter %s -ErrorAction Stop
-		if ($vol) {
-			$result = @{
-				Free = $vol.SizeRemaining
-				Total = $vol.Size
-				Success = $true
-			}
-		} else {
-			$result = @{
-				Free = 0
-				Total = 0
-				Success = $false
-				Error = "Volume not found"
-			}
-		}
-	} catch {
-		$result = @{
-			Free = 0
-			Total = 0
-			Success = $false
-			Error = $_.Exception.Message
-		}
-	}
-	ConvertTo-Json -InputObject $result -Compress
-	`, driveLetter)
-
-	// Set timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use direct wmic command instead of PowerShell
+	// First get the total size and free space of the drive
+	drivePath := fmt.Sprintf("%s:", driveLetter)
+	cmd := exec.Command("wmic", "logicaldisk", "where", fmt.Sprintf("DeviceID='%s'", drivePath), "get", "Size,FreeSpace", "/value")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Execute with timeout
-	out, err := c.runPowerShellWithTimeout(psScript, 10)
-
+	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err := cmdWithTimeout.Output()
 	if err != nil || ctx.Err() == context.DeadlineExceeded {
-		log.Printf("Disk kullanımı güvenli sorgusu başarısız: %v", err)
+		log.Printf("Failed to get disk usage with wmic: %v", err)
 		return "N/A", 0
 	}
 
-	// Parse JSON output - with extended error handling
-	type DiskResult struct {
-		Free    uint64 `json:"Free"`
-		Total   uint64 `json:"Total"`
-		Success bool   `json:"Success"`
-		Error   string `json:"Error,omitempty"`
-	}
-
-	var diskInfo DiskResult
+	// Parse the output
 	outStr := string(out)
-	log.Printf("Raw disk info output: %s", strings.TrimSpace(outStr))
+	sizeMatches := regexp.MustCompile(`Size=(\d+)`).FindStringSubmatch(outStr)
+	freeMatches := regexp.MustCompile(`FreeSpace=(\d+)`).FindStringSubmatch(outStr)
 
-	if err := json.Unmarshal(out, &diskInfo); err != nil {
-		log.Printf("Disk kullanımı JSON ayrıştırma hatası: %v. Raw output: %s", err, outStr)
+	if len(sizeMatches) < 2 || len(freeMatches) < 2 {
+		log.Printf("Could not parse wmic output: %s", outStr)
 		return "N/A", 0
 	}
 
-	// Check if the operation was successful
-	if !diskInfo.Success {
-		log.Printf("Disk bilgisi alınamadı: %s", diskInfo.Error)
+	size, err := strconv.ParseUint(sizeMatches[1], 10, 64)
+	if err != nil {
+		log.Printf("Failed to parse size: %v", err)
+		return "N/A", 0
+	}
+
+	free, err := strconv.ParseUint(freeMatches[1], 10, 64)
+	if err != nil {
+		log.Printf("Failed to parse free space: %v", err)
 		return "N/A", 0
 	}
 
 	// Calculate usage percentage
 	usagePercent := 0
-	if diskInfo.Total > 0 {
-		usedBytes := diskInfo.Total - diskInfo.Free
-		usagePercent = int((float64(usedBytes) / float64(diskInfo.Total)) * 100)
+	if size > 0 {
+		usedBytes := size - free
+		usagePercent = int((float64(usedBytes) / float64(size)) * 100)
 	}
 
 	// Format free space
-	freeDisk := c.formatBytes(diskInfo.Free)
+	freeDisk := c.formatBytes(free)
 
 	// Cache the results
 	c.cacheDiskUsage(freeDisk, usagePercent)
@@ -1518,13 +1418,52 @@ func (c *MSSQLCollector) getLocalIP() string {
 		return cachedIP
 	}
 
-	// First, force using direct OS commands for physical IP detection
-	// This is the most reliable method for getting the actual physical node IP
-	physicalIP := c.getPhysicalNodeIP()
-	if physicalIP != "" {
-		log.Printf("Found physical node IP using direct methods: %s", physicalIP)
-		c.cacheIPPermanently(physicalIP)
-		return physicalIP
+	// On Windows, use direct commands without PowerShell
+	if runtime.GOOS == "windows" {
+		// Try with ipconfig command directly
+		cmd := exec.Command("ipconfig", "/all")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		out, err := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...).Output()
+		if err == nil {
+			// Parse the output to extract IP addresses
+			output := string(out)
+
+			// Extract IPv4 addresses
+			ipv4Regex := regexp.MustCompile(`IPv4 Address[^:]*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+			matches := ipv4Regex.FindAllStringSubmatch(output, -1)
+
+			var validIPs []string
+			for _, match := range matches {
+				if len(match) >= 2 {
+					ip := match[1]
+					if ip != "127.0.0.1" && !strings.HasPrefix(ip, "169.254.") {
+						validIPs = append(validIPs, ip)
+					}
+				}
+			}
+
+			// Sort IPs by preference (192.168.x.x first, then 10.x.x.x)
+			sort.Slice(validIPs, func(i, j int) bool {
+				if strings.HasPrefix(validIPs[i], "192.168.") &&
+					!strings.HasPrefix(validIPs[j], "192.168.") {
+					return true
+				}
+				if strings.HasPrefix(validIPs[i], "10.") &&
+					!strings.HasPrefix(validIPs[j], "10.") &&
+					!strings.HasPrefix(validIPs[j], "192.168.") {
+					return true
+				}
+				return false
+			})
+
+			if len(validIPs) > 0 {
+				log.Printf("Found IP using ipconfig: %s", validIPs[0])
+				c.cacheIP(validIPs[0])
+				return validIPs[0]
+			}
+		}
 	}
 
 	// Fallback to checking database configuration
@@ -1532,367 +1471,12 @@ func (c *MSSQLCollector) getLocalIP() string {
 		// Check if host is an IP address
 		if net.ParseIP(c.cfg.MSSQL.Host) != nil {
 			log.Printf("Using configured IP address: %s", c.cfg.MSSQL.Host)
-			c.cacheIPPermanently(c.cfg.MSSQL.Host)
+			c.cacheIP(c.cfg.MSSQL.Host)
 			return c.cfg.MSSQL.Host
 		}
 	}
 
-	// Last resort: Use SQL Server to get connection info
-	dbIP := c.getIPFromSQLServer()
-	if dbIP != "" {
-		log.Printf("Using SQL Server-reported IP address: %s", dbIP)
-		c.cacheIPPermanently(dbIP)
-		return dbIP
-	}
-
-	// If all fails, use the standard Go library (which can still be wrong)
-	log.Printf("All IP detection methods failed, using standard Go library as last resort")
-	return c.getStandardLibraryIP()
-}
-
-// getPhysicalNodeIP attempts to get the physical node's IP address using direct OS commands
-func (c *MSSQLCollector) getPhysicalNodeIP() string {
-	if runtime.GOOS != "windows" {
-		return ""
-	}
-
-	// First try with System.Net.Dns.GetHostAddresses - most reliable in Windows clusters
-	psHostCmd := `
-	try {
-		$result = [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | 
-		Where-Object { $_.AddressFamily -eq 'InterNetwork' -and
-					  $_.IPAddressToString -notlike '169.254.*' -and
-					  $_.IPAddressToString -notlike '127.0.0.*' } |
-		Sort-Object -Property @{
-			Expression = {
-				if ($_.IPAddressToString -like '192.168.*') { 1 }
-				elseif ($_.IPAddressToString -like '10.*') { 2 }
-				else { 99 }
-			}
-		} | Select-Object -First 1 -ExpandProperty IPAddressToString
-		
-		if ($result) { 
-			$result 
-		} else { 
-			Write-Output "" 
-		}
-	} catch {
-		Write-Output ""
-	}
-	`
-
-	physicalIP, err := c.runPowerShellWithTimeout(psHostCmd, 10)
-	if err == nil {
-		ipStr := strings.TrimSpace(string(physicalIP))
-		if ipStr != "" && net.ParseIP(ipStr) != nil {
-			log.Printf("IP from DNS resolution (System.Net.Dns): %s", ipStr)
-			return ipStr
-		}
-	}
-
-	// Rest of the existing implementation as fallback
-	// Execute ipconfig directly to get all adapters
-	// We'll parse the output ourselves to avoid PowerShell overhead
-	cmd := exec.Command("ipconfig", "/all")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-	out, err := cmdWithTimeout.Output()
-	if err != nil || ctx.Err() == context.DeadlineExceeded {
-		log.Printf("Failed to run ipconfig: %v", err)
-		return ""
-	}
-
-	// Parse output to find physical adapters and their IPs
-	// We want to exclude:
-	// - Virtual adapters (Hyper-V, VirtualBox, etc.)
-	// - Cluster virtual adapters
-	// - Disabled adapters
-	// - Loopback adapters
-	// - APIPA addresses (169.254.x.x)
-
-	output := string(out)
-
-	// First, split the output by adapter sections
-	adapters := strings.Split(output, "Ethernet adapter")
-	if len(adapters) <= 1 {
-		adapters = strings.Split(output, "Wireless LAN adapter")
-	}
-
-	type AdapterInfo struct {
-		Name            string
-		Description     string
-		PhysicalAddress string
-		IPv4Address     string
-		IsVirtual       bool
-		IsCluster       bool
-		IsDisabled      bool
-	}
-
-	var adapterInfos []AdapterInfo
-
-	// Process each adapter section
-	for _, adapter := range adapters {
-		if len(adapter) < 10 { // Too short to be useful
-			continue
-		}
-
-		// Extract adapter info
-		info := AdapterInfo{}
-
-		// Get name
-		nameEnd := strings.Index(adapter, ":")
-		if nameEnd > 0 {
-			info.Name = strings.TrimSpace(adapter[:nameEnd])
-		}
-
-		// Check if disabled
-		if strings.Contains(adapter, "Media disconnected") {
-			info.IsDisabled = true
-		}
-
-		// Check for description to detect virtual adapters
-		descLines := regexp.MustCompile(`Description[^:]*:\s*([^\r\n]+)`).FindStringSubmatch(adapter)
-		if len(descLines) > 1 {
-			info.Description = strings.TrimSpace(descLines[1])
-
-			// Check for virtual adapters by description
-			virtualKeywords := []string{
-				"Hyper-V", "Virtual", "VMware", "VirtualBox", "Cluster", "Failover",
-				"Microsoft Failover Cluster Virtual Adapter", "Teaming",
-			}
-
-			for _, keyword := range virtualKeywords {
-				if strings.Contains(info.Description, keyword) {
-					info.IsVirtual = true
-					if strings.Contains(info.Description, "Cluster") || strings.Contains(info.Description, "Failover") {
-						info.IsCluster = true
-					}
-					break
-				}
-			}
-		}
-
-		// Get physical address (MAC) - empty for virtual adapters
-		macLines := regexp.MustCompile(`Physical Address[^:]*:\s*([^\r\n]+)`).FindStringSubmatch(adapter)
-		if len(macLines) > 1 {
-			info.PhysicalAddress = strings.TrimSpace(macLines[1])
-			if info.PhysicalAddress == "" {
-				info.IsVirtual = true // No MAC usually means virtual
-			}
-		}
-
-		// Get IPv4 Address
-		ipLines := regexp.MustCompile(`IPv4 Address[^:]*:\s*([^\r\n]+)`).FindStringSubmatch(adapter)
-		if len(ipLines) > 1 {
-			ipWithMask := strings.TrimSpace(ipLines[1])
-			// Extract just the IP part (remove subnet mask if present)
-			ip := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`).FindString(ipWithMask)
-			info.IPv4Address = ip
-
-			// Exclude APIPA addresses
-			if strings.HasPrefix(ip, "169.254.") {
-				info.IsVirtual = true // APIPA addresses are usually not what we want
-			}
-		}
-
-		// Only add adapters with IP addresses
-		if info.IPv4Address != "" {
-			adapterInfos = append(adapterInfos, info)
-		}
-	}
-
-	// Sort adapters by priority:
-	// 1. Physical (non-virtual) adapters
-	// 2. Non-cluster adapters
-	// 3. Non-disabled adapters
-	// 4. IP address preference (192.168.x.x > 10.x.x.x)
-	sort.Slice(adapterInfos, func(i, j int) bool {
-		// First priority: Physical adapters
-		if !adapterInfos[i].IsVirtual && adapterInfos[j].IsVirtual {
-			return true
-		}
-		if adapterInfos[i].IsVirtual && !adapterInfos[j].IsVirtual {
-			return false
-		}
-
-		// Second priority: Non-cluster adapters
-		if !adapterInfos[i].IsCluster && adapterInfos[j].IsCluster {
-			return true
-		}
-		if adapterInfos[i].IsCluster && !adapterInfos[j].IsCluster {
-			return false
-		}
-
-		// Third priority: Non-disabled adapters
-		if !adapterInfos[i].IsDisabled && adapterInfos[j].IsDisabled {
-			return true
-		}
-		if adapterInfos[i].IsDisabled && !adapterInfos[j].IsDisabled {
-			return false
-		}
-
-		// Fourth priority: IP address preference
-		if strings.HasPrefix(adapterInfos[i].IPv4Address, "192.168.") &&
-			!strings.HasPrefix(adapterInfos[j].IPv4Address, "192.168.") {
-			return true
-		}
-		if strings.HasPrefix(adapterInfos[i].IPv4Address, "10.") &&
-			!strings.HasPrefix(adapterInfos[j].IPv4Address, "10.") &&
-			!strings.HasPrefix(adapterInfos[j].IPv4Address, "192.168.") {
-			return true
-		}
-
-		return false
-	})
-
-	// Log and return the best match
-	if len(adapterInfos) > 0 {
-		bestAdapter := adapterInfos[0]
-		log.Printf("Best adapter match: Name=%s, Desc=%s, IP=%s, IsVirtual=%v, IsCluster=%v",
-			bestAdapter.Name, bestAdapter.Description, bestAdapter.IPv4Address,
-			bestAdapter.IsVirtual, bestAdapter.IsCluster)
-
-		return bestAdapter.IPv4Address
-	}
-
-	// If we couldn't parse ipconfig output, try alternative methods
-	return c.getIPFromDirectCommands()
-}
-
-// getIPFromDirectCommands uses direct Windows commands to find the physical IP
-func (c *MSSQLCollector) getIPFromDirectCommands() string {
-	if runtime.GOOS != "windows" {
-		return ""
-	}
-
-	// Try using netsh command - more reliable than PowerShell for this
-	cmd := exec.Command("netsh", "interface", "ipv4", "show", "ipaddress")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-	out, err := cmdWithTimeout.Output()
-	if err != nil || ctx.Err() == context.DeadlineExceeded {
-		log.Printf("Failed to run netsh: %v", err)
-		return ""
-	}
-
-	// Parse the output to find IP addresses excluding virtual/cluster ones
-	output := string(out)
-	lines := strings.Split(output, "\n")
-
-	var candidateIPs []string
-	var currentAdapter string
-	var isVirtual bool
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		if strings.Contains(line, "Configuration for interface") {
-			// New adapter section
-			currentAdapter = line
-			isVirtual = strings.Contains(strings.ToLower(currentAdapter), "virtual") ||
-				strings.Contains(strings.ToLower(currentAdapter), "cluster") ||
-				strings.Contains(strings.ToLower(currentAdapter), "loopback")
-			continue
-		}
-
-		if strings.Contains(line, "IP Address:") && !isVirtual {
-			// Extract IP address
-			ipMatch := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`).FindString(line)
-			if ipMatch != "" && ipMatch != "127.0.0.1" && !strings.HasPrefix(ipMatch, "169.254.") {
-				candidateIPs = append(candidateIPs, ipMatch)
-			}
-		}
-	}
-
-	// Sort IPs to prioritize 192.168.x.x, then 10.x.x.x
-	sort.Slice(candidateIPs, func(i, j int) bool {
-		if strings.HasPrefix(candidateIPs[i], "192.168.") && !strings.HasPrefix(candidateIPs[j], "192.168.") {
-			return true
-		}
-		if strings.HasPrefix(candidateIPs[i], "10.") && !strings.HasPrefix(candidateIPs[j], "10.") && !strings.HasPrefix(candidateIPs[j], "192.168.") {
-			return true
-		}
-		return false
-	})
-
-	if len(candidateIPs) > 0 {
-		log.Printf("IP from netsh command: %s", candidateIPs[0])
-		return candidateIPs[0]
-	}
-
-	// Last resort - try simple PowerShell command to get physical adapters only
-	psScript := `
-	try {
-		Get-NetAdapter | 
-		Where-Object { 
-			$_.Status -eq 'Up' -and 
-			-not $_.Virtual -and 
-			$_.InterfaceDescription -notlike '*Cluster*' -and
-			$_.InterfaceDescription -notlike '*Virtual*' -and
-			$_.InterfaceDescription -notlike '*VMware*' -and
-			$_.InterfaceDescription -notlike '*VirtualBox*'
-		} | 
-		Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | 
-		Where-Object {
-			$_.IPAddress -notlike '127.0.0.1' -and
-			$_.IPAddress -notlike '169.254.*'
-		} |
-		Sort-Object -Property @{
-			Expression = {
-				if ($_.IPAddress -like '192.168.*') { 1 }
-				elseif ($_.IPAddress -like '10.*') { 2 }
-				else { 99 }
-			}
-		} | 
-		Select-Object -First 1 -ExpandProperty IPAddress
-	} catch {
-		Write-Output ""
-	}
-	`
-
-	physicalIP, err := c.runPowerShellWithTimeout(psScript, 10)
-	if err == nil && len(strings.TrimSpace(string(physicalIP))) > 0 {
-		ipStr := strings.TrimSpace(string(physicalIP))
-		log.Printf("IP from physical network adapter query: %s", ipStr)
-		return ipStr
-	}
-
-	return ""
-}
-
-// getStandardLibraryIP uses the standard Go library to find the IP
-func (c *MSSQLCollector) getStandardLibraryIP() string {
-	// Utility function to check if an IP is likely to be a physical adapter IP
-	isPreferredIP := func(ip string) bool {
-		// Filter out APIPA addresses (169.254.x.x)
-		if strings.HasPrefix(ip, "169.254.") {
-			return false
-		}
-
-		// Prioritize specific private network ranges
-		if strings.HasPrefix(ip, "192.168.") ||
-			strings.HasPrefix(ip, "10.") {
-			return true
-		}
-
-		// Check 172.16-31.x.x range
-		if strings.HasPrefix(ip, "172.") {
-			parts := strings.Split(ip, ".")
-			if len(parts) > 1 {
-				second, err := strconv.Atoi(parts[1])
-				if err == nil && second >= 16 && second <= 31 {
-					return true
-				}
-			}
-		}
-
-		return true
-	}
-
+	// Use standard library as fallback
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		log.Printf("Failed to get interface addresses: %v", err)
@@ -1904,7 +1488,8 @@ func (c *MSSQLCollector) getStandardLibraryIP() string {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
 				ipStr := ipnet.IP.String()
-				if isPreferredIP(ipStr) {
+				// Filter out APIPA addresses
+				if !strings.HasPrefix(ipStr, "169.254.") {
 					validIPs = append(validIPs, ipStr)
 				}
 			}
@@ -1923,306 +1508,38 @@ func (c *MSSQLCollector) getStandardLibraryIP() string {
 	})
 
 	if len(validIPs) > 0 {
+		log.Printf("Using IP from Go standard library: %s", validIPs[0])
+		c.cacheIP(validIPs[0])
 		return validIPs[0]
 	}
 
 	return "Unknown"
 }
 
-// getIPFromSQLServer attempts to get the IP address directly from SQL Server
-func (c *MSSQLCollector) getIPFromSQLServer() string {
-	db, err := c.GetClient()
-	if err != nil {
-		return ""
-	}
-	defer db.Close()
-
-	// Get physical server NetBIOS name (not the cluster virtual name)
-	var serverName string
-	err = db.QueryRow("SELECT SERVERPROPERTY('ComputerNamePhysicalNetBIOS')").Scan(&serverName)
-	if err == nil && serverName != "" {
-		log.Printf("Physical server name: %s", serverName)
-
-		// Try to use xp_cmdshell to get the IP address directly if available
-		if c.canExecuteXPCmdShell() {
-			// First try the most reliable method - System.Net.Dns
-			var output sql.NullString
-			err = db.QueryRow(`
-				DECLARE @cmd nvarchar(1000)
-				SET @cmd = 'powershell -Command "[System.Net.Dns]::GetHostAddresses('''+@@SERVERNAME+''') | Where-Object { $_.AddressFamily -eq ''InterNetwork'' -and $_.IPAddressToString -notlike ''169.254.*'' -and $_.IPAddressToString -notlike ''127.0.0.*'' } | Select-Object -First 1 -ExpandProperty IPAddressToString"'
-				
-				DECLARE @output TABLE (line nvarchar(500))
-				INSERT INTO @output (line)
-				EXEC xp_cmdshell @cmd
-				
-				SELECT TOP 1 line
-				FROM @output
-				WHERE line IS NOT NULL AND line <> ''
-			`).Scan(&output)
-
-			if err == nil && output.Valid {
-				ipStr := strings.TrimSpace(output.String)
-				log.Printf("IP from xp_cmdshell (System.Net.Dns): %s", ipStr)
-				if net.ParseIP(ipStr) != nil {
-					return ipStr
-				}
-			}
-
-			// If first method fails, try using ipconfig command
-			err = db.QueryRow(`
-				DECLARE @cmd nvarchar(1000)
-				SET @cmd = 'ipconfig /all'
-				
-				DECLARE @output TABLE (line nvarchar(1000))
-				INSERT INTO @output (line)
-				EXEC xp_cmdshell @cmd
-				
-				-- Extract sections with adapter info
-				DECLARE @currentAdapter nvarchar(255) = ''
-				DECLARE @isVirtual bit = 0
-				DECLARE @adapterOutput TABLE (
-					adapter nvarchar(255),
-					isVirtual bit,
-					line nvarchar(1000)
-				)
-				
-				-- Process the ipconfig output line by line
-				INSERT INTO @adapterOutput (adapter, isVirtual, line)
-				SELECT 
-					CASE 
-						WHEN line LIKE 'Ethernet adapter%' OR line LIKE 'Wireless%' 
-						THEN SUBSTRING(line, 1, CHARINDEX(':', line)-1)
-						ELSE @currentAdapter 
-					END,
-					CASE
-						WHEN (line LIKE '%Description%' AND (
-							line LIKE '%Virtual%' OR 
-							line LIKE '%Hyper-V%' OR 
-							line LIKE '%VMware%' OR
-							line LIKE '%VirtualBox%' OR
-							line LIKE '%Cluster%' OR
-							line LIKE '%Team%' OR
-							line LIKE '%Microsoft Failover%'
-						)) THEN 1
-						ELSE 0
-					END,
-					line
-				FROM @output
-				WHERE line IS NOT NULL AND LEN(LTRIM(line)) > 0
-				
-				-- Now find IP addresses from non-virtual adapters
-				SELECT TOP 1 SUBSTRING(line, CHARINDEX(':', line) + 1, LEN(line))
-				FROM @adapterOutput
-				WHERE line LIKE '%IPv4 Address%'
-				AND adapter IN (
-					SELECT DISTINCT adapter 
-					FROM @adapterOutput 
-					WHERE isVirtual = 0
-				)
-				AND line NOT LIKE '%169.254.%'
-				AND line NOT LIKE '%127.0.0.1%'
-				ORDER BY
-					CASE
-						WHEN line LIKE '%192.168.%' THEN 1
-						WHEN line LIKE '%10.%' THEN 2
-						ELSE 3
-					END
-			`).Scan(&output)
-
-			if err == nil && output.Valid {
-				// Extract the IP address from output
-				ipStr := strings.TrimSpace(output.String)
-				log.Printf("IP from xp_cmdshell (ipconfig): %s", ipStr)
-
-				// Extract just the IP using regex
-				re := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
-				matches := re.FindStringSubmatch(ipStr)
-				if len(matches) > 0 {
-					return matches[0]
-				}
-			}
-
-			// If second method fails, try another PowerShell method
-			err = db.QueryRow(`
-				DECLARE @cmd nvarchar(1000)
-				SET @cmd = 'powershell -Command "Get-NetAdapter | Where-Object { -not $_.Virtual -and $_.Status -eq ''Up'' } | Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike ''169.254.*'' -and $_.IPAddress -notlike ''127.0.0.1'' } | Select-Object -First 1 -ExpandProperty IPAddress"'
-				
-				DECLARE @output TABLE (line nvarchar(500))
-				INSERT INTO @output (line)
-				EXEC xp_cmdshell @cmd
-				
-				SELECT TOP 1 line
-				FROM @output
-				WHERE line IS NOT NULL AND line <> ''
-			`).Scan(&output)
-
-			if err == nil && output.Valid {
-				ipStr := strings.TrimSpace(output.String)
-				log.Printf("IP from xp_cmdshell (Get-NetAdapter): %s", ipStr)
-				if net.ParseIP(ipStr) != nil {
-					return ipStr
-				}
-			}
-		}
-
-		// Try to use DNS resolution as fallback
-		log.Printf("Trying to resolve physical host name: %s", serverName)
-		if ips, err := net.LookupIP(serverName); err == nil && len(ips) > 0 {
-			// Filter and sort IPs
-			var validIPs []string
-			for _, ip := range ips {
-				ipStr := ip.String()
-				if ip.To4() != nil && ipStr != "127.0.0.1" && !strings.HasPrefix(ipStr, "169.254.") {
-					validIPs = append(validIPs, ipStr)
-				}
-			}
-
-			// Sort IPs to prioritize 192.168.x.x, then 10.x.x.x
-			sort.Slice(validIPs, func(i, j int) bool {
-				if strings.HasPrefix(validIPs[i], "192.168.") && !strings.HasPrefix(validIPs[j], "192.168.") {
-					return true
-				}
-				if strings.HasPrefix(validIPs[i], "10.") && !strings.HasPrefix(validIPs[j], "10.") && !strings.HasPrefix(validIPs[j], "192.168.") {
-					return true
-				}
-				return false
-			})
-
-			if len(validIPs) > 0 {
-				log.Printf("Resolved physical server name %s to IP: %s", serverName, validIPs[0])
-				return validIPs[0]
-			}
-		}
-	}
-
-	// Try to get IP addresses from TCP connections and filter out cluster IPs
-	var serverIP string
-	err = db.QueryRow(`
-		WITH NetworkInfo AS (
-			-- Get all local IP addresses used for connections
-			SELECT 
-				local_net_address,
-				CASE
-					WHEN local_net_address LIKE '192.168.%' THEN 1
-					WHEN local_net_address LIKE '10.%' THEN 2
-					ELSE 3
-				END AS priority
-			FROM sys.dm_exec_connections 
-			WHERE local_net_address IS NOT NULL 
-			AND local_net_address <> '127.0.0.1'
-			AND local_net_address NOT LIKE '169.254.%'
-		)
-		SELECT TOP 1 local_net_address
-		FROM NetworkInfo
-		ORDER BY priority
-	`).Scan(&serverIP)
-
-	if err == nil && serverIP != "" {
-		// Check if this might be a cluster IP
-		isClusterIP := false
-
-		// Try to verify against availability group listener IPs
-		var listenerIPCount int
-		err = db.QueryRow(`
-			IF OBJECT_ID('sys.availability_group_listener_ip_addresses') IS NOT NULL
-			BEGIN
-				SELECT COUNT(*) 
-				FROM sys.availability_group_listener_ip_addresses 
-				WHERE ip_address = @ip
-			END
-			ELSE
-			BEGIN
-				SELECT 0
-			END
-		`, sql.Named("ip", serverIP)).Scan(&listenerIPCount)
-
-		if err == nil && listenerIPCount > 0 {
-			isClusterIP = true
-			log.Printf("IP %s appears to be an availability group listener IP", serverIP)
-		}
-
-		if !isClusterIP {
-			log.Printf("Using SQL connection IP: %s", serverIP)
-			return serverIP
-		}
-	}
-
-	// Fallback to basic SQL Server query for network adapters
-	err = db.QueryRow(`
-		SELECT TOP 1 
-			CASE 
-				WHEN CHARINDEX(',', ip_address) > 0 
-				THEN SUBSTRING(ip_address, 1, CHARINDEX(',', ip_address) - 1) 
-				ELSE ip_address 
-			END
-		FROM sys.dm_tcp_listener_states
-		WHERE ip_address <> '127.0.0.1'
-		  AND ip_address NOT LIKE '169.254.%'
-		  -- Exclude IPs used by availability group listeners
-		  AND ip_address NOT IN (
-				SELECT ISNULL(ip_address, '') 
-				FROM sys.availability_group_listener_ip_addresses
-				WHERE ip_address IS NOT NULL
-		  )
-		ORDER BY 
-			CASE 
-				WHEN ip_address LIKE '192.168.%' THEN 1
-				WHEN ip_address LIKE '10.%' THEN 2 
-				ELSE 3
-			END
-	`).Scan(&serverIP)
-
-	if err == nil && serverIP != "" {
-		log.Printf("Using TCP listener IP (filtered): %s", serverIP)
-		return serverIP
-	}
-
-	log.Printf("Could not get IP address from SQL Server")
-	return ""
-}
-
-// cacheIPPermanently caches the IP address with a much longer expiration
-func (c *MSSQLCollector) cacheIPPermanently(ip string) {
-	cacheDir := getCacheDir()
+// Helper function to cache IP address for 24 hours
+func (c *MSSQLCollector) cacheIP(ip string) {
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("IP önbellek dizini oluşturulamadı: %v", err)
 		return
 	}
 
-	// Create a persistent IP cache file
-	cacheFile := filepath.Join(cacheDir, "mssql_ip_permanent.txt")
+	cacheFile := filepath.Join(cacheDir, "mssql_ip_cache.txt")
 	if err := os.WriteFile(cacheFile, []byte(ip), 0644); err != nil {
-		log.Printf("IP kalıcı önbelleğe kaydedilemedi: %v", err)
-	} else {
-		log.Printf("IP adresi kalıcı önbelleğe kaydedildi: %s", ip)
+		log.Printf("IP önbelleğe kaydedilemedi: %v", err)
 	}
-
-	// Also update the regular cache
-	c.cacheIP(ip)
 }
 
-// Override getCachedIP to check permanent cache first
+// Helper function to get cached IP address
 func (c *MSSQLCollector) getCachedIP() string {
-	// First check the permanent cache
-	permanentCacheFile := filepath.Join(getCacheDir(), "mssql_ip_permanent.txt")
-	data, err := os.ReadFile(permanentCacheFile)
-	if err == nil {
-		ipStr := strings.TrimSpace(string(data))
-		if ipStr != "" && ipStr != "Unknown" {
-			log.Printf("Kalıcı önbellekten IP adresi alındı: %s", ipStr)
-			return ipStr
-		}
-	}
-
-	// Fall back to regular cache
-	regularCacheFile := filepath.Join(getCacheDir(), "mssql_ip_cache.txt")
-	data, err = os.ReadFile(regularCacheFile)
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_ip_cache.txt")
+	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return ""
 	}
 
 	// Check if cache is still valid (24 hours)
-	fileInfo, err := os.Stat(regularCacheFile)
+	fileInfo, err := os.Stat(cacheFile)
 	if err != nil {
 		return ""
 	}
@@ -2235,70 +1552,166 @@ func (c *MSSQLCollector) getCachedIP() string {
 	return strings.TrimSpace(string(data))
 }
 
-func getCacheDir() string {
+// Helper function to get cache directory
+func (c *MSSQLCollector) getCacheDir() string {
 	if runtime.GOOS == "windows" {
-		return filepath.Join("C:\\Program Files\\ClusterEyeAgent", "cache")
+		dir := filepath.Join("C:\\Program Files\\ClusterEyeAgent", "cache")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Windows önbellek dizini oluşturulamadı: %v, geçici dizin kullanılacak", err)
+			return os.TempDir()
+		}
+		return dir
 	} else {
 		dir := "/var/lib/clustereye-agent/cache"
 		if homeDir, err := os.UserHomeDir(); err == nil {
 			dir = filepath.Join(homeDir, ".clustereye", "cache")
 		}
+
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Unix önbellek dizini oluşturulamadı: %v, geçici dizin kullanılacak", err)
+			return os.TempDir()
+		}
 		return dir
 	}
 }
 
-// getTotalvCpu returns the total number of vCPUs
-func (c *MSSQLCollector) getTotalvCpu() int32 {
-	// Check for cached CPU count
-	if cachedCount := c.getCachedCPUCount(); cachedCount > 0 {
-		log.Printf("Using cached CPU count: %d", cachedCount)
-		return cachedCount
+// Define new structs for WMI queries
+// Win32_NetworkAdapter represents a network adapter in Windows
+type Win32_NetworkAdapter struct {
+	NetConnectionID string
+	Name            string
+	Description     string
+	MACAddress      string
+	PhysicalAdapter bool
+	NetEnabled      bool
+	AdapterType     string
+}
+
+// Win32_NetworkAdapterConfiguration represents network adapter configuration
+type Win32_NetworkAdapterConfiguration struct {
+	IPAddress        []string
+	IPEnabled        bool
+	MACAddress       string
+	DefaultIPGateway []string
+	DHCPEnabled      bool
+}
+
+// Win32_ComputerSystem for system information
+type Win32_ComputerSystem struct {
+	NumberOfLogicalProcessors uint32
+	TotalPhysicalMemory       uint64
+}
+
+// Win32_OperatingSystem for system information
+type Win32_OperatingSystem struct {
+	FreePhysicalMemory     uint64
+	TotalVisibleMemorySize uint64
+}
+
+// Win32_LogicalDisk for disk information
+type Win32_LogicalDisk struct {
+	DeviceID  string
+	FreeSpace uint64
+	Size      uint64
+	DriveType uint32
+}
+
+// getPhysicalNodeIP attempts to get the physical node's IP address
+func (c *MSSQLCollector) getPhysicalNodeIP() string {
+	if runtime.GOOS != "windows" {
+		return ""
 	}
 
-	var cpuCount int32
-
-	if runtime.GOOS == "windows" {
-		// Use a more direct method to get CPU count that's lighter weight
-		psCommand := `try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).NumberOfLogicalProcessors } catch { Write-Output "0" }`
-		out, err := c.runPowerShellWithTimeout(psCommand, 5) // 5 seconds timeout
-		if err == nil {
-			count, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
-			if err == nil && count > 0 {
-				cpuCount = int32(count)
-				// Cache the result
-				c.cacheCPUCount(cpuCount)
-				return cpuCount
-			}
-		}
-	}
-
-	// For Unix-like systems
-	cmd := exec.Command("sh", "-c", "nproc")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Windows'a özel işlemler için fallback implementasyon
+	// ipconfig çıktısını direkt olarak parse edelim
+	cmd := exec.Command("ipconfig", "/all")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 	out, err := cmdWithTimeout.Output()
-	if err == nil && ctx.Err() != context.DeadlineExceeded {
-		count, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
-		if err == nil {
-			cpuCount = int32(count)
-			// Cache the result
-			c.cacheCPUCount(cpuCount)
-			return cpuCount
+	if err == nil {
+		// Parse output with Go code
+		output := string(out)
+
+		// Extract IPv4 addresses from ipconfig output
+		ipv4Regex := regexp.MustCompile(`IPv4 Address[^:]*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+		matches := ipv4Regex.FindAllStringSubmatch(output, -1)
+
+		var validIPs []string
+		for _, match := range matches {
+			if len(match) >= 2 {
+				ip := match[1]
+				if ip != "127.0.0.1" && !strings.HasPrefix(ip, "169.254.") {
+					validIPs = append(validIPs, ip)
+				}
+			}
+		}
+
+		// Sort IPs by preferred ranges
+		sort.Slice(validIPs, func(i, j int) bool {
+			if strings.HasPrefix(validIPs[i], "192.168.") &&
+				!strings.HasPrefix(validIPs[j], "192.168.") {
+				return true
+			}
+			if strings.HasPrefix(validIPs[i], "10.") &&
+				!strings.HasPrefix(validIPs[j], "10.") &&
+				!strings.HasPrefix(validIPs[j], "192.168.") {
+				return true
+			}
+			return false
+		})
+
+		if len(validIPs) > 0 {
+			log.Printf("Found IP using ipconfig parsing: %s", validIPs[0])
+			return validIPs[0]
 		}
 	}
 
-	// Fallback to runtime.NumCPU()
-	cpuCount = int32(runtime.NumCPU())
-	// Cache the result
-	c.cacheCPUCount(cpuCount)
-	return cpuCount
+	// Standart kütüphane kullanarak IP'yi bul
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Printf("Failed to get interface addresses: %v", err)
+		return ""
+	}
+
+	var validIPs []string
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ipStr := ipnet.IP.String()
+				if ipStr != "127.0.0.1" && !strings.HasPrefix(ipStr, "169.254.") {
+					validIPs = append(validIPs, ipStr)
+				}
+			}
+		}
+	}
+
+	// Sort IPs by preferred ranges
+	sort.Slice(validIPs, func(i, j int) bool {
+		if strings.HasPrefix(validIPs[i], "192.168.") &&
+			!strings.HasPrefix(validIPs[j], "192.168.") {
+			return true
+		}
+		if strings.HasPrefix(validIPs[i], "10.") &&
+			!strings.HasPrefix(validIPs[j], "10.") &&
+			!strings.HasPrefix(validIPs[j], "192.168.") {
+			return true
+		}
+		return false
+	})
+
+	if len(validIPs) > 0 {
+		log.Printf("Found IP using standard library: %s", validIPs[0])
+		return validIPs[0]
+	}
+
+	return ""
 }
 
 // Helper function to cache CPU count
 func (c *MSSQLCollector) cacheCPUCount(count int32) {
-	cacheDir := getCacheDir()
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("CPU count önbellek dizini oluşturulamadı: %v", err)
 		return
@@ -2312,7 +1725,7 @@ func (c *MSSQLCollector) cacheCPUCount(count int32) {
 
 // Helper function to get cached CPU count
 func (c *MSSQLCollector) getCachedCPUCount() int32 {
-	cacheFile := filepath.Join(getCacheDir(), "mssql_cpu_count.txt")
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_cpu_count.txt")
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return 0
@@ -2338,34 +1751,51 @@ func (c *MSSQLCollector) getTotalMemory() int64 {
 	var totalMemory int64
 
 	if runtime.GOOS == "windows" {
-		// Use a more efficient command with -NoProfile to speed up PowerShell startup
-		psCommand := `try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { Write-Output "0" }`
-		out, err := c.runPowerShellWithTimeout(psCommand, 5) // 5 seconds timeout
+		// Direct command instead of PowerShell
+		cmd := exec.Command("wmic", "computersystem", "get", "TotalPhysicalMemory", "/value")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err := cmdWithTimeout.Output()
 		if err == nil {
-			memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-			if err == nil && memTotal > 0 {
-				totalMemory = memTotal
+			// Parse the output
+			memStr := strings.TrimSpace(string(out))
+			lines := strings.Split(memStr, "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "TotalPhysicalMemory=") {
+					parts := strings.Split(line, "=")
+					if len(parts) == 2 {
+						memValueStr := strings.TrimSpace(parts[1])
+						if memValueStr != "" {
+							// Convert to int64 ensuring no scientific notation
+							if mem, err := strconv.ParseInt(memValueStr, 10, 64); err == nil && mem > 0 {
+								totalMemory = mem
+								// Cache the result
+								c.cacheMemory(totalMemory)
+								log.Printf("Got total memory via wmic command: %d bytes", totalMemory)
+								return totalMemory
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// For Unix-like systems
+		cmd := exec.Command("sh", "-c", "grep MemTotal /proc/meminfo | awk '{print $2}'")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err := cmdWithTimeout.Output()
+		if err == nil && ctx.Err() != context.DeadlineExceeded {
+			if memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+				totalMemory = memTotal * 1024 // Convert KB to bytes
 				// Cache the result
 				c.cacheMemory(totalMemory)
 				return totalMemory
 			}
-		}
-	}
-
-	// For Unix-like systems
-	cmd := exec.Command("sh", "-c", "grep MemTotal /proc/meminfo | awk '{print $2}'")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-	out, err := cmdWithTimeout.Output()
-	if err == nil && ctx.Err() != context.DeadlineExceeded {
-		memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-		if err == nil {
-			totalMemory = memTotal * 1024 // Convert KB to bytes
-			// Cache the result
-			c.cacheMemory(totalMemory)
-			return totalMemory
 		}
 	}
 
@@ -2380,7 +1810,7 @@ func (c *MSSQLCollector) getTotalMemory() int64 {
 
 // Helper function to cache memory value
 func (c *MSSQLCollector) cacheMemory(memBytes int64) {
-	cacheDir := getCacheDir()
+	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("Memory önbellek dizini oluşturulamadı: %v", err)
 		return
@@ -2394,7 +1824,7 @@ func (c *MSSQLCollector) cacheMemory(memBytes int64) {
 
 // Helper function to get cached memory value
 func (c *MSSQLCollector) getCachedMemory() int64 {
-	cacheFile := filepath.Join(getCacheDir(), "mssql_memory.txt")
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_memory.txt")
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
 		return 0
@@ -2411,7 +1841,7 @@ func (c *MSSQLCollector) getCachedMemory() int64 {
 
 // ToProto converts MSSQLInfo to protobuf message
 func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
-	return &pb.MSSQLInfo{
+	proto := &pb.MSSQLInfo{
 		ClusterName: m.ClusterName,
 		Ip:          m.IP,
 		Hostname:    m.Hostname,
@@ -2431,6 +1861,79 @@ func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
 		HaRole:      m.HARole,
 		Edition:     m.Edition,
 	}
+
+	// Debug logging for protobuf values
+	log.Printf("PROTOBUF VALUES - TotalMemory: %v, TotalVcpu: %v, FdPercent: %v",
+		proto.TotalMemory, proto.TotalVcpu, proto.FdPercent)
+
+	// Convert AlwaysOn metrics to protobuf if available
+	if m.AlwaysOn != nil {
+		proto.AlwaysOnMetrics = &pb.AlwaysOnMetrics{
+			ClusterName:         m.AlwaysOn.ClusterName,
+			HealthState:         m.AlwaysOn.HealthState,
+			OperationalState:    m.AlwaysOn.OperationalState,
+			SynchronizationMode: m.AlwaysOn.SynchronizationMode,
+			FailoverMode:        m.AlwaysOn.FailoverMode,
+			PrimaryReplica:      m.AlwaysOn.PrimaryReplica,
+			LocalRole:           m.AlwaysOn.LocalRole,
+			LastFailoverTime:    m.AlwaysOn.LastFailoverTime,
+			ReplicationLagMs:    m.AlwaysOn.ReplicationLag,
+			LogSendQueueKb:      m.AlwaysOn.LogSendQueue,
+			RedoQueueKb:         m.AlwaysOn.RedoQueue,
+		}
+
+		// Convert replicas
+		for _, replica := range m.AlwaysOn.Replicas {
+			proto.AlwaysOnMetrics.Replicas = append(proto.AlwaysOnMetrics.Replicas, &pb.ReplicaMetrics{
+				ReplicaName:         replica.ReplicaName,
+				Role:                replica.Role,
+				ConnectionState:     replica.ConnectionState,
+				SynchronizationMode: replica.SynchronizationMode,
+				FailoverMode:        replica.FailoverMode,
+				AvailabilityMode:    replica.AvailabilityMode,
+				JoinState:           replica.JoinState,
+				ConnectedState:      replica.ConnectedState,
+				SuspendReason:       replica.SuspendReason,
+			})
+		}
+
+		// Convert databases
+		for _, db := range m.AlwaysOn.Databases {
+			proto.AlwaysOnMetrics.Databases = append(proto.AlwaysOnMetrics.Databases, &pb.DatabaseReplicaStatus{
+				DatabaseName:         db.DatabaseName,
+				ReplicaName:          db.ReplicaName,
+				SynchronizationState: db.SynchronizationState,
+				SuspendReason:        db.SuspendReason,
+				LastSentTime:         db.LastSentTime,
+				LastReceivedTime:     db.LastReceivedTime,
+				LastHardenedTime:     db.LastHardenedTime,
+				LastRedoneTime:       db.LastRedoneTime,
+				LogSendQueueKb:       db.LogSendQueueSize,
+				LogSendRateKbPerSec:  db.LogSendRate,
+				RedoQueueKb:          db.RedoQueueSize,
+				RedoRateKbPerSec:     db.RedoRate,
+				EndOfLogLsn:          db.EndOfLogLSN,
+				RecoveryLsn:          db.RecoveryLSN,
+				TruncationLsn:        db.TruncationLSN,
+				LastCommitLsn:        db.LastCommitLSN,
+				LastCommitTime:       db.LastCommitTime,
+			})
+		}
+
+		// Convert listeners
+		for _, listener := range m.AlwaysOn.Listeners {
+			proto.AlwaysOnMetrics.Listeners = append(proto.AlwaysOnMetrics.Listeners, &pb.ListenerInfo{
+				ListenerName:  listener.ListenerName,
+				IpAddresses:   listener.IPAddresses,
+				Port:          int32(listener.Port),
+				SubnetMask:    listener.SubnetMask,
+				ListenerState: listener.ListenerState,
+				DnsName:       listener.DNSName,
+			})
+		}
+	}
+
+	return proto
 }
 
 // CheckSlowQueries monitors for slow queries in SQL Server
@@ -2692,19 +2195,61 @@ func (c *MSSQLCollector) FindMSSQLLogFiles() ([]*pb.MSSQLLogFile, error) {
 	if err != nil || logDir == "" {
 		// Try alternative approach
 		if runtime.GOOS == "windows" {
-			// Get SQL Server installation directory
+			// Get SQL Server installation directory using WMIC instead of PowerShell
 			instance := c.cfg.MSSQL.Instance
 			regPath := "MSSQL"
 			if instance != "" {
 				regPath = "MSSQL$" + instance
 			}
 
-			cmd := exec.Command("powershell", "-Command",
-				fmt.Sprintf("Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Microsoft SQL Server\\*\\%s\\Setup' -Name SQLPath | Select-Object -ExpandProperty SQLPath", regPath))
-			out, err := cmd.Output()
+			// Try to find SQL Server installation directory using registry entries
+			// Using 'reg query' command which is more lightweight than PowerShell
+			cmd := exec.Command("reg", "query", "HKLM\\SOFTWARE\\Microsoft\\Microsoft SQL Server", "/s", "/f", regPath)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			out, err := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...).Output()
 			if err == nil {
-				// Typical log directory based on SQL Server installation
-				logDir = filepath.Join(strings.TrimSpace(string(out)), "Log")
+				// Parse the output to find the SQL path
+				output := string(out)
+				lines := strings.Split(output, "\n")
+				for i, line := range lines {
+					if strings.Contains(line, "SQLPath") && i < len(lines)-1 {
+						// Extract the path value
+						parts := strings.Split(line, "REG_SZ")
+						if len(parts) > 1 {
+							path := strings.TrimSpace(parts[1])
+							if path != "" {
+								// Typical log directory based on SQL Server installation
+								logDir = filepath.Join(path, "Log")
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// If reg query failed, try with WMIC as fallback
+			if logDir == "" {
+				cmd = exec.Command("wmic", "service", "where", "name like '%SQLServer%'", "get", "PathName", "/value")
+				ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				out, err = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...).Output()
+				if err == nil {
+					output := string(out)
+					// Extract the path from PathName
+					if pathMatch := regexp.MustCompile(`PathName=(.+)`).FindStringSubmatch(output); len(pathMatch) > 1 {
+						sqlPath := pathMatch[1]
+						// Extract the directory part
+						sqlDir := filepath.Dir(sqlPath)
+						if sqlDir != "" {
+							// Go up one level to the main SQL Server directory
+							baseDir := filepath.Dir(sqlDir)
+							logDir = filepath.Join(baseDir, "Log")
+						}
+					}
+				}
 			}
 		}
 	}
@@ -2768,16 +2313,877 @@ func (c *MSSQLCollector) RunBestPracticesAnalysis() (map[string]interface{}, err
 	return results, nil
 }
 
-// cacheIP caches the IP address with 24 hour expiration
-func (c *MSSQLCollector) cacheIP(ip string) {
-	cacheDir := getCacheDir()
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		log.Printf("IP önbellek dizini oluşturulamadı: %v", err)
+// getTotalvCpu returns the total number of vCPUs
+func (c *MSSQLCollector) getTotalvCpu() int32 {
+	// Check for cached CPU count
+	if cachedCount := c.getCachedCPUCount(); cachedCount > 0 {
+		log.Printf("Using cached CPU count: %d", cachedCount)
+		return cachedCount
+	}
+
+	var result int32 = 0
+
+	if runtime.GOOS == "windows" {
+		// Direct command
+		cmd := exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors", "/value")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err := cmdWithTimeout.Output()
+		if err == nil {
+			// Parse the output line by line to avoid parsing issues
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, "NumberOfLogicalProcessors=") {
+					parts := strings.Split(line, "=")
+					if len(parts) == 2 {
+						cpuCountStr := strings.TrimSpace(parts[1])
+						if cpuCountStr != "" {
+							if count, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && count > 0 {
+								result = int32(count)
+								// Cache the result
+								c.cacheCPUCount(result)
+								log.Printf("Got CPU count via wmic command: %d", result)
+								return result
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// For Unix-like systems
+		cmd := exec.Command("sh", "-c", "nproc")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err := cmdWithTimeout.Output()
+		if err == nil && ctx.Err() != context.DeadlineExceeded {
+			if count, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32); err == nil {
+				result = int32(count)
+				// Cache the result
+				c.cacheCPUCount(result)
+				return result
+			}
+		}
+	}
+
+	// Fallback to runtime.NumCPU()
+	if result <= 0 {
+		result = int32(runtime.NumCPU())
+		// Cache the result
+		c.cacheCPUCount(result)
+	}
+
+	return result
+}
+
+// AlwaysOnMetrics represents detailed AlwaysOn metrics
+type AlwaysOnMetrics struct {
+	ClusterName         string                  `json:"cluster_name"`
+	HealthState         string                  `json:"health_state"`
+	OperationalState    string                  `json:"operational_state"`
+	SynchronizationMode string                  `json:"synchronization_mode"`
+	FailoverMode        string                  `json:"failover_mode"`
+	PrimaryReplica      string                  `json:"primary_replica"`
+	LocalRole           string                  `json:"local_role"`
+	Replicas            []ReplicaMetrics        `json:"replicas"`
+	Databases           []DatabaseReplicaStatus `json:"databases"`
+	Listeners           []ListenerInfo          `json:"listeners"`
+	LastFailoverTime    string                  `json:"last_failover_time"`
+	ReplicationLag      int64                   `json:"replication_lag_ms"`
+	LogSendQueue        int64                   `json:"log_send_queue_kb"`
+	RedoQueue           int64                   `json:"redo_queue_kb"`
+}
+
+// ReplicaMetrics represents metrics for a single replica in the AG
+type ReplicaMetrics struct {
+	ReplicaName         string `json:"replica_name"`
+	Role                string `json:"role"`
+	ConnectionState     string `json:"connection_state"`
+	SynchronizationMode string `json:"synchronization_mode"`
+	FailoverMode        string `json:"failover_mode"`
+	AvailabilityMode    string `json:"availability_mode"`
+	JoinState           string `json:"join_state"`
+	ConnectedState      bool   `json:"connected_state"`
+	SuspendReason       string `json:"suspend_reason,omitempty"`
+}
+
+// DatabaseReplicaStatus represents database-level replication status
+type DatabaseReplicaStatus struct {
+	DatabaseName         string `json:"database_name"`
+	ReplicaName          string `json:"replica_name"`
+	SynchronizationState string `json:"synchronization_state"`
+	SuspendReason        string `json:"suspend_reason,omitempty"`
+	LastSentTime         string `json:"last_sent_time,omitempty"`
+	LastReceivedTime     string `json:"last_received_time,omitempty"`
+	LastHardenedTime     string `json:"last_hardened_time,omitempty"`
+	LastRedoneTime       string `json:"last_redone_time,omitempty"`
+	LogSendQueueSize     int64  `json:"log_send_queue_kb"`
+	LogSendRate          int64  `json:"log_send_rate_kb_per_sec"`
+	RedoQueueSize        int64  `json:"redo_queue_kb"`
+	RedoRate             int64  `json:"redo_rate_kb_per_sec"`
+	FileStreamSendRate   int64  `json:"filestream_send_rate_kb_per_sec"`
+	EndOfLogLSN          string `json:"end_of_log_lsn,omitempty"`
+	RecoveryLSN          string `json:"recovery_lsn,omitempty"`
+	TruncationLSN        string `json:"truncation_lsn,omitempty"`
+	LastCommitLSN        string `json:"last_commit_lsn,omitempty"`
+	LastCommitTime       string `json:"last_commit_time,omitempty"`
+}
+
+// ListenerInfo represents availability group listener information
+type ListenerInfo struct {
+	ListenerName  string   `json:"listener_name"`
+	IPAddresses   []string `json:"ip_addresses"`
+	Port          int      `json:"port"`
+	SubnetMask    string   `json:"subnet_mask,omitempty"`
+	ListenerState string   `json:"listener_state"`
+	DNSName       string   `json:"dns_name,omitempty"`
+}
+
+// GetAlwaysOnMetrics collects comprehensive AlwaysOn metrics and health information
+// This function is optimized to reduce database load and prevent CPU spikes
+func (c *MSSQLCollector) GetAlwaysOnMetrics() (*AlwaysOnMetrics, error) {
+	// Check if we have recent cached AlwaysOn metrics (cache for 5 minutes)
+	if cachedMetrics := c.getCachedAlwaysOnMetrics(); cachedMetrics != nil {
+		log.Printf("Using cached AlwaysOn metrics to avoid database overload")
+		return cachedMetrics, nil
+	}
+
+	// Return nil if not connected to SQL Server
+	db, err := c.GetClient()
+	if err != nil {
+		return nil, fmt.Errorf("could not connect to SQL Server to collect AlwaysOn metrics: %w", err)
+	}
+	defer db.Close()
+
+	// Set connection timeout to prevent hanging
+	db.SetConnMaxLifetime(10 * time.Second)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	// First check if AlwaysOn is enabled
+	var isHAEnabled int
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, `
+		SELECT CASE 
+			WHEN SERVERPROPERTY('IsHadrEnabled') = 1 THEN 1
+			ELSE 0
+		END AS IsHAEnabled
+	`).Scan(&isHAEnabled)
+
+	if err != nil || isHAEnabled == 0 {
+		return nil, fmt.Errorf("AlwaysOn is not enabled on this instance")
+	}
+
+	metrics := &AlwaysOnMetrics{}
+
+	// Get basic AG information with a single optimized query
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, `
+		SELECT TOP 1 
+			ISNULL(ag.name, '') AS cluster_name,
+			ISNULL(ags.primary_replica, '') AS primary_replica,
+			ISNULL(ags.synchronization_health_desc, 'UNKNOWN') AS health_state,
+			ISNULL(ars.role_desc, 'UNKNOWN') AS local_role
+		FROM sys.availability_groups ag
+		JOIN sys.dm_hadr_availability_group_states ags ON ag.group_id = ags.group_id
+		JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+		JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id
+		WHERE ar.replica_server_name = @@SERVERNAME
+	`).Scan(
+		&metrics.ClusterName,
+		&metrics.PrimaryReplica,
+		&metrics.HealthState,
+		&metrics.LocalRole,
+	)
+
+	if err != nil {
+		log.Printf("Error getting basic AG information: %v", err)
+		// Try simplified fallback query
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = db.QueryRowContext(ctx, `
+			SELECT TOP 1 
+				ISNULL(ag.name, 'Unknown') AS cluster_name,
+				'Unknown' AS primary_replica,
+				'Unknown' AS health_state,
+				'Unknown' AS operational_state,
+				'Unknown' AS local_role
+			FROM sys.availability_groups ag
+		`).Scan(
+			&metrics.ClusterName,
+			&metrics.PrimaryReplica,
+			&metrics.HealthState,
+			&metrics.OperationalState,
+			&metrics.LocalRole,
+		)
+
+		if err != nil {
+			log.Printf("Fallback AG query also failed: %v", err)
+			metrics.ClusterName = "Unknown"
+			metrics.HealthState = "Unknown"
+			metrics.OperationalState = "Unknown"
+			metrics.LocalRole = "Unknown"
+		}
+	}
+
+	// Get replica information with limited results and timeout
+	ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT TOP 10
+			ISNULL(ar.replica_server_name, '') AS replica_name,
+			ISNULL(ars.role_desc, 'UNKNOWN') AS role,
+			ISNULL(ars.connected_state_desc, 'UNKNOWN') AS connection_state,
+			ISNULL(ar.availability_mode_desc, 'UNKNOWN') AS synchronization_mode,
+			ISNULL(ar.failover_mode_desc, 'UNKNOWN') AS failover_mode,
+			ISNULL(ar.availability_mode_desc, 'UNKNOWN') AS availability_mode,
+			CAST(ISNULL(ars.connected_state, 0) AS BIT) AS connected_state
+		FROM sys.availability_replicas ar
+		LEFT JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id
+		WHERE ar.group_id IN (
+			SELECT TOP 1 group_id FROM sys.availability_replicas WHERE replica_server_name = @@SERVERNAME
+		)
+	`)
+
+	if err != nil {
+		log.Printf("Error getting replica information (non-critical): %v", err)
+	} else {
+		defer rows.Close()
+		replicaCount := 0
+		for rows.Next() && replicaCount < 10 { // Limit to 10 replicas max
+			var replica ReplicaMetrics
+			var operationalState string // temporary variable for operational_state
+
+			err := rows.Scan(
+				&replica.ReplicaName,
+				&replica.Role,
+				&replica.ConnectionState,
+				&replica.SynchronizationMode,
+				&replica.FailoverMode,
+				&replica.AvailabilityMode,
+				&replica.ConnectedState,
+			)
+			if err != nil {
+				log.Printf("Error scanning replica row: %v", err)
+				continue
+			}
+
+			// Map operational_state to join_state or use a default value
+			replica.JoinState = operationalState // or set to "UNKNOWN" if needed
+
+			metrics.Replicas = append(metrics.Replicas, replica)
+			replicaCount++
+		}
+	}
+
+	// Get database replica status with limited results and basic info only
+	ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	rows, err = db.QueryContext(ctx, `
+		SELECT TOP 20
+			ISNULL(DB_NAME(drs.database_id), '') AS database_name,
+			ISNULL(ar.replica_server_name, '') AS replica_name,
+			ISNULL(drs.synchronization_state_desc, 'UNKNOWN') AS synchronization_state,
+			ISNULL(drs.suspend_reason_desc, '') AS suspend_reason,
+			ISNULL(drs.log_send_queue_size, 0) AS log_send_queue_size,
+			ISNULL(drs.redo_queue_size, 0) AS redo_queue_size
+		FROM sys.dm_hadr_database_replica_states drs
+		LEFT JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+		WHERE drs.group_id IN (
+			SELECT TOP 1 group_id FROM sys.availability_replicas WHERE replica_server_name = @@SERVERNAME
+		)
+		AND drs.database_id IS NOT NULL
+	`)
+
+	if err != nil {
+		log.Printf("Error getting database replica status (non-critical): %v", err)
+	} else {
+		defer rows.Close()
+		dbCount := 0
+		for rows.Next() && dbCount < 20 { // Limit to 20 databases max
+			var dbStatus DatabaseReplicaStatus
+			err := rows.Scan(
+				&dbStatus.DatabaseName,
+				&dbStatus.ReplicaName,
+				&dbStatus.SynchronizationState,
+				&dbStatus.SuspendReason,
+				&dbStatus.LogSendQueueSize,
+				&dbStatus.RedoQueueSize,
+			)
+			if err != nil {
+				log.Printf("Error scanning database replica status row: %v", err)
+				continue
+			}
+
+			// Set other fields to empty/default values to avoid additional queries
+			dbStatus.LastSentTime = ""
+			dbStatus.LastReceivedTime = ""
+			dbStatus.LastHardenedTime = ""
+			dbStatus.LastRedoneTime = ""
+			dbStatus.LogSendRate = 0
+			dbStatus.RedoRate = 0
+			dbStatus.FileStreamSendRate = 0
+			dbStatus.EndOfLogLSN = ""
+			dbStatus.RecoveryLSN = ""
+			dbStatus.TruncationLSN = ""
+			dbStatus.LastCommitLSN = ""
+			dbStatus.LastCommitTime = ""
+
+			metrics.Databases = append(metrics.Databases, dbStatus)
+
+			// If this is our current server, get basic replication lag metrics
+			hostname, _ := os.Hostname()
+			if dbStatus.ReplicaName == hostname && metrics.LocalRole == "SECONDARY" {
+				metrics.LogSendQueue = dbStatus.LogSendQueueSize
+				metrics.RedoQueue = dbStatus.RedoQueueSize
+			}
+			dbCount++
+		}
+	}
+
+	// Skip listener information collection to reduce load - can be added back if needed
+	// Listeners don't change frequently and cause additional database load
+
+	// Set default values for fields we're not collecting to reduce load
+	metrics.SynchronizationMode = "Unknown"
+	metrics.FailoverMode = "Unknown"
+	metrics.LastFailoverTime = "Unknown"
+	metrics.ReplicationLag = 0
+
+	// Cache the results for 5 minutes to avoid frequent database hits
+	c.cacheAlwaysOnMetrics(metrics)
+
+	log.Printf("AlwaysOn metrics collection completed successfully (optimized)")
+	return metrics, nil
+}
+
+// ExportAlwaysOnMetrics exports the detailed AlwaysOn metrics as a JSON object that can be
+// consumed by monitoring systems. This provides a way to access the metrics since they
+// can't be included in the protobuf message yet.
+func (c *MSSQLCollector) ExportAlwaysOnMetrics() (map[string]interface{}, error) {
+	metrics, err := c.GetAlwaysOnMetrics()
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect AlwaysOn metrics: %w", err)
+	}
+
+	if metrics == nil {
+		return nil, fmt.Errorf("no AlwaysOn configuration found on this server")
+	}
+
+	// Convert structured metrics to a map for easier extension and compatibility
+	result := map[string]interface{}{
+		"cluster_name":          metrics.ClusterName,
+		"health_state":          metrics.HealthState,
+		"operational_state":     metrics.OperationalState,
+		"synchronization_mode":  metrics.SynchronizationMode,
+		"failover_mode":         metrics.FailoverMode,
+		"primary_replica":       metrics.PrimaryReplica,
+		"local_role":            metrics.LocalRole,
+		"last_failover_time":    metrics.LastFailoverTime,
+		"replication_lag_ms":    metrics.ReplicationLag,
+		"log_send_queue_kb":     metrics.LogSendQueue,
+		"redo_queue_kb":         metrics.RedoQueue,
+		"replicas":              metrics.Replicas,
+		"databases":             metrics.Databases,
+		"listeners":             metrics.Listeners,
+		"timestamp":             time.Now().Unix(),
+		"collection_successful": true,
+	}
+
+	return result, nil
+}
+
+// GetAlwaysOnStatus returns a simplified status of the AlwaysOn configuration
+// for use in monitoring dashboards and alerts
+func (c *MSSQLCollector) GetAlwaysOnStatus() map[string]interface{} {
+	metrics, err := c.GetAlwaysOnMetrics()
+	if err != nil {
+		return map[string]interface{}{
+			"is_enabled": false,
+			"error":      err.Error(),
+			"status":     "ERROR",
+			"timestamp":  time.Now().Unix(),
+		}
+	}
+
+	if metrics == nil {
+		return map[string]interface{}{
+			"is_enabled": false,
+			"status":     "DISABLED",
+			"timestamp":  time.Now().Unix(),
+		}
+	}
+
+	// Determine overall status based on health state
+	status := "HEALTHY"
+	if metrics.HealthState != "HEALTHY" {
+		status = "UNHEALTHY"
+	}
+
+	// Count number of connected replicas
+	var connectedReplicas int
+	var totalReplicas = len(metrics.Replicas)
+
+	for _, replica := range metrics.Replicas {
+		if replica.ConnectedState {
+			connectedReplicas++
+		}
+	}
+
+	// Return simplified status for monitoring
+	return map[string]interface{}{
+		"is_enabled":         true,
+		"status":             status,
+		"health_state":       metrics.HealthState,
+		"operational_state":  metrics.OperationalState,
+		"local_role":         metrics.LocalRole,
+		"primary_replica":    metrics.PrimaryReplica,
+		"replication_lag_ms": metrics.ReplicationLag,
+		"connected_replicas": connectedReplicas,
+		"total_replicas":     totalReplicas,
+		"timestamp":          time.Now().Unix(),
+	}
+}
+
+// NormalizeData ensures all data types and formats are consistent to avoid false change detection
+func (m *MSSQLInfo) NormalizeData() {
+	// Ensure consistent memory format (always as int64, no scientific notation)
+	if m.TotalMemory < 0 {
+		m.TotalMemory = 0
+	}
+
+	// Ensure CPU count is reasonable and consistent
+	if m.TotalvCpu <= 0 {
+		m.TotalvCpu = 1 // Default to 1 if invalid
+	}
+
+	// Ensure FD percentage is within valid range
+	if m.FdPercent < 0 {
+		m.FdPercent = 0
+	} else if m.FdPercent > 100 {
+		m.FdPercent = 100
+	}
+
+	// Trim and normalize string fields to avoid whitespace comparison issues
+	m.ClusterName = strings.TrimSpace(m.ClusterName)
+	m.IP = strings.TrimSpace(m.IP)
+	m.Hostname = strings.TrimSpace(m.Hostname)
+	m.NodeStatus = strings.TrimSpace(m.NodeStatus)
+	m.Version = strings.TrimSpace(m.Version)
+	m.Location = strings.TrimSpace(m.Location)
+	m.Status = strings.TrimSpace(m.Status)
+	m.Instance = strings.TrimSpace(m.Instance)
+	m.FreeDisk = strings.TrimSpace(m.FreeDisk)
+	m.Port = strings.TrimSpace(m.Port)
+	m.ConfigPath = strings.TrimSpace(m.ConfigPath)
+	m.Database = strings.TrimSpace(m.Database)
+	m.HARole = strings.TrimSpace(m.HARole)
+	m.Edition = strings.TrimSpace(m.Edition)
+
+	// Normalize AlwaysOn metrics if present
+	if m.AlwaysOn != nil {
+		m.normalizeAlwaysOnMetrics()
+	}
+}
+
+// normalizeAlwaysOnMetrics normalizes AlwaysOn metrics data
+func (m *MSSQLInfo) normalizeAlwaysOnMetrics() {
+	if m.AlwaysOn == nil {
 		return
 	}
 
-	cacheFile := filepath.Join(cacheDir, "mssql_ip_cache.txt")
-	if err := os.WriteFile(cacheFile, []byte(ip), 0644); err != nil {
-		log.Printf("IP önbelleğe kaydedilemedi: %v", err)
+	// Normalize string fields
+	m.AlwaysOn.ClusterName = strings.TrimSpace(m.AlwaysOn.ClusterName)
+	m.AlwaysOn.HealthState = strings.TrimSpace(m.AlwaysOn.HealthState)
+	m.AlwaysOn.OperationalState = strings.TrimSpace(m.AlwaysOn.OperationalState)
+	m.AlwaysOn.SynchronizationMode = strings.TrimSpace(m.AlwaysOn.SynchronizationMode)
+	m.AlwaysOn.FailoverMode = strings.TrimSpace(m.AlwaysOn.FailoverMode)
+	m.AlwaysOn.PrimaryReplica = strings.TrimSpace(m.AlwaysOn.PrimaryReplica)
+	m.AlwaysOn.LocalRole = strings.TrimSpace(m.AlwaysOn.LocalRole)
+	m.AlwaysOn.LastFailoverTime = strings.TrimSpace(m.AlwaysOn.LastFailoverTime)
+
+	// Ensure numeric values are reasonable
+	if m.AlwaysOn.ReplicationLag < 0 {
+		m.AlwaysOn.ReplicationLag = 0
 	}
+	if m.AlwaysOn.LogSendQueue < 0 {
+		m.AlwaysOn.LogSendQueue = 0
+	}
+	if m.AlwaysOn.RedoQueue < 0 {
+		m.AlwaysOn.RedoQueue = 0
+	}
+
+	// Normalize replica metrics
+	for i := range m.AlwaysOn.Replicas {
+		replica := &m.AlwaysOn.Replicas[i]
+		replica.ReplicaName = strings.TrimSpace(replica.ReplicaName)
+		replica.Role = strings.TrimSpace(replica.Role)
+		replica.ConnectionState = strings.TrimSpace(replica.ConnectionState)
+		replica.SynchronizationMode = strings.TrimSpace(replica.SynchronizationMode)
+		replica.FailoverMode = strings.TrimSpace(replica.FailoverMode)
+		replica.AvailabilityMode = strings.TrimSpace(replica.AvailabilityMode)
+		replica.JoinState = strings.TrimSpace(replica.JoinState)
+		replica.SuspendReason = strings.TrimSpace(replica.SuspendReason)
+	}
+
+	// Normalize database replica status
+	for i := range m.AlwaysOn.Databases {
+		db := &m.AlwaysOn.Databases[i]
+		db.DatabaseName = strings.TrimSpace(db.DatabaseName)
+		db.ReplicaName = strings.TrimSpace(db.ReplicaName)
+		db.SynchronizationState = strings.TrimSpace(db.SynchronizationState)
+		db.SuspendReason = strings.TrimSpace(db.SuspendReason)
+		db.LastSentTime = strings.TrimSpace(db.LastSentTime)
+		db.LastReceivedTime = strings.TrimSpace(db.LastReceivedTime)
+		db.LastHardenedTime = strings.TrimSpace(db.LastHardenedTime)
+		db.LastRedoneTime = strings.TrimSpace(db.LastRedoneTime)
+		db.EndOfLogLSN = strings.TrimSpace(db.EndOfLogLSN)
+		db.RecoveryLSN = strings.TrimSpace(db.RecoveryLSN)
+		db.TruncationLSN = strings.TrimSpace(db.TruncationLSN)
+		db.LastCommitLSN = strings.TrimSpace(db.LastCommitLSN)
+		db.LastCommitTime = strings.TrimSpace(db.LastCommitTime)
+
+		// Ensure numeric values are reasonable
+		if db.LogSendQueueSize < 0 {
+			db.LogSendQueueSize = 0
+		}
+		if db.LogSendRate < 0 {
+			db.LogSendRate = 0
+		}
+		if db.RedoQueueSize < 0 {
+			db.RedoQueueSize = 0
+		}
+		if db.RedoRate < 0 {
+			db.RedoRate = 0
+		}
+		if db.FileStreamSendRate < 0 {
+			db.FileStreamSendRate = 0
+		}
+	}
+
+	// Normalize listener info
+	for i := range m.AlwaysOn.Listeners {
+		listener := &m.AlwaysOn.Listeners[i]
+		listener.ListenerName = strings.TrimSpace(listener.ListenerName)
+		listener.SubnetMask = strings.TrimSpace(listener.SubnetMask)
+		listener.ListenerState = strings.TrimSpace(listener.ListenerState)
+		listener.DNSName = strings.TrimSpace(listener.DNSName)
+
+		// Normalize IP addresses
+		for j := range listener.IPAddresses {
+			listener.IPAddresses[j] = strings.TrimSpace(listener.IPAddresses[j])
+		}
+
+		// Ensure port is reasonable
+		if listener.Port <= 0 || listener.Port > 65535 {
+			listener.Port = 1433 // Default SQL Server port
+		}
+	}
+}
+
+// Helper function to cache AlwaysOn metrics for 5 minutes
+func (c *MSSQLCollector) cacheAlwaysOnMetrics(metrics *AlwaysOnMetrics) {
+	cacheDir := c.getCacheDir()
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		log.Printf("AlwaysOn metrics önbellek dizini oluşturulamadı: %v", err)
+		return
+	}
+
+	// Add timestamp to metrics data
+	cacheData := struct {
+		Metrics   *AlwaysOnMetrics `json:"metrics"`
+		Timestamp int64            `json:"timestamp"`
+	}{
+		Metrics:   metrics,
+		Timestamp: time.Now().Unix(),
+	}
+
+	jsonData, err := json.Marshal(cacheData)
+	if err != nil {
+		log.Printf("AlwaysOn metrics JSON encode hatası: %v", err)
+		return
+	}
+
+	cacheFile := filepath.Join(cacheDir, "mssql_alwayson_metrics.json")
+	if err := os.WriteFile(cacheFile, jsonData, 0644); err != nil {
+		log.Printf("AlwaysOn metrics önbelleğe kaydedilemedi: %v", err)
+	} else {
+		log.Printf("AlwaysOn metrics başarıyla önbelleğe kaydedildi")
+	}
+}
+
+// Helper function to get cached AlwaysOn metrics
+func (c *MSSQLCollector) getCachedAlwaysOnMetrics() *AlwaysOnMetrics {
+	cacheFile := filepath.Join(c.getCacheDir(), "mssql_alwayson_metrics.json")
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return nil
+	}
+
+	var cacheData struct {
+		Metrics   *AlwaysOnMetrics `json:"metrics"`
+		Timestamp int64            `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(data, &cacheData); err != nil {
+		log.Printf("AlwaysOn metrics cache parse hatası: %v", err)
+		return nil
+	}
+
+	// Check if cache is recent (within last 5 minutes = 300 seconds)
+	if time.Now().Unix()-cacheData.Timestamp > 300 {
+		log.Printf("AlwaysOn metrics cache çok eski, yeni veri toplanacak")
+		return nil
+	}
+
+	log.Printf("AlwaysOn metrics cache'den alındı")
+	return cacheData.Metrics
+}
+
+// shouldCollectAlwaysOnMetrics checks if it's time to collect AlwaysOn metrics
+func (c *MSSQLCollector) shouldCollectAlwaysOnMetrics() bool {
+	// If collector is unhealthy, don't collect AlwaysOn metrics
+	if !c.IsHealthy() {
+		log.Printf("Skipping AlwaysOn metrics collection - collector unhealthy")
+		return false
+	}
+
+	// Check if cached metrics exist and are still fresh
+	cachedMetrics := c.getCachedAlwaysOnMetrics()
+
+	// If no cached metrics or cache is older than 4 minutes, collect new metrics
+	// This ensures we don't hit the database too frequently
+	if cachedMetrics == nil {
+		log.Printf("No cached AlwaysOn metrics found, collecting new data")
+		return true
+	}
+
+	// Cache exists and is fresh (less than 5 minutes old), skip collection
+	log.Printf("Fresh AlwaysOn metrics cache available, skipping collection to reduce load")
+	return false
+}
+
+// ClearCaches clears all MSSQL related cache files to remove any inconsistent data
+func (c *MSSQLCollector) ClearCaches() error {
+	cacheDir := c.getCacheDir()
+
+	// List of cache files to clear
+	cacheFiles := []string{
+		"mssql_system_metrics.json",
+		"mssql_disk_usage.json",
+		"mssql_ip_cache.txt",
+		"mssql_cpu_count.txt",
+		"mssql_memory.txt",
+		"mssql_config_path.txt",
+		"mssql_alwayson_metrics.json",
+		"mssql_ha_state.json",
+	}
+
+	var errors []string
+
+	for _, fileName := range cacheFiles {
+		filePath := filepath.Join(cacheDir, fileName)
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			errors = append(errors, fmt.Sprintf("%s: %v", fileName, err))
+			log.Printf("Cache file temizleme hatası %s: %v", fileName, err)
+		} else if err == nil {
+			log.Printf("Cache file temizlendi: %s", fileName)
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("some cache files could not be cleared: %s", strings.Join(errors, ", "))
+	}
+
+	log.Printf("Tüm MSSQL cache dosyaları başarıyla temizlendi")
+	return nil
+}
+
+// TestAlwaysOnSystemViews tests if AlwaysOn system views and columns are accessible
+func (c *MSSQLCollector) TestAlwaysOnSystemViews() error {
+	db, err := c.GetClient()
+	if err != nil {
+		return fmt.Errorf("could not connect to SQL Server: %w", err)
+	}
+	defer db.Close()
+
+	// Test basic availability groups query
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var testCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) 
+		FROM sys.availability_groups ag
+		JOIN sys.dm_hadr_availability_group_states ags ON ag.group_id = ags.group_id
+	`).Scan(&testCount)
+
+	if err != nil {
+		return fmt.Errorf("AlwaysOn system views test failed: %w", err)
+	}
+
+	log.Printf("AlwaysOn system views test successful, found %d availability groups", testCount)
+	return nil
+}
+
+// CanCollect checks if enough time has passed since last collection to prevent rate limiting
+func (c *MSSQLCollector) CanCollect() bool {
+	if time.Since(c.lastCollectionTime) < c.collectionInterval {
+		logger.Debug("Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
+		return false
+	}
+	return true
+}
+
+// SetCollectionTime updates the last collection time
+func (c *MSSQLCollector) SetCollectionTime() {
+	c.lastCollectionTime = time.Now()
+}
+
+// IsHealthy returns the current health state
+func (c *MSSQLCollector) IsHealthy() bool {
+	// Check health every 2 minutes
+	if time.Since(c.lastHealthCheck) > 2*time.Minute {
+		c.checkHealth()
+	}
+	return c.isHealthy
+}
+
+// checkHealth performs a simple health check
+func (c *MSSQLCollector) checkHealth() {
+	c.lastHealthCheck = time.Now()
+
+	// Simple connectivity test
+	db, err := c.GetClient()
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("Health check failed - marking collector as unhealthy: %v", err)
+		// Increase collection interval when unhealthy
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Quick test query
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var result int
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
+	db.Close()
+
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("Health check query failed - marking collector as unhealthy: %v", err)
+		c.collectionInterval = 2 * time.Minute
+	} else {
+		c.isHealthy = true
+		logger.Debug("Health check passed - collector is healthy")
+		c.collectionInterval = 30 * time.Second // Reset to normal interval
+	}
+}
+
+// ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
+func (c *MSSQLCollector) ShouldSkipCollection() bool {
+	if !c.CanCollect() {
+		return true
+	}
+
+	if !c.IsHealthy() {
+		logger.Debug("Skipping collection due to unhealthy state")
+		return true
+	}
+
+	return false
+}
+
+// getLastKnownGoodInfo returns the last cached information to avoid excessive DB calls
+func (c *MSSQLCollector) getLastKnownGoodInfo() *MSSQLInfo {
+	// Try to get cached system metrics
+	systemMetrics := c.getCachedSystemMetrics()
+
+	hostname, _ := os.Hostname()
+
+	// Create a basic info structure with cached or default values
+	info := &MSSQLInfo{
+		ClusterName: "",
+		IP:          "",
+		Hostname:    hostname,
+		NodeStatus:  "UNKNOWN",
+		Version:     "Unknown",
+		Location:    c.cfg.MSSQL.Location,
+		Status:      "RATE_LIMITED", // Indicate this is a rate-limited response
+		Instance:    c.cfg.MSSQL.Instance,
+		FreeDisk:    "Unknown",
+		FdPercent:   0,
+		Port:        c.cfg.MSSQL.Port,
+		TotalvCpu:   0,
+		TotalMemory: 0,
+		ConfigPath:  "",
+		Database:    c.cfg.MSSQL.Database,
+		IsHAEnabled: false,
+		HARole:      "UNKNOWN",
+		Edition:     "Unknown",
+		AlwaysOn:    nil,
+	}
+
+	// Fill in cached values if available
+	if systemMetrics != nil {
+		if ipVal, ok := systemMetrics["ip_address"].(string); ok {
+			info.IP = ipVal
+		}
+		if cpuVal, ok := systemMetrics["cpu_count"]; ok {
+			if cpu, ok := cpuVal.(int32); ok {
+				info.TotalvCpu = cpu
+			}
+		}
+		if memVal, ok := systemMetrics["total_memory"]; ok {
+			if mem, ok := memVal.(int64); ok {
+				info.TotalMemory = mem
+			}
+		}
+	}
+
+	// Try to get cached HA state
+	haState, hasHAState := c.getHAStateFromCache("mssql_ha_state")
+	if hasHAState {
+		info.NodeStatus = haState.role
+		info.ClusterName = haState.group
+		info.IsHAEnabled = (haState.role != "STANDALONE" && haState.role != "")
+		info.HARole = haState.role
+	}
+
+	// Try to get cached disk usage
+	if cachedDisk := c.getCachedDiskUsage(); cachedDisk != nil {
+		if freeDisk, ok := cachedDisk["free_disk"].(string); ok {
+			info.FreeDisk = freeDisk
+		}
+		if usagePercent, ok := cachedDisk["usage_percent"]; ok {
+			switch v := usagePercent.(type) {
+			case int:
+				info.FdPercent = int32(v)
+			case float64:
+				info.FdPercent = int32(v)
+			}
+		}
+	}
+
+	// Get cached config path
+	info.ConfigPath = c.getCachedConfigPath()
+
+	// Normalize data
+	info.NormalizeData()
+
+	logger.Debug("Returned cached/rate-limited info to prevent overload")
+	return info
 }

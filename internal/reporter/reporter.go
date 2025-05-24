@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -415,20 +416,159 @@ type Reporter struct {
 	reportTicker *time.Ticker        // Periyodik raporlama için ticker
 	alarmMonitor *alarm.AlarmMonitor // Alarm izleme sistemi
 	platform     string              // Added to keep track of the platform
+
+	// Rate limiting and circuit breaker fields
+	lastConnectionAttempt  time.Time
+	connectionInterval     time.Duration
+	maxRetries             int
+	isHealthy              bool
+	lastHealthCheck        time.Time
+	consecutiveFailures    int
+	maxConsecutiveFailures int
 }
 
 // NewReporter yeni bir Reporter örneği oluşturur
 func NewReporter(cfg *config.AgentConfig) *Reporter {
 	return &Reporter{
-		cfg:         cfg,
-		stopCh:      make(chan struct{}),
-		isListening: false,
-		platform:    "", // Platform bilgisi AgentRegistration sırasında set edilecek
+		cfg:                    cfg,
+		stopCh:                 make(chan struct{}),
+		isListening:            false,
+		platform:               "",              // Platform bilgisi AgentRegistration sırasında set edilecek
+		connectionInterval:     5 * time.Second, // Minimum 5 seconds between connection attempts
+		maxRetries:             10,
+		isHealthy:              true,
+		lastHealthCheck:        time.Now(),
+		consecutiveFailures:    0,
+		maxConsecutiveFailures: 3,
 	}
 }
 
-// Connect GRPC sunucusuna bağlanır
-func (r *Reporter) Connect() error {
+// CanConnect checks if enough time has passed since last connection attempt
+func (r *Reporter) CanConnect() bool {
+	if time.Since(r.lastConnectionAttempt) < r.connectionInterval {
+		log.Printf("Connection rate limiting: Not enough time passed since last attempt (min interval: %v)", r.connectionInterval)
+		return false
+	}
+	return true
+}
+
+// SetConnectionTime updates the last connection attempt time
+func (r *Reporter) SetConnectionTime() {
+	r.lastConnectionAttempt = time.Now()
+}
+
+// IsHealthy returns the current health state of the connection
+func (r *Reporter) IsHealthy() bool {
+	// Check health every 2 minutes
+	if time.Since(r.lastHealthCheck) > 2*time.Minute {
+		r.checkHealth()
+	}
+	return r.isHealthy
+}
+
+// checkHealth performs a simple health check
+func (r *Reporter) checkHealth() {
+	r.lastHealthCheck = time.Now()
+
+	if r.grpcClient == nil {
+		r.isHealthy = false
+		return
+	}
+
+	// Simple connectivity test
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := pb.NewAgentServiceClient(r.grpcClient)
+	_, err := client.GetThresholdSettings(ctx, &pb.GetThresholdSettingsRequest{
+		AgentId: "health_check",
+	})
+
+	if err != nil {
+		r.consecutiveFailures++
+		if r.consecutiveFailures >= r.maxConsecutiveFailures {
+			r.isHealthy = false
+			log.Printf("gRPC connection marked as unhealthy after %d consecutive failures", r.consecutiveFailures)
+			// Increase connection interval when unhealthy
+			r.connectionInterval = 30 * time.Second
+		}
+	} else {
+		r.consecutiveFailures = 0
+		r.isHealthy = true
+		r.connectionInterval = 5 * time.Second // Reset to normal interval
+	}
+}
+
+// ShouldSkipConnection determines if connection should be skipped due to rate limiting or health issues
+func (r *Reporter) ShouldSkipConnection() bool {
+	if !r.CanConnect() {
+		return true
+	}
+
+	if !r.IsHealthy() {
+		log.Printf("Skipping connection due to unhealthy state")
+		return true
+	}
+
+	return false
+}
+
+// connectWithBackoff attempts to connect with exponential backoff and jitter
+func (r *Reporter) connectWithBackoff() error {
+	baseDelay := 1 * time.Second
+	maxDelay := 2 * time.Minute
+	maxRetries := r.maxRetries
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Check if we should skip this attempt
+		if r.ShouldSkipConnection() && attempt > 1 {
+			log.Printf("Connection attempt %d/%d skipped due to rate limiting or health check", attempt, maxRetries)
+			return fmt.Errorf("connection skipped due to rate limiting or health check")
+		}
+
+		// Update connection attempt time
+		r.SetConnectionTime()
+
+		log.Printf("gRPC connection attempt %d/%d to %s", attempt, maxRetries, r.cfg.GRPC.ServerAddress)
+
+		err := r.connectDirect()
+		if err == nil {
+			r.consecutiveFailures = 0
+			r.isHealthy = true
+			r.connectionInterval = 5 * time.Second
+			log.Printf("gRPC connection successful after %d attempts", attempt)
+			return nil
+		}
+
+		r.consecutiveFailures++
+		log.Printf("gRPC connection attempt %d/%d failed: %v", attempt, maxRetries, err)
+
+		// Don't wait after the last attempt
+		if attempt < maxRetries {
+			// Calculate delay with exponential backoff
+			delay := time.Duration(1<<uint(attempt-1)) * baseDelay
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+
+			// Add jitter to prevent thundering herd (±20% randomization)
+			jitter := time.Duration(float64(delay) * 0.2 * (2*rand.Float64() - 1))
+			delay += jitter
+
+			log.Printf("Waiting %v before retry %d/%d (with jitter)", delay, attempt+1, maxRetries)
+			time.Sleep(delay)
+		}
+	}
+
+	// Mark as unhealthy after max retries
+	r.isHealthy = false
+	r.connectionInterval = 2 * time.Minute // Long interval when unhealthy
+
+	return fmt.Errorf("failed to connect after %d attempts", maxRetries)
+}
+
+// connectDirect performs the actual connection without retry logic
+func (r *Reporter) connectDirect() error {
 	// GRPC bağlantısı oluştur
 	log.Printf("ClusterEye sunucusuna bağlanıyor: %s", r.cfg.GRPC.ServerAddress)
 
@@ -441,32 +581,35 @@ func (r *Reporter) Connect() error {
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
 				BaseDelay:  1.0 * time.Second,
-				Multiplier: 1.5,
+				Multiplier: 1.6, // Slightly more aggressive than default 1.5
 				Jitter:     0.2,
-				MaxDelay:   20 * time.Second,
+				MaxDelay:   30 * time.Second, // Reduced from 120s
 			},
 			MinConnectTimeout: 10 * time.Second,
 		}),
 
-		// Otomatik yeniden bağlantı etkinleştir
-		grpc.WithDisableServiceConfig(),
+		// Connection pool and timeout settings
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(32*1024*1024), // 32MB
+			grpc.MaxCallSendMsgSize(32*1024*1024), // 32MB
+		),
 
-		// Keep-alive seçenekleri
+		// Keep-alive seçenekleri - more conservative to prevent ENHANCE_YOUR_CALM
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                60 * time.Second, // 60 saniyede bir ping (daha önce 10 saniyeydi, arttırdık)
-			Timeout:             10 * time.Second, // 10 saniye ping timeout
-			PermitWithoutStream: false,            // Stream yokken ping gönderme (daha önce true'ydu)
+			Time:                90 * time.Second, // Increased from 60s to 90s
+			Timeout:             15 * time.Second, // Increased from 10s to 15s
+			PermitWithoutStream: false,            // Keep disabled to avoid unnecessary pings
 		}),
 	}
 
-	// Bağlantı için context oluştur
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Bağlantı için context oluştur - shorter timeout
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer dialCancel()
 
 	// gRPC bağlantısını oluştur
 	conn, err := grpc.DialContext(dialCtx, r.cfg.GRPC.ServerAddress, opts...)
 	if err != nil {
-		return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
+		return fmt.Errorf("gRPC bağlantısı kurulamadı: %w", err)
 	}
 
 	r.grpcClient = conn
@@ -474,15 +617,15 @@ func (r *Reporter) Connect() error {
 	// gRPC client oluştur
 	client := pb.NewAgentServiceClient(conn)
 
-	// ÖNEMLİ: Stream bağlantısı için iptal EDİLMEYEN bir context kullan
-	// defer cancel() çağrılıyordu ve fonksiyon çıkışında stream iptal ediliyordu!
+	// Stream bağlantısı için context - no timeout for long-lived stream
 	streamCtx := context.Background()
 
 	// Stream bağlantısını başlat
 	stream, err := client.Connect(streamCtx)
 	if err != nil {
 		r.grpcClient.Close() // Bağlantıyı temizle
-		return fmt.Errorf("stream bağlantısı kurulamadı: %v", err)
+		r.grpcClient = nil
+		return fmt.Errorf("stream bağlantısı kurulamadı: %w", err)
 	}
 
 	r.stream = stream
@@ -4513,4 +4656,9 @@ func createBasicPlanXML(query string, database string, startTime time.Time) map[
 		"estimated":   true, // Gerçek plan olmadığını belirt
 		"message":     "Gerçek execution plan alınamadı, tahmini temel bir plan oluşturuldu",
 	}
+}
+
+// Connect GRPC sunucusuna bağlanır (wrapper for connectWithBackoff)
+func (r *Reporter) Connect() error {
+	return r.connectWithBackoff()
 }

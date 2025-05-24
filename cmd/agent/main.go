@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"time"
 
 	"github.com/kardianos/service"
 	"github.com/senbaris/clustereye-agent/internal/agent"
@@ -130,11 +132,29 @@ func setupFileLogging() {
 		log.Fatalf("Failed to get executable path: %v", err)
 	}
 	logDir := filepath.Dir(exePath)
+
+	// Log rotasyon ayarları
+	maxLogSize := int64(100 * 1024 * 1024) // 100MB
+	maxLogFiles := 5                       // Saklanacak maksimum log dosyası sayısı
+
+	// Ana log dosyası
 	logFile := filepath.Join(logDir, "agent.log")
 
-	// Eğer log dosyası çok büyükse eski logu .old olarak taşı
-	if info, err := os.Stat(logFile); err == nil && info.Size() > maxLogSize {
-		_ = os.Rename(logFile, logFile+".old")
+	// Mevcut log dosyasının boyutunu kontrol et
+	info, err := os.Stat(logFile)
+	if err == nil && info.Size() > maxLogSize {
+		// Rotasyon gerekli, tarihe göre eski dosyayı adlandır
+		timestamp := time.Now().Format("2006-01-02_15-04-05")
+		backupFile := filepath.Join(logDir, fmt.Sprintf("agent_%s.log", timestamp))
+
+		if err := os.Rename(logFile, backupFile); err != nil {
+			log.Printf("Log rotasyonu yapılamadı: %v", err)
+		} else {
+			log.Printf("Log rotasyonu yapıldı: %s", backupFile)
+		}
+
+		// Eski log dosyalarını temizle (maksimum sayıyı aşarsa)
+		cleanupOldLogs(logDir, maxLogFiles)
 	}
 
 	// Dosyayı aç
@@ -148,4 +168,38 @@ func setupFileLogging() {
 	logger.SetOutput(f)
 
 	logger.Info("Dosya log sistemi başarıyla etkinleştirildi, log seviyesi: %s", logger.LevelToString(logger.GetLevel()))
+}
+
+// Eski log dosyalarını temizler, sadece en yeni n dosyayı tutar
+func cleanupOldLogs(logDir string, keepCount int) {
+	// Tüm log dosyalarını bul
+	pattern := filepath.Join(logDir, "agent_*.log")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		log.Printf("Eski log dosyaları bulunamadı: %v", err)
+		return
+	}
+
+	// Log dosyalarını oluşturma tarihine göre sırala (en eskiler önce)
+	sort.Slice(matches, func(i, j int) bool {
+		infoI, errI := os.Stat(matches[i])
+		infoJ, errJ := os.Stat(matches[j])
+
+		if errI != nil || errJ != nil {
+			return false
+		}
+
+		return infoI.ModTime().Before(infoJ.ModTime())
+	})
+
+	// Maksimum sayıyı aşan en eski dosyaları sil
+	if len(matches) > keepCount {
+		for i := 0; i < len(matches)-keepCount; i++ {
+			if err := os.Remove(matches[i]); err != nil {
+				log.Printf("Eski log dosyası silinemedi %s: %v", matches[i], err)
+			} else {
+				log.Printf("Eski log dosyası silindi: %s", matches[i])
+			}
+		}
+	}
 }

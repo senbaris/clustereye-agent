@@ -3,11 +3,11 @@ package alarm
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -963,59 +963,66 @@ func (m *AlarmMonitor) checkDiskUsage() {
 	var maxUsageFS string
 
 	if runtime.GOOS == "windows" {
-		// Windows için PowerShell kullan
-		cmd := exec.Command("powershell", "-Command",
-			"Get-Volume | Where-Object {$_.DriveLetter} | Select-Object DriveLetter, @{Name='UsedPercent';Expression={100 - (100 * $_.SizeRemaining / $_.Size)}}, @{Name='Size';Expression={$_.Size}}, @{Name='FreeSpace';Expression={$_.SizeRemaining}} | ConvertTo-Json")
+		// Windows için wmic komutunu kullan (PowerShell yerine çok daha hafif)
+		cmd := exec.Command("wmic", "logicaldisk", "get", "DeviceID,Size,FreeSpace", "/format:csv")
 		output, err := cmd.Output()
 		if err != nil {
 			logger.Error("Windows disk kullanımı alınamadı: %v", err)
 			return
 		}
 
-		// JSON çıktısını parse et
-		var volumes []map[string]interface{}
-		err = json.Unmarshal(output, &volumes)
-		if err != nil {
-			// Tek bir volume için farklı format
-			var singleVolume map[string]interface{}
-			if err := json.Unmarshal(output, &singleVolume); err != nil {
-				logger.Error("Windows disk kullanım bilgisi parse edilemedi: %v", err)
-				return
-			}
-			volumes = []map[string]interface{}{singleVolume}
+		// CSV çıktısını parse et
+		lines := strings.Split(string(output), "\n")
+		if len(lines) < 2 {
+			logger.Warning("Disk kullanım bilgisi parse edilemedi")
+			return
 		}
 
-		for _, volume := range volumes {
-			driveLetter, ok := volume["DriveLetter"].(string)
-			if !ok || driveLetter == "" {
+		// CSV çıktısını işle (ilk satır başlık)
+		for _, line := range lines[1:] {
+			if strings.TrimSpace(line) == "" {
 				continue
 			}
 
-			usedPercent, ok := volume["UsedPercent"].(float64)
-			if !ok {
+			// CSV formatında Node,DeviceID,FreeSpace,Size şeklinde
+			fields := strings.Split(line, ",")
+			if len(fields) < 4 {
 				continue
 			}
 
-			// Size ve FreeSpace'i formatla
-			var sizeBytes, freeBytes float64
-			size, ok := volume["Size"].(float64)
-			if ok {
-				sizeBytes = size
+			// Sadece gerçek sürücüleri (C:, D: gibi) al
+			driveLetter := strings.TrimSpace(fields[1])
+			// Sürücü harfi içermiyorsa veya boş ise atla
+			if !strings.Contains(driveLetter, ":") || driveLetter == "" {
+				continue
+			}
+			driveLetter = strings.ReplaceAll(driveLetter, ":", "")
+
+			// Size ve FreeSpace'i parse et
+			freeSpaceStr := strings.TrimSpace(fields[2])
+			sizeStr := strings.TrimSpace(fields[3])
+
+			freeSpace, err := strconv.ParseFloat(freeSpaceStr, 64)
+			if err != nil {
+				continue
 			}
 
-			freeSpace, ok := volume["FreeSpace"].(float64)
-			if ok {
-				freeBytes = freeSpace
+			size, err := strconv.ParseFloat(sizeStr, 64)
+			if err != nil || size == 0 {
+				continue
 			}
+
+			// Kullanım yüzdesini hesapla
+			usedPercent := 100.0 * (1.0 - (freeSpace / size))
 
 			// Threshold'u aşan sürücüleri kaydet
 			if usedPercent >= m.thresholds.DiskThreshold {
 				// İnsan tarafından okunabilir formata çevir
-				sizeStr := formatBytes(sizeBytes)
-				freeStr := formatBytes(freeBytes)
+				sizeFormatted := formatBytes(size)
+				freeFormatted := formatBytes(freeSpace)
 
 				fsInfo := fmt.Sprintf("Drive %s: %.2f%% used (Size: %s, Free: %s)",
-					driveLetter, usedPercent, sizeStr, freeStr)
+					driveLetter, usedPercent, sizeFormatted, freeFormatted)
 				highUsageFilesystems = append(highUsageFilesystems, fsInfo)
 
 				// En yüksek kullanımı takip et
@@ -1836,16 +1843,42 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 
 	// 4. Yöntem: Son çare olarak genel sistem CPU kullanımına bak (Windows için)
 	if !cpuUsageObtained && runtime.GOOS == "windows" {
-		cmd := exec.Command("powershell", "-Command",
-			"Get-WmiObject Win32_PerfFormattedData_PerfOS_Processor | Select-Object -ExpandProperty PercentProcessorTime")
+		// PowerShell yerine doğrudan wmic komutunu kullan (daha az CPU kullanımı)
+		cmd := exec.Command("wmic", "cpu", "get", "LoadPercentage", "/value")
 		output, err := cmd.Output()
 		if err == nil {
+			// LoadPercentage=XX formatında çıktıyı parse et
 			cpuStr := strings.TrimSpace(string(output))
-			cpuVal, err := strconv.ParseFloat(cpuStr, 64)
+			if match := regexp.MustCompile(`LoadPercentage=(\d+)`).FindStringSubmatch(cpuStr); len(match) > 1 {
+				cpuVal, err := strconv.ParseFloat(match[1], 64)
+				if err == nil {
+					cpuUsage = cpuVal
+					cpuUsageObtained = true
+					logger.Info("[DEBUG] Sistem CPU kullanımı (wmic): %.2f%%", cpuUsage)
+				}
+			}
+		}
+
+		// Eğer wmic başarısız olursa alternatif bir komut deneyelim
+		if !cpuUsageObtained {
+			cmd = exec.Command("typeperf", "-sc", "1", "\\Processor(_Total)\\% Processor Time")
+			output, err = cmd.Output()
 			if err == nil {
-				cpuUsage = cpuVal
-				cpuUsageObtained = true
-				logger.Info("[DEBUG] Sistem CPU kullanımı (Windows): %.2f%%", cpuUsage)
+				lines := strings.Split(string(output), "\n")
+				// typeperf çıktısı CSV formatında, 3. satırda değer var
+				if len(lines) >= 3 {
+					fields := strings.Split(lines[2], ",")
+					if len(fields) >= 2 {
+						// Çift tırnaklı değeri temizle
+						valueStr := strings.Trim(fields[1], "\"")
+						cpuVal, err := strconv.ParseFloat(valueStr, 64)
+						if err == nil {
+							cpuUsage = cpuVal
+							cpuUsageObtained = true
+							logger.Info("[DEBUG] Sistem CPU kullanımı (typeperf): %.2f%%", cpuUsage)
+						}
+					}
+				}
 			}
 		}
 	}
