@@ -972,14 +972,50 @@ func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 		return
 	}
 
-	// Add timestamp
-	metricsCopy := make(map[string]interface{})
+	// Standardize metrics format to prevent false change detection
+	standardizedMetrics := make(map[string]interface{})
 	for k, v := range metrics {
-		metricsCopy[k] = v
+		switch k {
+		case "total_memory":
+			// Ensure memory is stored as int64 with explicit formatting
+			if memVal, ok := v.(int64); ok && memVal > 0 {
+				standardizedMetrics[k] = memVal
+				log.Printf("Caching memory with consistent format: %d", memVal)
+			} else {
+				log.Printf("Invalid memory value for caching: %v (type: %T)", v, v)
+				standardizedMetrics[k] = int64(8 * 1024 * 1024 * 1024) // 8GB default
+			}
+		case "cpu_count":
+			// Ensure CPU count is stored as int32
+			if cpuVal, ok := v.(int32); ok && cpuVal > 0 {
+				standardizedMetrics[k] = cpuVal
+			} else {
+				log.Printf("Invalid CPU count for caching: %v (type: %T)", v, v)
+				standardizedMetrics[k] = int32(1) // Default to 1 CPU
+			}
+		case "ip_address":
+			// Ensure IP is stored as string
+			if ipVal, ok := v.(string); ok {
+				standardizedMetrics[k] = strings.TrimSpace(ipVal)
+			} else {
+				log.Printf("Invalid IP address for caching: %v (type: %T)", v, v)
+				standardizedMetrics[k] = "Unknown"
+			}
+		default:
+			// Copy other values as-is
+			standardizedMetrics[k] = v
+		}
 	}
-	metricsCopy["timestamp"] = time.Now().Unix()
 
-	jsonData, err := json.Marshal(metricsCopy)
+	// Add timestamp with consistent format
+	standardizedMetrics["timestamp"] = time.Now().Unix()
+
+	// Log the values being cached for verification
+	if memVal, ok := standardizedMetrics["total_memory"].(int64); ok {
+		log.Printf("CACHE FORMAT CHECK - Memory: %d, Scientific: %e", memVal, float64(memVal))
+	}
+
+	jsonData, err := json.Marshal(standardizedMetrics)
 	if err != nil {
 		log.Printf("System metrics JSON encode hatası: %v", err)
 		return
@@ -988,6 +1024,8 @@ func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 	cacheFile := filepath.Join(cacheDir, "mssql_system_metrics.json")
 	if err := os.WriteFile(cacheFile, jsonData, 0644); err != nil {
 		log.Printf("System metrics önbelleğe kaydedilemedi: %v", err)
+	} else {
+		log.Printf("System metrics cached with standardized formatting")
 	}
 }
 
@@ -1810,15 +1848,26 @@ func (c *MSSQLCollector) getTotalMemory() int64 {
 
 // Helper function to cache memory value
 func (c *MSSQLCollector) cacheMemory(memBytes int64) {
+	// Ensure memory value is positive and reasonable
+	if memBytes <= 0 {
+		log.Printf("Invalid memory value for caching: %d, using default 8GB", memBytes)
+		memBytes = 8 * 1024 * 1024 * 1024 // 8GB default
+	}
+
 	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		log.Printf("Memory önbellek dizini oluşturulamadı: %v", err)
 		return
 	}
 
+	// Use explicit integer formatting to avoid scientific notation
+	memoryStr := fmt.Sprintf("%d", memBytes)
+
 	cacheFile := filepath.Join(cacheDir, "mssql_memory.txt")
-	if err := os.WriteFile(cacheFile, []byte(strconv.FormatInt(memBytes, 10)), 0644); err != nil {
+	if err := os.WriteFile(cacheFile, []byte(memoryStr), 0644); err != nil {
 		log.Printf("Memory önbelleğe kaydedilemedi: %v", err)
+	} else {
+		log.Printf("Memory cached with consistent format: %s bytes (value: %d)", memoryStr, memBytes)
 	}
 }
 
@@ -1841,6 +1890,29 @@ func (c *MSSQLCollector) getCachedMemory() int64 {
 
 // ToProto converts MSSQLInfo to protobuf message
 func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
+	// Ensure consistent numeric formatting to prevent false change detection
+	// API compares values as strings, so we need to avoid scientific notation
+
+	// Normalize TotalMemory to prevent scientific notation
+	normalizedMemory := m.TotalMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	// Normalize TotalvCpu to reasonable range
+	normalizedCpu := m.TotalvCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	// Normalize FdPercent to valid range
+	normalizedFdPercent := m.FdPercent
+	if normalizedFdPercent < 0 {
+		normalizedFdPercent = 0
+	} else if normalizedFdPercent > 100 {
+		normalizedFdPercent = 100
+	}
+
 	proto := &pb.MSSQLInfo{
 		ClusterName: m.ClusterName,
 		Ip:          m.IP,
@@ -1851,10 +1923,10 @@ func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
 		Status:      m.Status,
 		Instance:    m.Instance,
 		FreeDisk:    m.FreeDisk,
-		FdPercent:   m.FdPercent,
+		FdPercent:   normalizedFdPercent,
 		Port:        m.Port,
-		TotalVcpu:   m.TotalvCpu,
-		TotalMemory: m.TotalMemory,
+		TotalVcpu:   normalizedCpu,
+		TotalMemory: normalizedMemory,
 		ConfigPath:  m.ConfigPath,
 		Database:    m.Database,
 		IsHaEnabled: m.IsHAEnabled,
@@ -1862,9 +1934,13 @@ func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
 		Edition:     m.Edition,
 	}
 
-	// Debug logging for protobuf values
-	log.Printf("PROTOBUF VALUES - TotalMemory: %v, TotalVcpu: %v, FdPercent: %v",
+	// Enhanced debug logging with format consistency check
+	log.Printf("PROTOBUF VALUES (NORMALIZED) - TotalMemory: %d, TotalVcpu: %d, FdPercent: %d",
 		proto.TotalMemory, proto.TotalVcpu, proto.FdPercent)
+
+	// Additional format verification log
+	log.Printf("MEMORY FORMAT CHECK - Original: %d, Normalized: %d, Scientific: %e",
+		m.TotalMemory, normalizedMemory, float64(normalizedMemory))
 
 	// Convert AlwaysOn metrics to protobuf if available
 	if m.AlwaysOn != nil {

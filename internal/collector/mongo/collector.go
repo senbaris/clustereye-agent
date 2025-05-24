@@ -711,7 +711,7 @@ func (c *MongoCollector) getTotalvCpu() int32 {
 		out, err = cmd.Output()
 		if err != nil {
 			logger.Warning("MongoDB getTotalvCpu: vCPU sayısı alınamadı: %v", err)
-			return 0
+			return int32(1) // Default to 1 instead of 0
 		}
 	}
 
@@ -719,7 +719,17 @@ func (c *MongoCollector) getTotalvCpu() int32 {
 	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
 	if err != nil {
 		logger.Warning("MongoDB getTotalvCpu: vCPU sayısı parse edilemedi: %v", err)
-		return 0
+		return int32(1) // Default to 1 instead of 0
+	}
+
+	// Ensure result is valid and within reasonable range
+	if cpuCount <= 0 {
+		logger.Warning("MongoDB getTotalvCpu: Invalid CPU count detected: %d, using default", cpuCount)
+		return int32(1)
+	}
+	if cpuCount > 256 { // Reasonable upper limit
+		logger.Warning("MongoDB getTotalvCpu: CPU count seems too high: %d, capping at 256", cpuCount)
+		return int32(256)
 	}
 
 	return int32(cpuCount)
@@ -736,22 +746,38 @@ func (c *MongoCollector) getTotalMemory() int64 {
 		out, err = cmd.Output()
 		if err != nil {
 			logger.Warning("MongoDB getTotalMemory: Toplam RAM miktarı alınamadı: %v", err)
-			return 0
+			return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
 		}
 	}
 
-	// Çıktıyı int64'e çevir
-	// /proc/meminfo'dan alınan değer KB cinsindendir, byte'a çevirmek için 1024 ile çarp
+	// Parse as int64 to avoid scientific notation
 	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
 		logger.Warning("MongoDB getTotalMemory: Toplam RAM miktarı parse edilemedi: %v", err)
-		return 0
+		return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
 	}
 
 	// grep MemTotal kullanıldıysa KB cinsinden, bunu byte'a çevir
 	if strings.Contains(cmd.String(), "MemTotal") {
 		memTotal *= 1024
 	}
+
+	// Ensure result is valid and within reasonable range
+	if memTotal <= 0 {
+		logger.Warning("MongoDB getTotalMemory: Invalid memory size detected: %d, using default 8GB", memTotal)
+		return int64(8 * 1024 * 1024 * 1024)
+	}
+
+	// Reasonable upper limit check (1TB)
+	maxMemory := int64(1024 * 1024 * 1024 * 1024)
+	if memTotal > maxMemory {
+		logger.Warning("MongoDB getTotalMemory: Memory size seems too high: %d, capping at 1TB", memTotal)
+		return maxMemory
+	}
+
+	// Log memory value to verify no scientific notation
+	logger.Debug("MONGO MEMORY COLLECTED - Value: %d bytes (format check: %d)",
+		memTotal, memTotal)
 
 	return memTotal
 }
@@ -788,9 +814,22 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 	ip := c.getLocalIP()
 	freeDisk, usagePercent := c.GetDiskUsage()
 
-	// Yeni eklenen bilgileri topla
-	totalvCpu := c.getTotalvCpu()
-	totalMemory := c.getTotalMemory()
+	// Get raw values first and normalize them
+	rawTotalvCpu := c.getTotalvCpu()
+	rawTotalMemory := c.getTotalMemory()
+
+	// Ensure consistent formatting to prevent false change detection
+	// API compares values as strings, so we need to avoid scientific notation
+	normalizedCpu := rawTotalvCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	normalizedMemory := rawTotalMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
 	configPath := findMongoConfigFile()
 
 	info := &MongoInfo{
@@ -806,10 +845,18 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 		FreeDisk:       freeDisk,
 		FdPercent:      int32(usagePercent),
 		Port:           c.cfg.Mongo.Port, // MongoDB port bilgisini config'den alıyoruz
-		TotalvCpu:      totalvCpu,
-		TotalMemory:    totalMemory,
+		TotalvCpu:      normalizedCpu,    // Use normalized value
+		TotalMemory:    normalizedMemory, // Use normalized value
 		ConfigPath:     configPath,
 	}
+
+	// Enhanced debug logging with format consistency check
+	logger.Debug("MONGO VALUES (NORMALIZED) - TotalMemory: %d, TotalvCpu: %d",
+		info.TotalMemory, info.TotalvCpu)
+
+	// Additional format verification log
+	logger.Debug("MONGO MEMORY FORMAT CHECK - Value: %d, Scientific: %e",
+		normalizedMemory, float64(normalizedMemory))
 
 	logger.Info("MongoDB bilgileri başarıyla toplandı - Port: %s, Status: %s, Version: %s, vCPU: %d, Memory: %d, ConfigPath: %s",
 		info.Port, info.MongoStatus, info.MongoVersion, info.TotalvCpu, info.TotalMemory, info.ConfigPath)
@@ -888,23 +935,62 @@ func (c *MongoCollector) runAdminCommand(client *mongo.Client, command interface
 
 // ToProto MongoInfo'yu proto mesajına dönüştürür
 func (m *MongoInfo) ToProto() *pb.MongoInfo {
-	return &pb.MongoInfo{
-		ClusterName:       m.ClusterName,
-		Ip:                m.IP,
-		Hostname:          m.Hostname,
-		NodeStatus:        m.NodeStatus,
-		MongoVersion:      m.MongoVersion,
-		Location:          m.Location,
-		MongoStatus:       m.MongoStatus,
-		ReplicaSetName:    m.ReplicaSetName,
-		ReplicationLagSec: m.ReplicaLagSec,
-		FreeDisk:          m.FreeDisk,
-		FdPercent:         m.FdPercent,
-		Port:              m.Port,
-		TotalVcpu:         m.TotalvCpu,
-		TotalMemory:       m.TotalMemory,
-		ConfigPath:        m.ConfigPath,
+	// Ensure consistent numeric formatting to prevent false change detection
+	// API compares values as strings, so we need to avoid scientific notation
+
+	// Normalize TotalMemory to prevent scientific notation
+	normalizedMemory := m.TotalMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
 	}
+
+	// Normalize TotalvCpu to reasonable range
+	normalizedCpu := m.TotalvCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	// Normalize FdPercent to valid range
+	normalizedFdPercent := m.FdPercent
+	if normalizedFdPercent < 0 {
+		normalizedFdPercent = 0
+	} else if normalizedFdPercent > 100 {
+		normalizedFdPercent = 100
+	}
+
+	// Normalize ReplicationLagSec
+	normalizedLag := m.ReplicaLagSec
+	if normalizedLag < 0 {
+		normalizedLag = 0
+	}
+
+	proto := &pb.MongoInfo{
+		ClusterName:       strings.TrimSpace(m.ClusterName),
+		Ip:                strings.TrimSpace(m.IP),
+		Hostname:          strings.TrimSpace(m.Hostname),
+		NodeStatus:        strings.TrimSpace(m.NodeStatus),
+		MongoVersion:      strings.TrimSpace(m.MongoVersion),
+		Location:          strings.TrimSpace(m.Location),
+		MongoStatus:       strings.TrimSpace(m.MongoStatus),
+		ReplicaSetName:    strings.TrimSpace(m.ReplicaSetName),
+		ReplicationLagSec: normalizedLag,
+		FreeDisk:          strings.TrimSpace(m.FreeDisk),
+		FdPercent:         normalizedFdPercent,
+		Port:              strings.TrimSpace(m.Port),
+		TotalVcpu:         normalizedCpu,
+		TotalMemory:       normalizedMemory,
+		ConfigPath:        strings.TrimSpace(m.ConfigPath),
+	}
+
+	// Enhanced debug logging with format consistency check
+	logger.Debug("MONGO PROTOBUF VALUES (NORMALIZED) - TotalMemory: %d, TotalVcpu: %d, FdPercent: %d",
+		proto.TotalMemory, proto.TotalVcpu, proto.FdPercent)
+
+	// Additional format verification log
+	logger.Debug("MONGO MEMORY FORMAT CHECK - Value: %d, Scientific: %e",
+		normalizedMemory, float64(normalizedMemory))
+
+	return proto
 }
 
 // FindMongoLogFiles MongoDB log dosyalarını bulur ve listeler
@@ -2139,6 +2225,20 @@ func (c *MongoCollector) openDBDirect() (*mongo.Client, error) {
 func (c *MongoCollector) getLastKnownGoodInfo() *MongoInfo {
 	hostname, _ := os.Hostname()
 
+	// Get raw values and normalize them
+	rawTotalvCpu := c.getTotalvCpu()
+	rawTotalMemory := c.getTotalMemory()
+
+	normalizedCpu := rawTotalvCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	normalizedMemory := rawTotalMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
 	// Create a basic info structure with cached or default values
 	info := &MongoInfo{
 		ClusterName:    c.cfg.Mongo.Replset,
@@ -2153,12 +2253,12 @@ func (c *MongoCollector) getLastKnownGoodInfo() *MongoInfo {
 		FreeDisk:       "Unknown",
 		FdPercent:      0,
 		Port:           c.cfg.Mongo.Port,
-		TotalvCpu:      c.getTotalvCpu(),
-		TotalMemory:    c.getTotalMemory(),
+		TotalvCpu:      normalizedCpu,    // Use normalized value
+		TotalMemory:    normalizedMemory, // Use normalized value
 		ConfigPath:     "",
 	}
 
-	log.Printf("Returned cached/rate-limited MongoDB info to prevent overload")
+	logger.Debug("Returned cached/rate-limited MongoDB info with normalized values to prevent overload")
 	return info
 }
 

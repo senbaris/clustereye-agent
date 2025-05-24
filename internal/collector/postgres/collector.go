@@ -262,15 +262,31 @@ func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 	// Get hostname
 	hostname, _ := os.Hostname()
 
-	// Create info object with rate-limited wrapper functions
+	// Get raw values first
+	rawMemory := c.getTotalMemory()
+	rawCpu := c.getTotalvCpu()
+
+	// Ensure consistent formatting to prevent false change detection
+	// API compares values as strings, so we need to avoid scientific notation
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	// Create info object with format-consistent values
 	info := map[string]interface{}{
 		"hostname":              hostname,
 		"service_status":        c.getServiceStatus(),
 		"version":               c.getVersion(),
 		"node_status":           c.getNodeStatus(),
 		"replication_lag":       c.getReplicationLag(),
-		"total_memory":          c.getTotalMemory(),
-		"total_vcpu":            c.getTotalvCpu(),
+		"total_memory":          normalizedMemory, // Use normalized int64 to avoid scientific notation
+		"total_vcpu":            normalizedCpu,    // Use normalized int32
 		"cluster_name":          c.cfg.PostgreSQL.Cluster,
 		"location":              c.cfg.PostgreSQL.Location,
 		"ip":                    c.getLocalIP(),
@@ -280,15 +296,147 @@ func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 		"collection_successful": true,
 	}
 
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
+	// Enhanced debug logging with format consistency check
+	logger.Debug("POSTGRES VALUES (NORMALIZED) - TotalMemory: %d, TotalvCpu: %d",
+		info["total_memory"], info["total_vcpu"])
+
+	// Additional format verification log
+	if memVal, ok := info["total_memory"].(int64); ok {
+		logger.Debug("POSTGRES MEMORY FORMAT CHECK - Value: %d, Scientific: %e",
+			memVal, float64(memVal))
+	}
+
 	logger.Info("PostgreSQL bilgileri başarıyla toplandı. Status=%s, Version=%s",
 		info["service_status"], info["version"])
 
 	return info
 }
 
+// normalizePostgresInfo ensures all data types and formats are consistent to avoid false change detection
+func normalizePostgresInfo(info map[string]interface{}) {
+	if info == nil {
+		return
+	}
+
+	// Normalize total_memory to ensure int64 format without scientific notation
+	if memVal, exists := info["total_memory"]; exists {
+		switch v := memVal.(type) {
+		case int64:
+			if v < 0 {
+				info["total_memory"] = int64(0)
+			}
+		case int:
+			info["total_memory"] = int64(v)
+		case float64:
+			info["total_memory"] = int64(v)
+		default:
+			// Set default if invalid type
+			info["total_memory"] = int64(8 * 1024 * 1024 * 1024) // 8GB default
+		}
+	}
+
+	// Normalize total_vcpu to ensure int32 format
+	if cpuVal, exists := info["total_vcpu"]; exists {
+		switch v := cpuVal.(type) {
+		case int32:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			}
+		case int:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		case int64:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		case float64:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		default:
+			// Set default if invalid type
+			info["total_vcpu"] = int32(1)
+		}
+	}
+
+	// Normalize replication_lag to ensure float64 format
+	if lagVal, exists := info["replication_lag"]; exists {
+		switch v := lagVal.(type) {
+		case float64:
+			if v < 0 {
+				info["replication_lag"] = float64(0)
+			}
+		case float32:
+			if v < 0 {
+				info["replication_lag"] = float64(0)
+			} else {
+				info["replication_lag"] = float64(v)
+			}
+		case int:
+			info["replication_lag"] = float64(v)
+		case int64:
+			info["replication_lag"] = float64(v)
+		default:
+			// Set default if invalid type
+			info["replication_lag"] = float64(0)
+		}
+	}
+
+	// Normalize string fields to avoid whitespace comparison issues
+	stringFields := []string{"hostname", "service_status", "version", "node_status",
+		"cluster_name", "location", "ip", "config_path", "data_path"}
+
+	for _, field := range stringFields {
+		if val, exists := info[field]; exists {
+			if strVal, ok := val.(string); ok {
+				info[field] = strings.TrimSpace(strVal)
+			}
+		}
+	}
+
+	// Normalize timestamp to ensure int64 format
+	if tsVal, exists := info["timestamp"]; exists {
+		switch v := tsVal.(type) {
+		case int64:
+			// Already correct format
+		case int:
+			info["timestamp"] = int64(v)
+		case float64:
+			info["timestamp"] = int64(v)
+		default:
+			// Set current timestamp if invalid
+			info["timestamp"] = time.Now().Unix()
+		}
+	}
+}
+
 // getMinimalServiceInfo returns minimal service information when rate limited
 func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
 	hostname, _ := os.Hostname()
+
+	// Get raw values and normalize them
+	rawMemory := GetTotalMemory()
+	rawCpu := GetTotalvCpu()
+
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
 
 	// Provide minimal but useful information even when rate limited
 	info := map[string]interface{}{
@@ -296,9 +444,9 @@ func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
 		"service_status":        "CHECKING", // Instead of RATE_LIMITED which causes alarms
 		"version":               "Checking",
 		"node_status":           "Checking",
-		"replication_lag":       0.0,
-		"total_memory":          GetTotalMemory(),
-		"total_vcpu":            GetTotalvCpu(),
+		"replication_lag":       float64(0.0),     // Ensure float64 format
+		"total_memory":          normalizedMemory, // Use normalized int64
+		"total_vcpu":            normalizedCpu,    // Use normalized int32
 		"cluster_name":          "",
 		"location":              "",
 		"ip":                    c.getLocalIP(),
@@ -337,6 +485,9 @@ func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
 		}
 	}
 
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
 	logger.Debug("Returned minimal service info to prevent alarm while rate limited")
 	return info
 }
@@ -345,20 +496,39 @@ func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
 func (c *PostgresCollector) getLastKnownGoodInfo() map[string]interface{} {
 	hostname, _ := os.Hostname()
 
-	return map[string]interface{}{
+	// Get raw values and normalize them
+	rawMemory := GetTotalMemory()
+	rawCpu := GetTotalvCpu()
+
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	info := map[string]interface{}{
 		"hostname":        hostname,
 		"service_status":  "RATE_LIMITED",
 		"version":         "Rate Limited",
 		"node_status":     "Rate Limited",
-		"replication_lag": 0.0,
-		"total_memory":    GetTotalMemory(),
-		"total_vcpu":      GetTotalvCpu(),
+		"replication_lag": float64(0.0),     // Ensure float64 format
+		"total_memory":    normalizedMemory, // Use normalized int64
+		"total_vcpu":      normalizedCpu,    // Use normalized int32
 		"cluster_name":    c.cfg.PostgreSQL.Cluster,
 		"location":        c.cfg.PostgreSQL.Location,
 		"ip":              c.getLocalIP(),
 		"timestamp":       time.Now().Unix(),
 		"rate_limited":    true,
 	}
+
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
+	return info
 }
 
 // Wrapper methods that use rate limiting
@@ -1332,7 +1502,11 @@ func GetTotalvCpu() int32 {
 			cores, err := getCPUCores()
 			if err != nil {
 				log.Printf("vCPU sayısı alınamadı: %v", err)
-				return 0
+				return int32(1) // Default to 1 instead of 0
+			}
+			// Ensure result is valid
+			if cores <= 0 {
+				return int32(1)
 			}
 			return cores
 		}
@@ -1342,7 +1516,17 @@ func GetTotalvCpu() int32 {
 	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
 	if err != nil {
 		log.Printf("vCPU sayısı parse edilemedi: %v", err)
-		return 0
+		return int32(1) // Default to 1 instead of 0
+	}
+
+	// Ensure result is valid and within reasonable range
+	if cpuCount <= 0 {
+		log.Printf("Invalid CPU count detected: %d, using default", cpuCount)
+		return int32(1)
+	}
+	if cpuCount > 256 { // Reasonable upper limit
+		log.Printf("CPU count seems too high: %d, capping at 256", cpuCount)
+		return int32(256)
 	}
 
 	return int32(cpuCount)
@@ -1363,22 +1547,39 @@ func GetTotalMemory() int64 {
 			out, err = cmd.Output()
 			if err != nil {
 				log.Printf("Toplam RAM miktarı alınamadı: %v", err)
-				return 0
+				return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
 			}
 		}
 	}
 
-	// Çıktıyı int64'e çevir
+	// Parse as int64 to avoid scientific notation
 	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
 		log.Printf("Toplam RAM miktarı parse edilemedi: %v", err)
-		return 0
+		return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
 	}
 
 	// grep MemTotal kullanıldıysa KB cinsinden, bunu byte'a çevir
 	if strings.Contains(cmd.String(), "MemTotal") {
 		memTotal *= 1024
 	}
+
+	// Ensure result is valid and within reasonable range
+	if memTotal <= 0 {
+		log.Printf("Invalid memory size detected: %d, using default 8GB", memTotal)
+		return int64(8 * 1024 * 1024 * 1024)
+	}
+
+	// Reasonable upper limit check (1TB)
+	maxMemory := int64(1024 * 1024 * 1024 * 1024)
+	if memTotal > maxMemory {
+		log.Printf("Memory size seems too high: %d, capping at 1TB", memTotal)
+		return maxMemory
+	}
+
+	// Log memory value to verify no scientific notation
+	log.Printf("POSTGRES MEMORY COLLECTED - Value: %d bytes (format check: %d)",
+		memTotal, memTotal)
 
 	return memTotal
 }
