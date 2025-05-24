@@ -671,6 +671,21 @@ func (r *Reporter) Report(data *pb.PostgresInfo) error {
 
 // SendMSSQLInfo MSSQL bilgilerini toplar ve sunucuya gönderir
 func (r *Reporter) SendMSSQLInfo() error {
+	// gRPC client nil check - API restart edildiğinde nil olabiliyor
+	if r.grpcClient == nil {
+		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
+		if err := r.reconnect(); err != nil {
+			log.Printf("MSSQL bilgileri gönderilemedi - gRPC bağlantısı kurulamadı: %v", err)
+			return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
+		}
+
+		// Hala nil ise hata döndür
+		if r.grpcClient == nil {
+			log.Printf("MSSQL bilgileri gönderilemedi - gRPC client hala nil")
+			return fmt.Errorf("gRPC client yeniden bağlantıdan sonra hala nil")
+		}
+	}
+
 	// MSSQL kolektörünü oluştur
 	log.Printf("MSSQL bilgileri toplanıyor...")
 	collector := mssql.NewMSSQLCollector(r.cfg)
@@ -848,19 +863,45 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 
 		// Alarm izleme sistemini başlat
 		agentID := "agent_" + hostname
-		client := pb.NewAgentServiceClient(r.grpcClient)
 
-		// Client yenileme callback'i tanımla
-		clientRefreshCallback := func() (pb.AgentServiceClient, error) {
-			// Client'ı yenilemek için önce bağlantıyı yenileyip sonra yeni bir client oluştur
+		// gRPC client nil check - API restart edildiğinde nil olabiliyor
+		if r.grpcClient == nil {
+			log.Printf("gRPC client nil, alarm monitor için yeniden bağlantı kuruluyor...")
 			if err := r.reconnect(); err != nil {
-				return nil, fmt.Errorf("client yenilenemedi: %v", err)
-			}
-			return pb.NewAgentServiceClient(r.grpcClient), nil
-		}
+				log.Printf("Alarm monitor başlatılamadı - gRPC bağlantısı kurulamadı: %v", err)
+				// Alarm monitor kurulamazsa devam et, ama log kaydet
+			} else if r.grpcClient != nil {
+				// Bağlantı başarılı, client oluştur
+				client := pb.NewAgentServiceClient(r.grpcClient)
 
-		r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform, clientRefreshCallback)
-		r.alarmMonitor.Start()
+				// Client yenileme callback'i tanımla
+				clientRefreshCallback := func() (pb.AgentServiceClient, error) {
+					// Client'ı yenilemek için önce bağlantıyı yenileyip sonra yeni bir client oluştur
+					if err := r.reconnect(); err != nil {
+						return nil, fmt.Errorf("client yenilenemedi: %v", err)
+					}
+					return pb.NewAgentServiceClient(r.grpcClient), nil
+				}
+
+				r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform, clientRefreshCallback)
+				r.alarmMonitor.Start()
+			}
+		} else {
+			// gRPC client zaten mevcut
+			client := pb.NewAgentServiceClient(r.grpcClient)
+
+			// Client yenileme callback'i tanımla
+			clientRefreshCallback := func() (pb.AgentServiceClient, error) {
+				// Client'ı yenilemek için önce bağlantıyı yenileyip sonra yeni bir client oluştur
+				if err := r.reconnect(); err != nil {
+					return nil, fmt.Errorf("client yenilenemedi: %v", err)
+				}
+				return pb.NewAgentServiceClient(r.grpcClient), nil
+			}
+
+			r.alarmMonitor = alarm.NewAlarmMonitor(client, agentID, r.cfg, platform, clientRefreshCallback)
+			r.alarmMonitor.Start()
+		}
 
 		return nil // Başarılı
 	}
@@ -2988,8 +3029,23 @@ func (r *Reporter) reconnect() error {
 	return nil
 }
 
-// SendPostgresInfo PostgreSQL bilgilerini sunucuya gönderir
+// SendPostgresInfo PostgreSQL bilgilerini toplar ve sunucuya gönderir
 func (r *Reporter) SendPostgresInfo() error {
+	// gRPC client nil check - API restart edildiğinde nil olabiliyor
+	if r.grpcClient == nil {
+		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
+		if err := r.reconnect(); err != nil {
+			log.Printf("PostgreSQL bilgileri gönderilemedi - gRPC bağlantısı kurulamadı: %v", err)
+			return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
+		}
+
+		// Hala nil ise hata döndür
+		if r.grpcClient == nil {
+			log.Printf("PostgreSQL bilgileri gönderilemedi - gRPC client hala nil")
+			return fmt.Errorf("gRPC client yeniden bağlantıdan sonra hala nil")
+		}
+	}
+
 	log.Printf("SendPostgresInfo metodu çağrıldı")
 	log.Println("PostgreSQL bilgileri toplanıyor...")
 
@@ -3072,6 +3128,21 @@ func (r *Reporter) SendPostgresInfo() error {
 
 // SendMongoInfo MongoDB bilgilerini sunucuya gönderir
 func (r *Reporter) SendMongoInfo() error {
+	// gRPC client nil check - API restart edildiğinde nil olabiliyor
+	if r.grpcClient == nil {
+		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
+		if err := r.reconnect(); err != nil {
+			log.Printf("MongoDB bilgileri gönderilemedi - gRPC bağlantısı kurulamadı: %v", err)
+			return fmt.Errorf("gRPC bağlantısı kurulamadı: %v", err)
+		}
+
+		// Hala nil ise hata döndür
+		if r.grpcClient == nil {
+			log.Printf("MongoDB bilgileri gönderilemedi - gRPC client hala nil")
+			return fmt.Errorf("gRPC client yeniden bağlantıdan sonra hala nil")
+		}
+	}
+
 	log.Println("MongoDB bilgileri toplanıyor...")
 
 	// MongoDB kolektörünü import et
@@ -3396,6 +3467,29 @@ func (r *Reporter) FreezeMongoSecondary(ctx context.Context, req *pb.MongoFreeze
 func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.PostgresPromoteMasterRequest) (*pb.PostgresPromoteMasterResponse, error) {
 	log.Printf("PostgreSQL Master Promotion işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, DataDirectory: %s",
 		req.JobId, req.AgentId, req.NodeHostname, req.DataDirectory)
+
+	// gRPC client nil check - API restart edildiğinde nil olabiliyor
+	if r.grpcClient == nil {
+		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
+		if err := r.reconnect(); err != nil {
+			log.Printf("PostgreSQL promotion işlemi başlatılamadı - gRPC bağlantısı kurulamadı: %v", err)
+			return &pb.PostgresPromoteMasterResponse{
+				JobId:        req.JobId,
+				Status:       pb.JobStatus_JOB_STATUS_FAILED,
+				ErrorMessage: fmt.Sprintf("gRPC bağlantısı kurulamadı: %v", err),
+			}, nil
+		}
+
+		// Hala nil ise hata döndür
+		if r.grpcClient == nil {
+			log.Printf("PostgreSQL promotion işlemi başlatılamadı - gRPC client hala nil")
+			return &pb.PostgresPromoteMasterResponse{
+				JobId:        req.JobId,
+				Status:       pb.JobStatus_JOB_STATUS_FAILED,
+				ErrorMessage: "gRPC client yeniden bağlantıdan sonra hala nil",
+			}, nil
+		}
+	}
 
 	// Log izleyici oluştur ve başlat
 	// Burada req.JobId kullanılıyor çünkü işlem ID'si dışarıdan geliyor
