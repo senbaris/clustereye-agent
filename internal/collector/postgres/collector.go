@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -313,9 +314,11 @@ func (c *PostgresCollector) getDataPath() string {
 
 // Global collector instance for backward compatibility
 var defaultPostgresCollector *PostgresCollector
+var collectorMutex sync.RWMutex // Thread-safe access
 
 func init() {
 	// Initialize default collector - will be updated when config is available
+	collectorMutex.Lock()
 	defaultPostgresCollector = &PostgresCollector{
 		collectionInterval: 30 * time.Second,
 		maxRetries:         3,
@@ -323,13 +326,26 @@ func init() {
 		isHealthy:          true,
 		lastHealthCheck:    time.Now(),
 	}
-	log.Printf("PostgreSQL default collector initialized in init()")
+	collectorMutex.Unlock()
+	log.Printf("PostgreSQL default collector initialized in init() with thread safety")
 }
 
-// EnsureDefaultCollector ensures the default collector is initialized
+// EnsureDefaultCollector ensures the default collector is initialized (thread-safe)
 func EnsureDefaultCollector() {
+	collectorMutex.RLock()
+	if defaultPostgresCollector != nil {
+		collectorMutex.RUnlock()
+		return
+	}
+	collectorMutex.RUnlock()
+
+	// Need to create new collector
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+
+	// Double-check in case another goroutine created it
 	if defaultPostgresCollector == nil {
-		log.Printf("WARNING: defaultPostgresCollector was nil, reinitializing...")
+		log.Printf("WARNING: defaultPostgresCollector was nil, reinitializing with thread safety...")
 		defaultPostgresCollector = &PostgresCollector{
 			collectionInterval: 30 * time.Second,
 			maxRetries:         3,
@@ -340,14 +356,24 @@ func EnsureDefaultCollector() {
 	}
 }
 
-// UpdateDefaultPostgresCollector updates the default collector with proper config
-func UpdateDefaultPostgresCollector(cfg *config.AgentConfig) {
-	defaultPostgresCollector = NewPostgresCollector(cfg)
+// GetDefaultCollectorSafe returns the default collector in a thread-safe manner
+func GetDefaultCollectorSafe() *PostgresCollector {
+	collectorMutex.RLock()
+	defer collectorMutex.RUnlock()
+	return defaultPostgresCollector
 }
 
-// GetDefaultPostgresCollector returns the default collector instance
+// UpdateDefaultPostgresCollector updates the default collector with proper config (thread-safe)
+func UpdateDefaultPostgresCollector(cfg *config.AgentConfig) {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+	defaultPostgresCollector = NewPostgresCollector(cfg)
+	log.Printf("PostgreSQL default collector updated with new config (thread-safe)")
+}
+
+// GetDefaultPostgresCollector returns the default collector instance (thread-safe)
 func GetDefaultPostgresCollector() *PostgresCollector {
-	return defaultPostgresCollector
+	return GetDefaultCollectorSafe()
 }
 
 // PostgresLogFile PostgreSQL log dosyasını temsil eder
@@ -371,24 +397,28 @@ func (p *PostgresLogFile) ToProto() map[string]interface{} {
 
 // OpenDB veritabanı bağlantısını açar
 func OpenDB() (*sql.DB, error) {
-	// Check rate limiting first - but only if collector exists
-	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+	// Check rate limiting first - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
 		return nil, fmt.Errorf("PostgreSQL collection rate limited or collector unhealthy")
 	}
 
-	// Update collection time - but only if collector exists
-	if defaultPostgresCollector != nil {
-		defaultPostgresCollector.SetCollectionTime()
+	// Update collection time - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil {
+		collectorMutex.Lock()
+		collector.SetCollectionTime()
+		collectorMutex.Unlock()
 	}
 
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in OpenDB: %v", r)
-			// Mark as unhealthy after panic - but check for nil first
-			if defaultPostgresCollector != nil {
-				defaultPostgresCollector.isHealthy = false
-				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
 			}
 		}
 	}()
@@ -428,16 +458,18 @@ func GetPGServiceStatus() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetPGServiceStatus: %v", r)
-			// Mark as unhealthy after panic - but check for nil first
-			if defaultPostgresCollector != nil {
-				defaultPostgresCollector.isHealthy = false
-				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
 			}
 		}
 	}()
 
-	// Check rate limiting - but only if collector exists
-	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+	// Check rate limiting - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
 		return "RATE_LIMITED"
 	}
 
@@ -482,16 +514,18 @@ func GetPGVersion() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetPGVersion: %v", r)
-			// Mark as unhealthy after panic - but check for nil first
-			if defaultPostgresCollector != nil {
-				defaultPostgresCollector.isHealthy = false
-				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
 			}
 		}
 	}()
 
-	// Check rate limiting - but only if collector exists
-	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+	// Check rate limiting - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
 		return "Rate Limited"
 	}
 
@@ -531,16 +565,18 @@ func GetNodeStatus() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetNodeStatus: %v", r)
-			// Mark as unhealthy after panic - but check for nil first
-			if defaultPostgresCollector != nil {
-				defaultPostgresCollector.isHealthy = false
-				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
 			}
 		}
 	}()
 
-	// Check rate limiting - but only if collector exists
-	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+	// Check rate limiting - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
 		return "Rate Limited"
 	}
 
@@ -570,6 +606,23 @@ func GetNodeStatus() string {
 
 // openDBDirect creates a database connection without rate limiting for critical operations
 func openDBDirect() (*sql.DB, error) {
+	// Ensure collector is initialized with thread safety
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in openDBDirect: %v", r)
+			// Mark as unhealthy after panic - but check for nil first with thread safety
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
 	cfg, err := config.LoadAgentConfig()
 	if err != nil {
 		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
@@ -592,6 +645,16 @@ func openDBDirect() (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(10 * time.Second)
+
+	// Test connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("PostgreSQL direct connection test failed: %w", err)
+	}
 
 	return db, nil
 }
@@ -686,16 +749,18 @@ func GetReplicationLagSec() float64 {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetReplicationLagSec: %v", r)
-			// Mark as unhealthy after panic
-			if defaultPostgresCollector != nil {
-				defaultPostgresCollector.isHealthy = false
-				defaultPostgresCollector.collectionInterval = 5 * time.Minute
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
 			}
 		}
 	}()
 
-	// Check rate limiting
-	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
+	// Check rate limiting - thread-safe
+	if collector := GetDefaultCollectorSafe(); collector != nil && collector.ShouldSkipCollection() {
 		return 0
 	}
 
