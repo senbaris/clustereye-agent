@@ -230,7 +230,9 @@ func (c *PostgresCollector) getServiceStatus() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in getServiceStatus: %v", r)
-			c.isHealthy = false
+			if c != nil {
+				c.isHealthy = false
+			}
 		}
 	}()
 
@@ -242,7 +244,9 @@ func (c *PostgresCollector) getVersion() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in getVersion: %v", r)
-			c.isHealthy = false
+			if c != nil {
+				c.isHealthy = false
+			}
 		}
 	}()
 
@@ -254,7 +258,9 @@ func (c *PostgresCollector) getNodeStatus() string {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in getNodeStatus: %v", r)
-			c.isHealthy = false
+			if c != nil {
+				c.isHealthy = false
+			}
 		}
 	}()
 
@@ -266,7 +272,9 @@ func (c *PostgresCollector) getReplicationLag() float64 {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in getReplicationLag: %v", r)
-			c.isHealthy = false
+			if c != nil {
+				c.isHealthy = false
+			}
 		}
 	}()
 
@@ -315,6 +323,21 @@ func init() {
 		isHealthy:          true,
 		lastHealthCheck:    time.Now(),
 	}
+	log.Printf("PostgreSQL default collector initialized in init()")
+}
+
+// EnsureDefaultCollector ensures the default collector is initialized
+func EnsureDefaultCollector() {
+	if defaultPostgresCollector == nil {
+		log.Printf("WARNING: defaultPostgresCollector was nil, reinitializing...")
+		defaultPostgresCollector = &PostgresCollector{
+			collectionInterval: 30 * time.Second,
+			maxRetries:         3,
+			backoffDuration:    5 * time.Second,
+			isHealthy:          true,
+			lastHealthCheck:    time.Now(),
+		}
+	}
 }
 
 // UpdateDefaultPostgresCollector updates the default collector with proper config
@@ -348,12 +371,12 @@ func (p *PostgresLogFile) ToProto() map[string]interface{} {
 
 // OpenDB veritabanı bağlantısını açar
 func OpenDB() (*sql.DB, error) {
-	// Check rate limiting first
+	// Check rate limiting first - but only if collector exists
 	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
 		return nil, fmt.Errorf("PostgreSQL collection rate limited or collector unhealthy")
 	}
 
-	// Update collection time
+	// Update collection time - but only if collector exists
 	if defaultPostgresCollector != nil {
 		defaultPostgresCollector.SetCollectionTime()
 	}
@@ -362,7 +385,7 @@ func OpenDB() (*sql.DB, error) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in OpenDB: %v", r)
-			// Mark as unhealthy after panic
+			// Mark as unhealthy after panic - but check for nil first
 			if defaultPostgresCollector != nil {
 				defaultPostgresCollector.isHealthy = false
 				defaultPostgresCollector.collectionInterval = 5 * time.Minute
@@ -398,11 +421,14 @@ func OpenDB() (*sql.DB, error) {
 }
 
 func GetPGServiceStatus() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetPGServiceStatus: %v", r)
-			// Mark as unhealthy after panic
+			// Mark as unhealthy after panic - but check for nil first
 			if defaultPostgresCollector != nil {
 				defaultPostgresCollector.isHealthy = false
 				defaultPostgresCollector.collectionInterval = 5 * time.Minute
@@ -410,7 +436,7 @@ func GetPGServiceStatus() string {
 		}
 	}()
 
-	// Check rate limiting
+	// Check rate limiting - but only if collector exists
 	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
 		return "RATE_LIMITED"
 	}
@@ -449,11 +475,14 @@ func GetPGServiceStatus() string {
 
 // GetPGVersion PostgreSQL versiyonunu döndürür
 func GetPGVersion() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetPGVersion: %v", r)
-			// Mark as unhealthy after panic
+			// Mark as unhealthy after panic - but check for nil first
 			if defaultPostgresCollector != nil {
 				defaultPostgresCollector.isHealthy = false
 				defaultPostgresCollector.collectionInterval = 5 * time.Minute
@@ -461,7 +490,7 @@ func GetPGVersion() string {
 		}
 	}()
 
-	// Check rate limiting
+	// Check rate limiting - but only if collector exists
 	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
 		return "Rate Limited"
 	}
@@ -495,11 +524,14 @@ func GetPGVersion() string {
 
 // GetNodeStatus node'un master/slave durumunu döndürür
 func GetNodeStatus() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("PANIC in GetNodeStatus: %v", r)
-			// Mark as unhealthy after panic
+			// Mark as unhealthy after panic - but check for nil first
 			if defaultPostgresCollector != nil {
 				defaultPostgresCollector.isHealthy = false
 				defaultPostgresCollector.collectionInterval = 5 * time.Minute
@@ -507,7 +539,7 @@ func GetNodeStatus() string {
 		}
 	}()
 
-	// Check rate limiting
+	// Check rate limiting - but only if collector exists
 	if defaultPostgresCollector != nil && defaultPostgresCollector.ShouldSkipCollection() {
 		return "Rate Limited"
 	}
@@ -647,6 +679,9 @@ func GetDataDirectory() (string, error) {
 
 // GetReplicationLagSec replication lag'i saniye cinsinden döndürür
 func GetReplicationLagSec() float64 {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
@@ -676,7 +711,7 @@ func GetReplicationLagSec() float64 {
 		return 0
 	}
 
-	var lag float64
+	var lag sql.NullFloat64 // Use NullFloat64 to handle NULL values
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -692,7 +727,13 @@ func GetReplicationLagSec() float64 {
 		return 0
 	}
 
-	return lag
+	// Handle NULL values properly
+	if !lag.Valid {
+		log.Printf("Replication lag NULL döndürüldü, 0 olarak işleniyor")
+		return 0
+	}
+
+	return lag.Float64
 }
 
 // GetPGBouncerStatus PgBouncer servisinin durumunu kontrol eder
