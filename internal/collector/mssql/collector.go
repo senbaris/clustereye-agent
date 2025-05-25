@@ -2514,32 +2514,63 @@ func (c *MSSQLCollector) getTotalvCpu() int32 {
 	var result int32 = 0
 
 	if runtime.GOOS == "windows" {
-		// Direct command
-		cmd := exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors", "/value")
+		// First try: Get total number of logical processors from computersystem
+		cmd := exec.Command("wmic", "computersystem", "get", "NumberOfLogicalProcessors", "/value")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 		out, err := cmdWithTimeout.Output()
 		if err == nil {
-			// Parse the output line by line to avoid parsing issues
+			// Parse the output
+			outStr := strings.TrimSpace(string(out))
+			if matches := regexp.MustCompile(`NumberOfLogicalProcessors=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+				if count, err := strconv.ParseInt(matches[1], 10, 32); err == nil && count > 0 {
+					result = int32(count)
+					// Cache the result
+					c.cacheCPUCount(result)
+					log.Printf("Got total CPU count via wmic computersystem: %d", result)
+					return result
+				}
+			}
+		}
+
+		// Fallback: Sum up all CPU cores
+		cmd = exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors", "/value")
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err = cmdWithTimeout.Output()
+		if err == nil {
+			// Parse all CPU entries and sum them up
 			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			totalCores := int32(0)
+			cpuCount := 0
+
 			for _, line := range lines {
+				line = strings.TrimSpace(line)
 				if strings.Contains(line, "NumberOfLogicalProcessors=") {
 					parts := strings.Split(line, "=")
 					if len(parts) == 2 {
 						cpuCountStr := strings.TrimSpace(parts[1])
 						if cpuCountStr != "" {
 							if count, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && count > 0 {
-								result = int32(count)
-								// Cache the result
-								c.cacheCPUCount(result)
-								log.Printf("Got CPU count via wmic command: %d", result)
-								return result
+								totalCores += int32(count)
+								cpuCount++
+								log.Printf("Found CPU #%d with %d logical processors", cpuCount, count)
 							}
 						}
 					}
 				}
+			}
+
+			if totalCores > 0 {
+				result = totalCores
+				// Cache the result
+				c.cacheCPUCount(result)
+				log.Printf("Got total CPU count by summing %d CPUs: %d total logical processors", cpuCount, result)
+				return result
 			}
 		}
 	} else {

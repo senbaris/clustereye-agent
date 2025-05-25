@@ -1290,6 +1290,72 @@ func (r *Reporter) listenForCommands() {
 
 						log.Printf("MSSQL sorgusu tespit edildi (ID: %s)", query.QueryId)
 
+						// Sistem metrikleri sorgusu için özel işleme
+						if query.Command == "get_system_metrics" {
+							log.Printf("MSSQL platformunda sistem metrikleri sorgusu alındı (QueryID: %s)", query.QueryId)
+
+							// MSSQL/Windows için özel metrik toplama
+							metrics := r.collectMSSQLSystemMetrics()
+
+							// Metrics verilerini structpb.Struct formatına dönüştür
+							metricsStruct := &structpb.Struct{
+								Fields: map[string]*structpb.Value{
+									"cpu_usage":        structpb.NewNumberValue(metrics.CpuUsage),
+									"cpu_cores":        structpb.NewNumberValue(float64(metrics.CpuCores)),
+									"memory_usage":     structpb.NewNumberValue(metrics.MemoryUsage),
+									"total_memory":     structpb.NewNumberValue(float64(metrics.TotalMemory)),
+									"free_memory":      structpb.NewNumberValue(float64(metrics.FreeMemory)),
+									"load_average_1m":  structpb.NewNumberValue(metrics.LoadAverage_1M),
+									"load_average_5m":  structpb.NewNumberValue(metrics.LoadAverage_5M),
+									"load_average_15m": structpb.NewNumberValue(metrics.LoadAverage_15M),
+									"total_disk":       structpb.NewNumberValue(float64(metrics.TotalDisk)),
+									"free_disk":        structpb.NewNumberValue(float64(metrics.FreeDisk)),
+									"os_version":       structpb.NewStringValue(metrics.OsVersion),
+									"kernel_version":   structpb.NewStringValue(metrics.KernelVersion),
+									"uptime":           structpb.NewNumberValue(float64(metrics.Uptime)),
+								},
+							}
+
+							// structpb.Struct'ı Any tipine çevir
+							anyValue, err := anypb.New(metricsStruct)
+							if err != nil {
+								log.Printf("Metrics struct'ı Any tipine çevrilemedi: %v", err)
+								// Hata durumunda boş bir yanıt gönder
+								queryResult := map[string]interface{}{
+									"status":  "error",
+									"message": fmt.Sprintf("Metrics struct'ı Any tipine çevrilemedi: %v", err),
+								}
+								sendQueryResult(r.stream, query.QueryId, queryResult)
+								isProcessingQuery = false
+								continue
+							}
+
+							// Yanıtı oluştur ve gönder
+							queryResult := &pb.QueryResult{
+								QueryId: query.QueryId,
+								Result:  anyValue,
+							}
+
+							// QueryResult mesajı olarak gönder
+							err = r.stream.Send(&pb.AgentMessage{
+								Payload: &pb.AgentMessage_QueryResult{
+									QueryResult: queryResult,
+								},
+							})
+
+							if err != nil {
+								log.Printf("MSSQL sistem metrikleri sorgusu yanıtı gönderilemedi: %v", err)
+								if err := r.reconnect(); err != nil {
+									log.Printf("Yeniden bağlantı başarısız: %v", err)
+								}
+							} else {
+								log.Printf("MSSQL sistem metrikleri sorgusu başarıyla yanıtlandı (QueryID: %s)", query.QueryId)
+							}
+
+							isProcessingQuery = false
+							continue
+						}
+
 						// MSSQL sorgu açıklama (explain) isteği için özel işleme
 						if strings.HasPrefix(query.Command, "MSSQL_EXPLAIN") {
 							log.Printf("MSSQL explain sorgusu tespit edildi: %s", shortenString(query.Command, 100))
@@ -4905,4 +4971,231 @@ func createBasicPlanXML(query string, database string, startTime time.Time) map[
 // Connect GRPC sunucusuna bağlanır (wrapper for connectWithBackoff)
 func (r *Reporter) Connect() error {
 	return r.connectWithBackoff()
+}
+
+// collectMSSQLSystemMetrics MSSQL platformunda sistem metriklerini toplar
+// Windows ve Unix sistemlerde çalışır
+func (r *Reporter) collectMSSQLSystemMetrics() *pb.SystemMetrics {
+	metrics := &pb.SystemMetrics{}
+
+	// MSSQL collector'ı kullan
+	collector := mssql.GetDefaultMSSQLCollector()
+	if collector == nil {
+		log.Printf("MSSQL collector not available, returning default metrics")
+		return metrics
+	}
+
+	// Sistem bilgilerini topla
+	systemMetrics := collector.BatchCollectSystemMetrics()
+
+	// CPU sayısını al
+	if cpuVal, ok := systemMetrics["cpu_count"]; ok {
+		switch v := cpuVal.(type) {
+		case int32:
+			metrics.CpuCores = v
+		case int:
+			metrics.CpuCores = int32(v)
+		case float64:
+			metrics.CpuCores = int32(v)
+		}
+	}
+
+	// Toplam belleği al
+	if memVal, ok := systemMetrics["total_memory"]; ok {
+		switch v := memVal.(type) {
+		case int64:
+			metrics.TotalMemory = v
+		case int:
+			metrics.TotalMemory = int64(v)
+		case float64:
+			metrics.TotalMemory = int64(v)
+		}
+	}
+
+	// Windows için özel metrikler
+	if runtime.GOOS == "windows" {
+		// CPU kullanımı
+		if cpuUsage := r.getWindowsCPUUsage(); cpuUsage >= 0 {
+			metrics.CpuUsage = cpuUsage
+		}
+
+		// Bellek kullanımı
+		if memInfo := r.getWindowsMemoryInfo(); memInfo != nil {
+			metrics.FreeMemory = memInfo["free"].(int64)
+			metrics.MemoryUsage = memInfo["usage_percent"].(float64)
+		}
+
+		// Disk bilgileri
+		if diskInfo := r.getWindowsDiskInfo(); diskInfo != nil {
+			metrics.TotalDisk = diskInfo["total"].(int64)
+			metrics.FreeDisk = diskInfo["free"].(int64)
+		}
+
+		// OS bilgileri
+		metrics.OsVersion = r.getWindowsOSVersion()
+		metrics.KernelVersion = r.getWindowsKernelVersion()
+
+		// Uptime
+		metrics.Uptime = r.getWindowsUptime()
+
+		// Windows'ta load average yok, 0 olarak bırak
+		metrics.LoadAverage_1M = 0
+		metrics.LoadAverage_5M = 0
+		metrics.LoadAverage_15M = 0
+
+	} else {
+		// Unix/Linux sistemler için
+		// PostgreSQL collector'ın Unix metriklerini kullan
+		unixMetrics := postgres.GetSystemMetrics()
+
+		metrics.CpuUsage = unixMetrics.CpuUsage
+		metrics.MemoryUsage = unixMetrics.MemoryUsage
+		metrics.FreeMemory = unixMetrics.FreeMemory
+		metrics.LoadAverage_1M = unixMetrics.LoadAverage_1M
+		metrics.LoadAverage_5M = unixMetrics.LoadAverage_5M
+		metrics.LoadAverage_15M = unixMetrics.LoadAverage_15M
+		metrics.TotalDisk = unixMetrics.TotalDisk
+		metrics.FreeDisk = unixMetrics.FreeDisk
+		metrics.OsVersion = unixMetrics.OsVersion
+		metrics.KernelVersion = unixMetrics.KernelVersion
+		metrics.Uptime = unixMetrics.Uptime
+
+		// CPU ve bellek bilgileri zaten MSSQL collector'dan alındı
+	}
+
+	return metrics
+}
+
+// Windows için yardımcı fonksiyonlar
+func (r *Reporter) getWindowsCPUUsage() float64 {
+	cmd := exec.Command("wmic", "cpu", "get", "loadpercentage", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+
+	re := regexp.MustCompile(`LoadPercentage=(\d+)`)
+	matches := re.FindStringSubmatch(string(out))
+	if len(matches) > 1 {
+		if usage, err := strconv.ParseFloat(matches[1], 64); err == nil {
+			return usage
+		}
+	}
+	return -1
+}
+
+func (r *Reporter) getWindowsMemoryInfo() map[string]interface{} {
+	// Toplam ve kullanılabilir bellek
+	cmd := exec.Command("wmic", "OS", "get", "TotalVisibleMemorySize,FreePhysicalMemory", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+	outStr := string(out)
+
+	// Toplam bellek (KB cinsinden)
+	if matches := regexp.MustCompile(`TotalVisibleMemorySize=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+		if total, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+			result["total"] = total * 1024 // Byte'a çevir
+		}
+	}
+
+	// Boş bellek (KB cinsinden)
+	if matches := regexp.MustCompile(`FreePhysicalMemory=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+		if free, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+			result["free"] = free * 1024 // Byte'a çevir
+
+			// Kullanım yüzdesini hesapla
+			if total, ok := result["total"].(int64); ok && total > 0 {
+				used := total - (free * 1024)
+				result["usage_percent"] = float64(used) / float64(total) * 100
+			}
+		}
+	}
+
+	return result
+}
+
+func (r *Reporter) getWindowsDiskInfo() map[string]interface{} {
+	// C: sürücüsü için disk bilgileri
+	cmd := exec.Command("wmic", "logicaldisk", "where", "DeviceID='C:'", "get", "Size,FreeSpace", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	result := make(map[string]interface{})
+	outStr := string(out)
+
+	// Toplam alan
+	if matches := regexp.MustCompile(`Size=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+		if size, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+			result["total"] = size / (1024 * 1024 * 1024) // GB'a çevir
+		}
+	}
+
+	// Boş alan
+	if matches := regexp.MustCompile(`FreeSpace=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+		if free, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+			result["free"] = free / (1024 * 1024 * 1024) // GB'a çevir
+		}
+	}
+
+	return result
+}
+
+func (r *Reporter) getWindowsOSVersion() string {
+	cmd := exec.Command("wmic", "os", "get", "Caption", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return "Windows"
+	}
+
+	if matches := regexp.MustCompile(`Caption=(.+)`).FindStringSubmatch(string(out)); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	return "Windows"
+}
+
+func (r *Reporter) getWindowsKernelVersion() string {
+	cmd := exec.Command("wmic", "os", "get", "Version", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	if matches := regexp.MustCompile(`Version=(.+)`).FindStringSubmatch(string(out)); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	return ""
+}
+
+func (r *Reporter) getWindowsUptime() int64 {
+	cmd := exec.Command("wmic", "os", "get", "LastBootUpTime", "/value")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	if matches := regexp.MustCompile(`LastBootUpTime=(\d{14})`).FindStringSubmatch(string(out)); len(matches) > 1 {
+		// WMI formatı: YYYYMMDDHHmmss
+		bootTimeStr := matches[1]
+
+		// Parse et
+		year, _ := strconv.Atoi(bootTimeStr[0:4])
+		month, _ := strconv.Atoi(bootTimeStr[4:6])
+		day, _ := strconv.Atoi(bootTimeStr[6:8])
+		hour, _ := strconv.Atoi(bootTimeStr[8:10])
+		minute, _ := strconv.Atoi(bootTimeStr[10:12])
+		second, _ := strconv.Atoi(bootTimeStr[12:14])
+
+		bootTime := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.Local)
+		uptime := time.Since(bootTime).Seconds()
+
+		return int64(uptime)
+	}
+
+	return 0
 }

@@ -191,6 +191,12 @@ func (m *AlarmMonitor) checkAlarms() {
 		m.checkMongoDBStatus()
 		// MongoDB yavaş sorgularını kontrol et
 		m.checkMongoSlowQueries()
+		// CPU kullanımını kontrol et
+		m.checkCPUUsage()
+		// Memory kullanımını kontrol et
+		m.checkMemoryUsage()
+		// Disk kullanımını kontrol et
+		m.checkDiskUsage()
 	} else if m.platform == "postgres" {
 		// PostgreSQL servis durumunu kontrol et
 		m.checkPostgreSQLServiceStatus()
