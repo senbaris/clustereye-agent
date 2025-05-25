@@ -92,7 +92,7 @@ func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
 			log.Printf("PANIC in MongoDB OpenDB: %v", r)
 			// Mark as unhealthy after panic
 			c.isHealthy = false
-			c.collectionInterval = 5 * time.Minute
+			c.collectionInterval = 2 * time.Minute
 		}
 	}()
 
@@ -153,7 +153,7 @@ func (c *MongoCollector) GetMongoStatus() string {
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 			}
 		}
 	}()
@@ -204,7 +204,7 @@ func (c *MongoCollector) GetMongoVersion() string {
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 			}
 		}
 	}()
@@ -263,7 +263,7 @@ func (c *MongoCollector) GetNodeStatus() string {
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 				logger.Error("MongoDB GetNodeStatus: Marked collector as unhealthy after panic")
 			}
 		}
@@ -804,7 +804,7 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 
 			// Mark as unhealthy after panic
 			c.isHealthy = false
-			c.collectionInterval = 5 * time.Minute // Increase interval significantly
+			c.collectionInterval = 2 * time.Minute // Increase interval significantly
 		}
 	}()
 
@@ -1002,7 +1002,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 			}
 		}
 	}()
@@ -1836,7 +1836,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 			}
 		}
 	}()
@@ -1903,7 +1903,7 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
-				c.collectionInterval = 5 * time.Minute
+				c.collectionInterval = 2 * time.Minute
 			}
 		}
 	}()

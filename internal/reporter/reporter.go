@@ -3253,6 +3253,9 @@ func (r *Reporter) SendMongoInfo() error {
 		return err
 	}
 
+	// MongoDB collector startup recovery - ensure it's healthy
+	mongoCollector.StartupRecovery()
+
 	// MongoDB bilgilerini topla
 	mongoInfo := mongoCollector.GetMongoInfo()
 
