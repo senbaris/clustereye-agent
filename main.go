@@ -105,8 +105,8 @@ func main() {
 		log.Fatalf("Konfigürasyon yüklenemedi: %v", err)
 	}
 
-	// Reporter oluştur
-	rptr := reporter.NewReporter(cfg)
+	// Global Reporter instance kullan - multiple instance leak'ini önler
+	rptr := reporter.GetGlobalReporter(cfg)
 
 	// AgentService yapısını oluştur
 	service := &AgentService{

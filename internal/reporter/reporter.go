@@ -3079,16 +3079,11 @@ func (r *Reporter) reconnect() error {
 		return fmt.Errorf("maksimum yeniden bağlantı denemesi aşıldı: %v", err)
 	}
 
-	// Agent kaydını tekrarla (test sonucu "reconnected" olarak gönder)
-	// Mevcut platform bilgisini kullanarak agent kaydını yenile
-	if err := r.AgentRegistration("reconnected", r.platform); err != nil {
-		log.Printf("Agent yeniden kaydı başarısız: %v. Tekrar deneniyor...", err)
-
-		// Agent kaydı için bir deneme daha yap
-		time.Sleep(2 * time.Second)
-		if err := r.AgentRegistration("reconnected", r.platform); err != nil {
-			return fmt.Errorf("agent yeniden kaydı başarısız: %v", err)
-		}
+	// Simple agent re-registration without starting new goroutines
+	// Skip periodic reporting and collector initialization to prevent goroutine explosion
+	if err := r.simpleAgentReRegistration("reconnected"); err != nil {
+		log.Printf("Agent yeniden kaydı başarısız: %v", err)
+		// Continue anyway, connection is working
 	}
 
 	// Alarm monitörünün client'ını güncelle
@@ -3099,6 +3094,40 @@ func (r *Reporter) reconnect() error {
 	}
 
 	log.Printf("Yeniden bağlantı tamamlandı. Platform: %s", r.platform)
+	return nil
+}
+
+// simpleAgentReRegistration performs a simple agent re-registration without starting new goroutines
+func (r *Reporter) simpleAgentReRegistration(testResult string) error {
+	hostname, _ := os.Hostname()
+	ip := utils.GetLocalIP()
+
+	// Agent bilgilerini hazırla
+	agentInfo := &pb.AgentInfo{
+		Key:          r.cfg.Key,
+		AgentId:      "agent_" + hostname,
+		Hostname:     hostname,
+		Ip:           ip,
+		Platform:     r.platform,
+		Auth:         getAuthStatus(r.platform, r.cfg),
+		Test:         testResult,
+		PostgresUser: r.cfg.PostgreSQL.User,
+		PostgresPass: r.cfg.PostgreSQL.Pass,
+	}
+
+	// Agent Message oluştur
+	agentMessage := &pb.AgentMessage{
+		Payload: &pb.AgentMessage_AgentInfo{
+			AgentInfo: agentInfo,
+		},
+	}
+
+	// Mesajı gönder (simple, no retry logic)
+	if err := r.stream.Send(agentMessage); err != nil {
+		return fmt.Errorf("simple agent re-registration failed: %v", err)
+	}
+
+	log.Printf("Simple agent re-registration completed (Platform: %s)", r.platform)
 	return nil
 }
 

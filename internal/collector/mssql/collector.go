@@ -2776,7 +2776,19 @@ func (c *MSSQLCollector) GetAlwaysOnMetrics() (*AlwaysOnMetrics, error) {
 		}
 	}
 
-	// Get database replica status with limited results and basic info only
+	// Extract synchronization mode and failover mode for current server from replica data
+	hostname, _ := os.Hostname()
+	for _, replica := range metrics.Replicas {
+		if replica.ReplicaName == hostname {
+			metrics.SynchronizationMode = replica.SynchronizationMode
+			metrics.FailoverMode = replica.FailoverMode
+			log.Printf("Current server modes - Synchronization: %s, Failover: %s",
+				metrics.SynchronizationMode, metrics.FailoverMode)
+			break
+		}
+	}
+
+	// Get database replica status with limited results and enhanced metrics
 	ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
@@ -2787,7 +2799,19 @@ func (c *MSSQLCollector) GetAlwaysOnMetrics() (*AlwaysOnMetrics, error) {
 			ISNULL(drs.synchronization_state_desc, 'UNKNOWN') AS synchronization_state,
 			ISNULL(drs.suspend_reason_desc, '') AS suspend_reason,
 			ISNULL(drs.log_send_queue_size, 0) AS log_send_queue_size,
-			ISNULL(drs.redo_queue_size, 0) AS redo_queue_size
+			ISNULL(drs.redo_queue_size, 0) AS redo_queue_size,
+			ISNULL(drs.log_send_rate, 0) AS log_send_rate,
+			ISNULL(drs.redo_rate, 0) AS redo_rate,
+			ISNULL(drs.filestream_send_rate, 0) AS filestream_send_rate,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_sent_time, 121), '') AS last_sent_time,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_received_time, 121), '') AS last_received_time,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_hardened_time, 121), '') AS last_hardened_time,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_redone_time, 121), '') AS last_redone_time,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_commit_time, 121), '') AS last_commit_time,
+			ISNULL(CONVERT(NVARCHAR(30), drs.last_commit_lsn), '') AS last_commit_lsn,
+			ISNULL(CONVERT(NVARCHAR(30), drs.end_of_log_lsn), '') AS end_of_log_lsn,
+			ISNULL(CONVERT(NVARCHAR(30), drs.recovery_lsn), '') AS recovery_lsn,
+			ISNULL(CONVERT(NVARCHAR(30), drs.truncation_lsn), '') AS truncation_lsn
 		FROM sys.dm_hadr_database_replica_states drs
 		LEFT JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
 		WHERE drs.group_id IN (
@@ -2810,25 +2834,23 @@ func (c *MSSQLCollector) GetAlwaysOnMetrics() (*AlwaysOnMetrics, error) {
 				&dbStatus.SuspendReason,
 				&dbStatus.LogSendQueueSize,
 				&dbStatus.RedoQueueSize,
+				&dbStatus.LogSendRate,
+				&dbStatus.RedoRate,
+				&dbStatus.FileStreamSendRate,
+				&dbStatus.LastSentTime,
+				&dbStatus.LastReceivedTime,
+				&dbStatus.LastHardenedTime,
+				&dbStatus.LastRedoneTime,
+				&dbStatus.LastCommitTime,
+				&dbStatus.LastCommitLSN,
+				&dbStatus.EndOfLogLSN,
+				&dbStatus.RecoveryLSN,
+				&dbStatus.TruncationLSN,
 			)
 			if err != nil {
 				log.Printf("Error scanning database replica status row: %v", err)
 				continue
 			}
-
-			// Set other fields to empty/default values to avoid additional queries
-			dbStatus.LastSentTime = ""
-			dbStatus.LastReceivedTime = ""
-			dbStatus.LastHardenedTime = ""
-			dbStatus.LastRedoneTime = ""
-			dbStatus.LogSendRate = 0
-			dbStatus.RedoRate = 0
-			dbStatus.FileStreamSendRate = 0
-			dbStatus.EndOfLogLSN = ""
-			dbStatus.RecoveryLSN = ""
-			dbStatus.TruncationLSN = ""
-			dbStatus.LastCommitLSN = ""
-			dbStatus.LastCommitTime = ""
 
 			metrics.Databases = append(metrics.Databases, dbStatus)
 
@@ -2837,19 +2859,116 @@ func (c *MSSQLCollector) GetAlwaysOnMetrics() (*AlwaysOnMetrics, error) {
 			if dbStatus.ReplicaName == hostname && metrics.LocalRole == "SECONDARY" {
 				metrics.LogSendQueue = dbStatus.LogSendQueueSize
 				metrics.RedoQueue = dbStatus.RedoQueueSize
+
+				// Calculate replication lag in milliseconds using timestamps
+				if dbStatus.LastCommitTime != "" && dbStatus.LastReceivedTime != "" {
+					if lastCommitTime, err := time.Parse("2006-01-02 15:04:05.000", dbStatus.LastCommitTime); err == nil {
+						if lastReceivedTime, err := time.Parse("2006-01-02 15:04:05.000", dbStatus.LastReceivedTime); err == nil {
+							lagMs := lastCommitTime.Sub(lastReceivedTime).Milliseconds()
+							if lagMs > 0 && lagMs < 86400000 { // Less than 24 hours (reasonable lag)
+								metrics.ReplicationLag = lagMs
+								log.Printf("Calculated replication lag: %d ms for database %s", lagMs, dbStatus.DatabaseName)
+							}
+						}
+					}
+				}
+
+				// Alternative lag calculation using last_hardened_time if available
+				if metrics.ReplicationLag == 0 && dbStatus.LastCommitTime != "" && dbStatus.LastHardenedTime != "" {
+					if lastCommitTime, err := time.Parse("2006-01-02 15:04:05.000", dbStatus.LastCommitTime); err == nil {
+						if lastHardenedTime, err := time.Parse("2006-01-02 15:04:05.000", dbStatus.LastHardenedTime); err == nil {
+							lagMs := lastCommitTime.Sub(lastHardenedTime).Milliseconds()
+							if lagMs > 0 && lagMs < 86400000 { // Less than 24 hours (reasonable lag)
+								metrics.ReplicationLag = lagMs
+								log.Printf("Calculated replication lag (hardened): %d ms for database %s", lagMs, dbStatus.DatabaseName)
+							}
+						}
+					}
+				}
 			}
 			dbCount++
 		}
 	}
 
-	// Skip listener information collection to reduce load - can be added back if needed
-	// Listeners don't change frequently and cause additional database load
+	// Collect listener information for complete AlwaysOn metrics
+	ctx, cancel = context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
 
-	// Set default values for fields we're not collecting to reduce load
-	metrics.SynchronizationMode = "Unknown"
-	metrics.FailoverMode = "Unknown"
+	rows, err = db.QueryContext(ctx, `
+		SELECT 
+			ISNULL(agl.dns_name, '') AS listener_name,
+			ISNULL(agl.dns_name, '') AS dns_name,
+			ISNULL(agl.port, 1433) AS port,
+			CASE WHEN EXISTS (
+				SELECT 1 FROM sys.availability_group_listener_ip_addresses 
+				WHERE listener_id = agl.listener_id
+			) THEN 'ONLINE' ELSE 'OFFLINE' END AS listener_state
+		FROM sys.availability_group_listeners agl
+		WHERE agl.group_id IN (
+			SELECT TOP 1 group_id FROM sys.availability_replicas WHERE replica_server_name = @@SERVERNAME
+		)
+	`)
+
+	if err != nil {
+		log.Printf("Error getting listener information (non-critical): %v", err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var listener ListenerInfo
+			err := rows.Scan(
+				&listener.ListenerName,
+				&listener.DNSName,
+				&listener.Port,
+				&listener.ListenerState,
+			)
+			if err != nil {
+				log.Printf("Error scanning listener row: %v", err)
+				continue
+			}
+
+			// Get IP addresses for this listener
+			ipRows, err := db.QueryContext(ctx, `
+				SELECT ip_address 
+				FROM sys.availability_group_listener_ip_addresses 
+				WHERE listener_id = (
+					SELECT listener_id FROM sys.availability_group_listeners 
+					WHERE dns_name = ? AND group_id IN (
+						SELECT TOP 1 group_id FROM sys.availability_replicas WHERE replica_server_name = @@SERVERNAME
+					)
+				)
+			`, listener.ListenerName)
+
+			if err == nil {
+				defer ipRows.Close()
+				var ipAddresses []string
+				for ipRows.Next() {
+					var ip string
+					if err := ipRows.Scan(&ip); err == nil {
+						ipAddresses = append(ipAddresses, ip)
+					}
+				}
+				listener.IPAddresses = ipAddresses
+			}
+
+			metrics.Listeners = append(metrics.Listeners, listener)
+		}
+	}
+
+	// Set defaults only if not already set from replica data
+	if metrics.SynchronizationMode == "" {
+		metrics.SynchronizationMode = "Unknown"
+	}
+	if metrics.FailoverMode == "" {
+		metrics.FailoverMode = "Unknown"
+	}
+
+	// Set last failover time (would require additional complex queries to determine)
 	metrics.LastFailoverTime = "Unknown"
-	metrics.ReplicationLag = 0
+
+	// ReplicationLag should have been calculated above from database timestamps
+	if metrics.ReplicationLag == 0 {
+		log.Printf("Replication lag could not be calculated from database timestamps")
+	}
 
 	// Cache the results for 5 minutes to avoid frequent database hits
 	c.cacheAlwaysOnMetrics(metrics)

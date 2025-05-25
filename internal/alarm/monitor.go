@@ -1768,9 +1768,10 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	) AS rb
 	ORDER BY record_id DESC`
 
+	var recordID sql.NullInt64 // Added missing record_id variable
 	var cpuUtilization, systemIdle sql.NullInt64
 	var eventTime sql.NullTime
-	err = db.QueryRow(resourceQuery).Scan(&cpuUtilization, &systemIdle, &eventTime)
+	err = db.QueryRow(resourceQuery).Scan(&recordID, &cpuUtilization, &systemIdle, &eventTime)
 
 	if err == nil && cpuUtilization.Valid {
 		cpuUsage = float64(cpuUtilization.Int64)
