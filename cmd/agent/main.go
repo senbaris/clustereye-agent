@@ -116,29 +116,44 @@ func main() {
 const maxLogSize = 10 * 1024 * 1024 // 10 MB
 
 func initLogging() {
-	if runtime.GOOS != "windows" {
-		// Linux'ta log dosyasına yazma
-		return
-	}
-
-	// Windows'ta dosya log sistemini kullan
+	// Hem Windows hem de Linux'ta dosya log sistemini kullan
 	setupFileLogging()
 }
 
 // Dosya log sistemini kurma yardımcı fonksiyonu
 func setupFileLogging() {
-	exePath, err := os.Executable()
-	if err != nil {
-		log.Fatalf("Failed to get executable path: %v", err)
+	var logDir string
+	var logFile string
+
+	if runtime.GOOS == "windows" {
+		// Windows'ta executable'ın bulunduğu dizinde log tut
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Fatalf("Failed to get executable path: %v", err)
+		}
+		logDir = filepath.Dir(exePath)
+		logFile = filepath.Join(logDir, "agent.log")
+	} else {
+		// Linux/Unix sistemlerde uygun log dizini belirle
+		// Önce /var/log/clustereye dizinini dene
+		logDir = "/var/log/clustereye"
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			// İzin yoksa, kullanıcının home dizini altında .clustereye/logs kullan
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				log.Fatalf("Failed to get user home directory: %v", err)
+			}
+			logDir = filepath.Join(homeDir, ".clustereye", "logs")
+			if err := os.MkdirAll(logDir, 0755); err != nil {
+				log.Fatalf("Failed to create log directory: %v", err)
+			}
+		}
+		logFile = filepath.Join(logDir, "agent.log")
 	}
-	logDir := filepath.Dir(exePath)
 
 	// Log rotasyon ayarları
 	maxLogSize := int64(100 * 1024 * 1024) // 100MB
 	maxLogFiles := 5                       // Saklanacak maksimum log dosyası sayısı
-
-	// Ana log dosyası
-	logFile := filepath.Join(logDir, "agent.log")
 
 	// Mevcut log dosyasının boyutunu kontrol et
 	info, err := os.Stat(logFile)
@@ -167,7 +182,10 @@ func setupFileLogging() {
 	log.SetOutput(f)
 	logger.SetOutput(f)
 
-	logger.Info("Dosya log sistemi başarıyla etkinleştirildi, log seviyesi: %s", logger.LevelToString(logger.GetLevel()))
+	// Log dosya yolunu da bildirin
+	fmt.Printf("Log dosyası: %s\n", logFile)
+	logger.Info("Dosya log sistemi başarıyla etkinleştirildi, log seviyesi: %s, log dosyası: %s",
+		logger.LevelToString(logger.GetLevel()), logFile)
 }
 
 // Eski log dosyalarını temizler, sadece en yeni n dosyayı tutar
