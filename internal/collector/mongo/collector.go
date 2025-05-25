@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -34,6 +33,8 @@ type MongoCollector struct {
 	backoffDuration    time.Duration
 	isHealthy          bool
 	lastHealthCheck    time.Time
+	startupTime        time.Time     // Track when collector was created
+	startupGracePeriod time.Duration // Grace period for startup collections
 }
 
 // NewMongoCollector yeni bir MongoCollector oluşturur
@@ -45,6 +46,8 @@ func NewMongoCollector(cfg *config.AgentConfig) *MongoCollector {
 		backoffDuration:    5 * time.Second,
 		isHealthy:          true,
 		lastHealthCheck:    time.Now(),
+		startupTime:        time.Now(),
+		startupGracePeriod: 10 * time.Second, // Default to 10 seconds
 	}
 }
 
@@ -89,7 +92,7 @@ func (c *MongoCollector) OpenDB() (*mongo.Client, error) {
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in MongoDB OpenDB: %v", r)
+			logger.Error("PANIC in MongoDB OpenDB: %v", r)
 			// Mark as unhealthy after panic
 			c.isHealthy = false
 			c.collectionInterval = 2 * time.Minute
@@ -449,26 +452,26 @@ func (c *MongoCollector) GetNodeStatus() string {
 func (c *MongoCollector) GetReplicaSetName() string {
 	client, err := c.OpenDB()
 	if err != nil {
-		log.Printf("MongoDB bağlantısı kurulamadı: %v", err)
+		logger.Error("MongoDB bağlantısı kurulamadı: %v", err)
 		return "Unknown"
 	}
 	defer func() {
 		if err := client.Disconnect(context.Background()); err != nil {
-			log.Printf("MongoDB bağlantısı kapatılamadı: %v", err)
+			logger.Error("MongoDB bağlantısı kapatılamadı: %v", err)
 		}
 	}()
 
 	// replSetGetStatus komutunu çalıştır
 	status, err := c.runAdminCommand(client, bson.D{{Key: "replSetGetStatus", Value: 1}})
 	if err != nil {
-		log.Printf("replSetGetStatus komutu çalıştırılamadı: %v", err)
+		logger.Error("replSetGetStatus komutu çalıştırılamadı: %v", err)
 		return "Unknown"
 	}
 
 	// Replica set adını al
 	replSetName, ok := status["set"].(string)
 	if !ok {
-		log.Printf("replica set adı bulunamadı")
+		logger.Warning("replica set adı bulunamadı")
 		return "Unknown"
 	}
 
@@ -485,39 +488,39 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 
 	client, err := c.OpenDB()
 	if err != nil {
-		log.Printf("MongoDB bağlantısı kurulamadı: %v", err)
+		logger.Error("MongoDB bağlantısı kurulamadı: %v", err)
 		return 0
 	}
 	defer func() {
 		if err := client.Disconnect(context.Background()); err != nil {
-			log.Printf("MongoDB bağlantısı kapatılamadı: %v", err)
+			logger.Error("MongoDB bağlantısı kapatılamadı: %v", err)
 		}
 	}()
 
 	// Önce serverStatus ile mevcut node bilgilerini al
 	serverStatus, err := c.runAdminCommand(client, bson.D{{Key: "serverStatus", Value: 1}})
 	if err != nil {
-		log.Printf("serverStatus komutu çalıştırılamadı: %v", err)
+		logger.Error("serverStatus komutu çalıştırılamadı: %v", err)
 		return 0
 	}
 
 	host, ok := serverStatus["host"].(string)
 	if !ok {
-		log.Printf("Host bilgisi bulunamadı")
+		logger.Warning("Host bilgisi bulunamadı")
 		host = "localhost"
 	}
 
 	// replSetGetStatus komutunu çalıştır
 	status, err := c.runAdminCommand(client, bson.D{{Key: "replSetGetStatus", Value: 1}})
 	if err != nil {
-		log.Printf("replSetGetStatus komutu çalıştırılamadı: %v", err)
+		logger.Error("replSetGetStatus komutu çalıştırılamadı: %v", err)
 		return 0
 	}
 
 	// Member'ları kontrol et
 	members, ok := status["members"].(bson.A)
 	if !ok {
-		log.Printf("members dizisi bulunamadı")
+		logger.Warning("members dizisi bulunamadı")
 		return 0
 	}
 
@@ -552,7 +555,7 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 		// optime değerini al
 		optime, ok := memberMap["optimeDate"].(time.Time)
 		if !ok {
-			log.Printf("Node %s için optimeDate bulunamadı", memberHost)
+			logger.Warning("Node %s için optimeDate bulunamadı", memberHost)
 			continue
 		}
 
@@ -560,7 +563,7 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 		if strings.Contains(memberHost, currentHost) || strings.Contains(currentHost, memberHost) {
 			myOptimeDate = optime
 			foundMe = true
-			log.Printf("Kendi node'umu buldum: %s, optimeDate: %v", memberHost, optime)
+			logger.Info("Kendi node'umu buldum: %s, optimeDate: %v", memberHost, optime)
 		}
 
 		// PRIMARY node mu?
@@ -572,13 +575,13 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 		if isPrimary {
 			primaryOptimeDate = optime
 			foundPrimary = true
-			log.Printf("PRIMARY node'u buldum: %s, optimeDate: %v", memberHost, optime)
+			logger.Info("PRIMARY node'u buldum: %s, optimeDate: %v", memberHost, optime)
 		}
 	}
 
 	// Eğer gerekli bilgiler bulunamadıysa 0 döndür
 	if !foundMe || !foundPrimary {
-		log.Printf("Lag hesaplanamadı: foundMe=%v, foundPrimary=%v", foundMe, foundPrimary)
+		logger.Debug("Lag hesaplanamadı: foundMe=%v, foundPrimary=%v", foundMe, foundPrimary)
 		return 0
 	}
 
@@ -588,7 +591,7 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 		lag = 0 // Negatif lag olamaz
 	}
 
-	log.Printf("Replikasyon lag: %.2f saniye", lag)
+	logger.Debug("Replikasyon lag: %.2f saniye", lag)
 	return int64(lag)
 }
 
@@ -599,7 +602,7 @@ func (c *MongoCollector) GetDiskUsage() (string, int) {
 	cmd := exec.Command("df", "-h")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("Disk bilgileri alınamadı: %v", err)
+		logger.Warning("Disk bilgileri alınamadı: %v", err)
 		return "N/A", 0
 	}
 
@@ -649,17 +652,17 @@ func (c *MongoCollector) GetDiskUsage() (string, int) {
 			maxSize = sizeInBytes
 			selectedFree = free
 			selectedUsage, _ = strconv.Atoi(usage)
-			log.Printf("DEBUG: DiskUsage - Filesystem: %s, MountPoint: %s, Size: %s, Free: %s, Usage: %s%%",
+			logger.Debug(" DiskUsage - Filesystem: %s, MountPoint: %s, Size: %s, Free: %s, Usage: %s%%",
 				filesystem, mountPoint, size, free, usage)
 		}
 	}
 
 	if maxSize == 0 {
-		log.Printf("DEBUG: GetDiskUsage - Uygun disk bulunamadı, N/A döndürülüyor")
+		logger.Debug(" GetDiskUsage - Uygun disk bulunamadı, N/A döndürülüyor")
 		return "N/A", 0
 	}
 
-	log.Printf("DEBUG: GetDiskUsage tamamlandı - Sonuç: Free=%s, Usage=%d%%", selectedFree, selectedUsage)
+	logger.Debug(" GetDiskUsage tamamlandı - Sonuç: Free=%s, Usage=%d%%", selectedFree, selectedUsage)
 	return selectedFree, selectedUsage
 }
 
@@ -897,13 +900,13 @@ func (c *MongoCollector) getFdPercent() int {
 	cmd := exec.Command("sh", "-c", "lsof | wc -l")
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("Dosya tanımlayıcı sayısı alınamadı: %v", err)
+		logger.Warning("Dosya tanımlayıcı sayısı alınamadı: %v", err)
 		return 0
 	}
 
 	fdCount, err := strconv.Atoi(strings.TrimSpace(string(out)))
 	if err != nil {
-		log.Printf("Dosya tanımlayıcı sayısı dönüştürülemedi: %v", err)
+		logger.Warning("Dosya tanımlayıcı sayısı dönüştürülemedi: %v", err)
 		return 0
 	}
 
@@ -998,7 +1001,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in FindMongoLogFiles: %v", r)
+			logger.Error("PANIC in FindMongoLogFiles: %v", r)
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
@@ -1024,13 +1027,13 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 				if !stat.IsDir() {
 					// Dosyanın bulunduğu dizini belirle
 					parentDir := filepath.Dir(logPathFromProcess)
-					log.Printf("MongoDB log dosyası bağlamından log dizini belirlendi: %s", parentDir)
+					logger.Debug("MongoDB log dosyası bağlamından log dizini belirlendi: %s", parentDir)
 					// Dosya yerine dizini kullan
 					logPath = parentDir
 				} else {
 					// Path zaten bir dizin
 					logPath = logPathFromProcess
-					log.Printf("MongoDB log dizini süreç parametrelerinden bulundu: %s", logPath)
+					logger.Debug("MongoDB log dizini süreç parametrelerinden bulundu: %s", logPath)
 				}
 			}
 		}
@@ -1062,7 +1065,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 						path = filepath.Dir(path)
 					}
 					logDirs = append([]string{path}, logDirs...)
-					log.Printf("MongoDB log dizini konfigürasyon dosyasından bulundu: %s", path)
+					logger.Debug("MongoDB log dizini konfigürasyon dosyasından bulundu: %s", path)
 				}
 			}
 
@@ -1071,7 +1074,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 			if mongoDataDir != "" {
 				// Data dizinindeki log dizinini kontrol et
 				logDirs = append([]string{mongoDataDir + "/log", mongoDataDir}, logDirs...)
-				log.Printf("MongoDB veri dizini bulundu, log için kontrol ediliyor: %s/log", mongoDataDir)
+				logger.Debug("MongoDB veri dizini bulundu, log için kontrol ediliyor: %s/log", mongoDataDir)
 			}
 
 			// İlk bulunan geçerli dizini kullan
@@ -1085,7 +1088,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 				for _, dir := range matches {
 					if _, err := os.Stat(dir); err == nil {
 						logPath = dir
-						log.Printf("MongoDB log dizini bulundu: %s", logPath)
+						logger.Debug("MongoDB log dizini bulundu: %s", logPath)
 						break
 					}
 				}
@@ -1101,7 +1104,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 				if mongoLogFile != "" {
 					// Dosyanın dizinini al
 					parentDir := filepath.Dir(mongoLogFile)
-					log.Printf("MongoDB log dosyası bulundu, dizini kontrol edilecek: %s", parentDir)
+					logger.Debug("MongoDB log dosyası bulundu, dizini kontrol edilecek: %s", parentDir)
 					// Dizin var mı kontrol et
 					if _, err := os.Stat(parentDir); err == nil {
 						logPath = parentDir
@@ -1115,7 +1118,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 								Size:         stat.Size(),
 								LastModified: stat.ModTime().Unix(),
 							}
-							log.Printf("MongoDB log dosyası açık dosya tanımlayıcıları ile bulundu: %s", mongoLogFile)
+							logger.Info("MongoDB log dosyası açık dosya tanımlayıcıları ile bulundu: %s", mongoLogFile)
 							return []*pb.MongoLogFile{file}, nil
 						}
 					}
@@ -1123,7 +1126,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 
 				if logPath == "" {
 					logPath = "/var/log"
-					log.Printf("MongoDB özel log dizini bulunamadı, genel log dizini kontrol ediliyor: %s", logPath)
+					logger.Debug("MongoDB özel log dizini bulunamadı, genel log dizini kontrol ediliyor: %s", logPath)
 				}
 			}
 		}
@@ -1137,14 +1140,14 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 
 	// DEBUG: Dizindeki tüm dosyaları listele
 	if info.IsDir() {
-		log.Printf("DEBUG: Dizindeki tüm dosyaları listeliyorum: %s", logPath)
+		logger.Debug(" Dizindeki tüm dosyaları listeliyorum: %s", logPath)
 		dirEntries, err := os.ReadDir(logPath)
 		if err == nil {
 			for _, entry := range dirEntries {
 				fileName := entry.Name()
 				isArtifact := isMongoDBArtifact(fileName)
 				isMatching := isMatchingMongoDBLogName(strings.ToLower(fileName))
-				log.Printf("DEBUG: Dosya: %s | MongoDB Artifact: %t | Matching Name: %t",
+				logger.Debug(" Dosya: %s | MongoDB Artifact: %t | Matching Name: %t",
 					fileName, isArtifact, isMatching)
 			}
 		}
@@ -1162,10 +1165,10 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 				Size:         info.Size(),
 				LastModified: info.ModTime().Unix(),
 			}
-			log.Printf("MongoDB tek log dosyası bulundu: %s", logPath)
+			logger.Info("MongoDB tek log dosyası bulundu: %s", logPath)
 			return append(logFiles, file), nil
 		}
-		log.Printf("Belirtilen dosya MongoDB log dosyası değil, dizini kontrol ediliyor: %s", filepath.Dir(logPath))
+		logger.Debug("Belirtilen dosya MongoDB log dosyası değil, dizini kontrol ediliyor: %s", filepath.Dir(logPath))
 		// Dosyanın dizinini dene
 		logPath = filepath.Dir(logPath)
 		info, err = os.Stat(logPath)
@@ -1175,7 +1178,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 	}
 
 	// Buraya geldiysek, logPath bir dizindir
-	log.Printf("MongoDB log dizini için dosyalar taranıyor: %s", logPath)
+	logger.Info("MongoDB log dizini için dosyalar taranıyor: %s", logPath)
 
 	// Dizindeki MongoDB log dosyalarını bul
 	entries, err := os.ReadDir(logPath)
@@ -1195,7 +1198,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 			// Dosya bilgilerini al
 			fileInfo, err := os.Stat(filepath.Join(logPath, entry.Name()))
 			if err != nil {
-				log.Printf("Dosya bilgileri alınamadı: %v", err)
+				logger.Warning("Dosya bilgileri alınamadı: %v", err)
 				continue
 			}
 
@@ -1206,7 +1209,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 				LastModified: fileInfo.ModTime().Unix(),
 			}
 			logFiles = append(logFiles, file)
-			log.Printf("MongoDB log dosyası bulundu: %s", file.Path)
+			logger.Info("MongoDB log dosyası bulundu: %s", file.Path)
 		}
 	}
 
@@ -1216,7 +1219,7 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 
 	// Hiç log dosyası bulunamadıysa bilgilendirme mesajı döndür
 	if len(logFiles) == 0 {
-		log.Printf("Belirtilen dizinde (%s) MongoDB log dosyası bulunamadı", logPath)
+		logger.Warning("Belirtilen dizinde (%s) MongoDB log dosyası bulunamadı", logPath)
 
 		// Son çare olarak, MongoDB process'inin dosya tanımlayıcılarını kontrol et
 		logFilePath := checkMongoFileDescriptors()
@@ -1229,15 +1232,15 @@ func (c *MongoCollector) FindMongoLogFiles(logPath string) ([]*pb.MongoLogFile, 
 					Size:         info.Size(),
 					LastModified: info.ModTime().Unix(),
 				}
-				log.Printf("MongoDB log dosyası file descriptor ile bulundu: %s", logFilePath)
+				logger.Info("MongoDB log dosyası file descriptor ile bulundu: %s", logFilePath)
 				return []*pb.MongoLogFile{file}, nil
 			}
 		}
 
 		// MongoDB çalışıyor ama log dosyası bulunamadı
-		log.Printf("MongoDB servisi çalışıyor ama log dosyaları bulunamadı. MongoDB log dosyası konumunu kontrol edin.")
+		logger.Warning("MongoDB servisi çalışıyor ama log dosyaları bulunamadı. MongoDB log dosyası konumunu kontrol edin.")
 	} else {
-		log.Printf("%d adet MongoDB log dosyası bulundu", len(logFiles))
+		logger.Info("%d adet MongoDB log dosyası bulundu", len(logFiles))
 	}
 
 	return logFiles, nil
@@ -1558,7 +1561,7 @@ func findMongoConfigFile() string {
 
 						// Dosyanın var olup olmadığını kontrol et
 						if _, err := os.Stat(configPath); err == nil {
-							log.Printf("MongoDB konfigürasyon dosyası süreç parametrelerinden bulundu: %s", configPath)
+							logger.Info("MongoDB konfigürasyon dosyası süreç parametrelerinden bulundu: %s", configPath)
 							return configPath
 						}
 					}
@@ -1614,7 +1617,7 @@ func findMongoConfigFile() string {
 		if err == nil && len(matches) > 0 {
 			for _, match := range matches {
 				if _, err := os.Stat(match); err == nil {
-					log.Printf("MongoDB konfigürasyon dosyası bilinen yoldan bulundu: %s", match)
+					logger.Info("MongoDB konfigürasyon dosyası bilinen yoldan bulundu: %s", match)
 					return match
 				}
 			}
@@ -1634,7 +1637,7 @@ func findMongoConfigFile() string {
 
 		for _, path := range configInDataDir {
 			if _, err := os.Stat(path); err == nil {
-				log.Printf("MongoDB konfigürasyon dosyası veri dizininde bulundu: %s", path)
+				logger.Info("MongoDB konfigürasyon dosyası veri dizininde bulundu: %s", path)
 				return path
 			}
 		}
@@ -1656,7 +1659,7 @@ func findMongoConfigFile() string {
 				matches := re.FindAllString(line, -1)
 				for _, match := range matches {
 					if _, err := os.Stat(match); err == nil {
-						log.Printf("MongoDB konfigürasyon dosyası --help çıktısından bulundu: %s", match)
+						logger.Info("MongoDB konfigürasyon dosyası --help çıktısından bulundu: %s", match)
 						return match
 					}
 				}
@@ -1665,7 +1668,7 @@ func findMongoConfigFile() string {
 	}
 
 	// Hiçbir şey bulunamadı
-	log.Printf("MongoDB konfigürasyon dosyası bulunamadı")
+	logger.Warning("MongoDB konfigürasyon dosyası bulunamadı")
 	return ""
 }
 
@@ -1674,7 +1677,7 @@ func getLogPathFromConfig(configFile string) string {
 	// Dosyayı oku
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		log.Printf("Konfigürasyon dosyası okunamadı: %v", err)
+		logger.Warning("Konfigürasyon dosyası okunamadı: %v", err)
 		return ""
 	}
 
@@ -1808,19 +1811,19 @@ func (c *MongoCollector) CheckForFailover(prevStatus, currentStatus *MongoServic
 	// 1. PRIMARY -> SECONDARY geçiş (bu node primary iken secondary'ye düşmüş)
 	if prevStatus.CurrentState == "PRIMARY" && currentStatus.CurrentState == "SECONDARY" {
 		isFailover = true
-		log.Printf("ALARM: MongoDB node PRIMARY'den SECONDARY'ye düştü!")
+		logger.Error("ALARM: MongoDB node PRIMARY'den SECONDARY'ye düştü!")
 	}
 
 	// 2. SECONDARY -> PRIMARY geçiş (bu node secondary iken primary olmuş)
 	if prevStatus.CurrentState == "SECONDARY" && currentStatus.CurrentState == "PRIMARY" {
 		isFailover = true
-		log.Printf("ALARM: MongoDB node SECONDARY'den PRIMARY'ye yükseldi!")
+		logger.Error("ALARM: MongoDB node SECONDARY'den PRIMARY'ye yükseldi!")
 	}
 
 	// 3. Servis durumu değişiklikleri
 	if prevStatus.Status == "RUNNING" && currentStatus.Status != "RUNNING" {
 		isFailover = true
-		log.Printf("ALARM: MongoDB servis durumu değişti! Önceki: %s, Şimdiki: %s, Hata: %s",
+		logger.Error("ALARM: MongoDB servis durumu değişti! Önceki: %s, Şimdiki: %s, Hata: %s",
 			prevStatus.Status, currentStatus.Status, currentStatus.ErrorMessage)
 	}
 
@@ -1832,7 +1835,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in PromoteToPrimary: %v", r)
+			logger.Error("PANIC in PromoteToPrimary: %v", r)
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
@@ -1841,7 +1844,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 		}
 	}()
 
-	log.Printf("MongoDB node stepDown başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
+	logger.Info("MongoDB node stepDown başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s",
 		hostname, port, replicaSet)
 
 	// MongoDB bağlantı URI'sini oluştur
@@ -1855,7 +1858,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 
 	// MongoDB shell komutu oluştur
 	command := fmt.Sprintf(`mongosh "%s" --eval "rs.stepDown(60, 10)"`, connectionString)
-	log.Printf("MongoDB RS stepDown komutu çalıştırılıyor")
+	logger.Info("MongoDB RS stepDown komutu çalıştırılıyor")
 
 	// Komutu çalıştır
 	cmd := exec.Command("bash", "-c", command)
@@ -1863,7 +1866,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 	outputStr := string(output)
 
 	if err != nil {
-		log.Printf("MongoDB stepDown komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
+		logger.Error("MongoDB stepDown komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
 		// Node primary değilse hata döner
 		if strings.Contains(outputStr, "not primary") {
 			return "", fmt.Errorf("bu node primary değil, stepDown işlemi yapılamaz: %v", err)
@@ -1871,10 +1874,10 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 		return "", fmt.Errorf("stepDown başarısız: %v", err)
 	}
 
-	log.Printf("MongoDB stepDown komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
+	logger.Info("MongoDB stepDown komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
 
 	// Check status after stepDown (10 second delay)
-	log.Printf("Node'un yeni durumunu kontrol etmek için bekleniyor...")
+	logger.Info("Node'un yeni durumunu kontrol etmek için bekleniyor...")
 	time.Sleep(10 * time.Second)
 
 	// Check node status after stepDown
@@ -1883,7 +1886,7 @@ func (c *MongoCollector) PromoteToPrimary(hostname string, port int, replicaSet 
 	checkOutput, checkErr := cmd.CombinedOutput()
 
 	if checkErr != nil {
-		log.Printf("StepDown sonrası durum kontrolü başarısız: %v", checkErr)
+		logger.Error("StepDown sonrası durum kontrolü başarısız: %v", checkErr)
 		return fmt.Sprintf("MongoDB node stepDown tamamlandı, ancak durum kontrolü başarısız: %s",
 			strings.TrimSpace(outputStr)), nil
 	}
@@ -1899,7 +1902,7 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 	// Implement panic recovery to prevent crash
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in FreezeMongoSecondary: %v", r)
+			logger.Error("PANIC in FreezeMongoSecondary: %v", r)
 			// Mark as unhealthy after panic
 			if c != nil {
 				c.isHealthy = false
@@ -1908,7 +1911,7 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 		}
 	}()
 
-	log.Printf("MongoDB node freeze başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s, Seconds: %d",
+	logger.Info("MongoDB node freeze başlatılıyor. Hostname: %s, Port: %d, ReplicaSet: %s, Seconds: %d",
 		hostname, port, replicaSet, seconds)
 
 	// MongoDB bağlantı URI'sini oluştur
@@ -1922,7 +1925,7 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 
 	// MongoDB shell komutu oluştur
 	command := fmt.Sprintf(`mongosh "%s" --eval "rs.freeze(%d)"`, connectionString, seconds)
-	log.Printf("MongoDB RS freeze komutu çalıştırılıyor: %d saniye", seconds)
+	logger.Info("MongoDB RS freeze komutu çalıştırılıyor: %d saniye", seconds)
 
 	// Komutu çalıştır
 	cmd := exec.Command("bash", "-c", command)
@@ -1930,11 +1933,11 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 	outputStr := string(output)
 
 	if err != nil {
-		log.Printf("MongoDB freeze komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
+		logger.Error("MongoDB freeze komutu çalıştırılırken hata: %v\nÇıktı: %s", err, outputStr)
 		return "", fmt.Errorf("freeze işlemi başarısız: %v", err)
 	}
 
-	log.Printf("MongoDB freeze komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
+	logger.Info("MongoDB freeze komutu başarıyla çalıştırıldı. Çıktı: %s", outputStr)
 
 	// Check node status after freeze
 	checkCmd := fmt.Sprintf(`mongosh "%s" --eval "rs.status()"`, connectionString)
@@ -1942,7 +1945,7 @@ func (c *MongoCollector) FreezeMongoSecondary(hostname string, port int, replica
 	checkOutput, checkErr := cmd.CombinedOutput()
 
 	if checkErr != nil {
-		log.Printf("Freeze sonrası durum kontrolü başarısız: %v", checkErr)
+		logger.Error("Freeze sonrası durum kontrolü başarısız: %v", checkErr)
 		return fmt.Sprintf("MongoDB node freeze tamamlandı, ancak durum kontrolü başarısız: %s",
 			strings.TrimSpace(outputStr)), nil
 	}
@@ -1994,22 +1997,22 @@ func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, e
 	// MongoDB bağlantısını al
 	client, err := c.GetClient()
 	if err != nil {
-		log.Printf("MongoDB explain bağlantısı açılamadı: %v", err)
+		logger.Error("MongoDB explain bağlantısı açılamadı: %v", err)
 		return "", fmt.Errorf("MongoDB bağlantısı açılamadı: %v", err)
 	}
 	defer client.Disconnect(context.Background())
 
-	log.Printf("ExplainMongoQuery başlatılıyor. Veritabanı: %s, Sorgu Boyutu: %d bytes",
+	logger.Info("ExplainMongoQuery başlatılıyor. Veritabanı: %s, Sorgu Boyutu: %d bytes",
 		database, len(queryStr))
 
 	// Sorguyu BSON formatına çevir
 	var queryDoc bson.D
 	if err := bson.UnmarshalExtJSON([]byte(queryStr), true, &queryDoc); err != nil {
-		log.Printf("MongoDB sorgusu JSON formatına çevrilemedi: %v", err)
+		logger.Error("MongoDB sorgusu JSON formatına çevrilemedi: %v", err)
 		return "", fmt.Errorf("sorgu JSON formatına çevrilemedi: %v", err)
 	}
 
-	log.Printf("MongoDB sorgusu başarıyla parse edildi")
+	logger.Info("MongoDB sorgusu başarıyla parse edildi")
 
 	// Veritabanı bağlantısı
 	db := client.Database(database)
@@ -2023,10 +2026,10 @@ func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, e
 	var explainResult bson.M
 	if err := db.RunCommand(context.Background(), explainOpts).Decode(&explainResult); err != nil {
 		// Admin veritabanında tekrar deneyelim
-		log.Printf("Explain sorgu hatası: %v, admin veritabanında tekrar deneniyor", err)
+		logger.Error("Explain sorgu hatası: %v, admin veritabanında tekrar deneniyor", err)
 		adminDB := client.Database("admin")
 		if err := adminDB.RunCommand(context.Background(), explainOpts).Decode(&explainResult); err != nil {
-			log.Printf("Admin veritabanında da explain başarısız: %v", err)
+			logger.Error("Admin veritabanında da explain başarısız: %v", err)
 			return "", fmt.Errorf("MongoDB sorgu planı alınamadı: %v", err)
 		}
 	}
@@ -2064,6 +2067,12 @@ func (c *MongoCollector) ExplainMongoQuery(database, queryStr string) (string, e
 
 // CanCollect checks if enough time has passed since last collection to prevent rate limiting
 func (c *MongoCollector) CanCollect() bool {
+	// Allow collection during startup grace period
+	if time.Since(c.startupTime) < c.startupGracePeriod {
+		logger.Info("MongoDB collector in startup grace period, allowing collection")
+		return true
+	}
+
 	if time.Since(c.lastCollectionTime) < c.collectionInterval {
 		logger.Debug("MongoDB Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
 		return false
@@ -2276,6 +2285,10 @@ func (c *MongoCollector) ResetToHealthy() {
 // StartupRecovery performs recovery checks at agent startup
 func (c *MongoCollector) StartupRecovery() {
 	logger.Info("MongoDB collector performing startup recovery check...")
+
+	// Reset startup time and extend grace period for recovery
+	c.startupTime = time.Now()
+	c.startupGracePeriod = 30 * time.Second // Extended grace period for recovery
 
 	// Give it 3 attempts at startup
 	for i := 0; i < 3; i++ {
