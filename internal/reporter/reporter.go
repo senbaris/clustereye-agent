@@ -413,14 +413,15 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 
 // Reporter toplanan verileri merkezi sunucuya raporlar
 type Reporter struct {
-	cfg          *config.AgentConfig
-	grpcClient   *grpc.ClientConn
-	stream       pb.AgentService_ConnectClient
-	stopCh       chan struct{}
-	isListening  bool
-	reportTicker *time.Ticker        // Periyodik raporlama için ticker
-	alarmMonitor *alarm.AlarmMonitor // Alarm izleme sistemi
-	platform     string              // Added to keep track of the platform
+	cfg           *config.AgentConfig
+	grpcClient    *grpc.ClientConn
+	stream        pb.AgentService_ConnectClient
+	stopCh        chan struct{}
+	isListening   bool
+	reportTicker  *time.Ticker        // Periyodik raporlama için ticker
+	alarmMonitor  *alarm.AlarmMonitor // Alarm izleme sistemi
+	platform      string              // Added to keep track of the platform
+	metricsSender *MetricsSender      // Metrics collection and sending
 
 	// Rate limiting and circuit breaker fields
 	lastConnectionAttempt  time.Time
@@ -439,7 +440,7 @@ type Reporter struct {
 
 // NewReporter yeni bir Reporter örneği oluşturur
 func NewReporter(cfg *config.AgentConfig) *Reporter {
-	return &Reporter{
+	reporter := &Reporter{
 		cfg:                    cfg,
 		stopCh:                 make(chan struct{}),
 		isListening:            false,
@@ -454,6 +455,11 @@ func NewReporter(cfg *config.AgentConfig) *Reporter {
 		// Initialize thread-safe periodic reporting control
 		isPeriodicRunning: false,
 	}
+
+	// Initialize metrics sender after reporter is created
+	reporter.metricsSender = NewMetricsSender(cfg, reporter)
+
+	return reporter
 }
 
 // GetGlobalReporter returns the global reporter instance (thread-safe)
@@ -634,8 +640,8 @@ func (r *Reporter) connectDirect() error {
 
 		// Connection pool and timeout settings
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(32*1024*1024), // 32MB
-			grpc.MaxCallSendMsgSize(32*1024*1024), // 32MB
+			grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB - Increased for large deadlock XML
+			grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB - Increased for large deadlock XML
 		),
 
 		// Keep-alive seçenekleri - more conservative to prevent ENHANCE_YOUR_CALM
@@ -932,6 +938,12 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			if err := r.SendMSSQLInfo(); err != nil {
 				log.Printf("MSSQL bilgileri gönderilemedi: %v", err)
 			}
+
+			// Start periodic metrics collection for MSSQL
+			if r.metricsSender != nil {
+				log.Printf("Starting periodic MSSQL metrics collection...")
+				r.metricsSender.StartPeriodicMetricsCollection(60 * time.Second) // Collect every minute
+			}
 		}
 
 		// Alarm izleme sistemini başlat
@@ -1178,6 +1190,7 @@ func (r *Reporter) listenForCommands() {
 				messageType = "query"
 			} else if metricsReq := msg.GetMetricsRequest(); metricsReq != nil {
 				messageType = "metrics_request"
+
 			}
 			log.Printf("Sunucudan mesaj alındı - Tip: %s (Son mesaj tipi: %s)", messageType, lastMessageType)
 
@@ -1292,7 +1305,19 @@ func (r *Reporter) listenForCommands() {
 
 						// Sistem metrikleri sorgusu için özel işleme
 						if query.Command == "get_system_metrics" {
-							log.Printf("MSSQL platformunda sistem metrikleri sorgusu alındı (QueryID: %s)", query.QueryId)
+							log.Printf("MSSQL platformunda sistem metrikleri sorgusu alındı (QueryID: %s), Platform: %s, OS: %s", query.QueryId, r.platform, runtime.GOOS)
+
+							// MSSQL/Windows için platform kontrolü
+							if runtime.GOOS != "windows" && r.platform != "mssql" {
+								log.Printf("MSSQL sistem metrikleri sadece Windows platformunda veya MSSQL platformu için desteklenir")
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": "MSSQL sistem metrikleri sadece Windows platformunda desteklenir",
+								}
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+								isProcessingQuery = false
+								continue
+							}
 
 							// MSSQL/Windows için özel metrik toplama
 							metrics := r.collectMSSQLSystemMetrics()
@@ -1932,7 +1957,72 @@ func (r *Reporter) listenForCommands() {
 
 				// Sistem metrikleri sorgusu için özel işleme
 				if query.Command == "get_system_metrics" {
-					log.Printf("Sistem metrikleri sorgusu alındı (QueryID: %s)", query.QueryId)
+					log.Printf("Sistem metrikleri sorgusu alındı (QueryID: %s), Platform: %s, OS: %s", query.QueryId, r.platform, runtime.GOOS)
+
+					// MSSQL platformunda MSSQL metriklerini topla
+					if r.platform == "mssql" {
+						log.Printf("MSSQL platformu tespit edildi, MSSQL sistem metrikleri toplanıyor")
+
+						// MSSQL/Windows için özel metrik toplama
+						metrics := r.collectMSSQLSystemMetrics()
+
+						// Metrics verilerini structpb.Struct formatına dönüştür
+						metricsStruct := &structpb.Struct{
+							Fields: map[string]*structpb.Value{
+								"cpu_usage":        structpb.NewNumberValue(metrics.CpuUsage),
+								"cpu_cores":        structpb.NewNumberValue(float64(metrics.CpuCores)),
+								"memory_usage":     structpb.NewNumberValue(metrics.MemoryUsage),
+								"total_memory":     structpb.NewNumberValue(float64(metrics.TotalMemory)),
+								"free_memory":      structpb.NewNumberValue(float64(metrics.FreeMemory)),
+								"load_average_1m":  structpb.NewNumberValue(metrics.LoadAverage_1M),
+								"load_average_5m":  structpb.NewNumberValue(metrics.LoadAverage_5M),
+								"load_average_15m": structpb.NewNumberValue(metrics.LoadAverage_15M),
+								"total_disk":       structpb.NewNumberValue(float64(metrics.TotalDisk)),
+								"free_disk":        structpb.NewNumberValue(float64(metrics.FreeDisk)),
+								"os_version":       structpb.NewStringValue(metrics.OsVersion),
+								"kernel_version":   structpb.NewStringValue(metrics.KernelVersion),
+								"uptime":           structpb.NewNumberValue(float64(metrics.Uptime)),
+							},
+						}
+
+						// structpb.Struct'ı Any tipine çevir
+						anyValue, err := anypb.New(metricsStruct)
+						if err != nil {
+							log.Printf("MSSQL Metrics struct'ı Any tipine çevrilemedi: %v", err)
+							queryResult := map[string]interface{}{
+								"status":  "error",
+								"message": fmt.Sprintf("Metrics struct'ı Any tipine çevrilemedi: %v", err),
+							}
+							sendQueryResult(r.stream, query.QueryId, queryResult)
+							isProcessingQuery = false
+							continue
+						}
+
+						// Yanıtı oluştur ve gönder
+						queryResult := &pb.QueryResult{
+							QueryId: query.QueryId,
+							Result:  anyValue,
+						}
+
+						// QueryResult mesajı olarak gönder
+						err = r.stream.Send(&pb.AgentMessage{
+							Payload: &pb.AgentMessage_QueryResult{
+								QueryResult: queryResult,
+							},
+						})
+
+						if err != nil {
+							log.Printf("MSSQL sistem metrikleri sorgusu yanıtı gönderilemedi: %v", err)
+							if err := r.reconnect(); err != nil {
+								log.Printf("Yeniden bağlantı başarısız: %v", err)
+							}
+						} else {
+							log.Printf("MSSQL sistem metrikleri sorgusu başarıyla yanıtlandı (QueryID: %s)", query.QueryId)
+						}
+
+						isProcessingQuery = false
+						continue
+					}
 
 					// Metrikleri topla
 					metrics := postgres.GetSystemMetrics()

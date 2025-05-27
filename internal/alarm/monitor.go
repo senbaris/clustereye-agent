@@ -1,8 +1,11 @@
 package alarm
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,7 +22,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/collector/mongo"
 	"github.com/senbaris/clustereye-agent/internal/collector/postgres"
 	"github.com/senbaris/clustereye-agent/internal/config"
-	"github.com/senbaris/clustereye-agent/internal/logger" // New logger package
+	"github.com/senbaris/clustereye-agent/internal/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -1196,12 +1199,31 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 	maxRetries := 5            // Daha fazla deneme hakkı
 	backoff := time.Second * 2 // Daha uzun bekleme süresi
 
+	logger.Debug("reportAlarm başlıyor - AlarmID: %s, MetricName: %s, Mesaj boyutu: %d bytes",
+		event.Id, event.MetricName, len(event.Message))
+
 	// Bağlantı yenileme sayacı
 	connectionRefreshCount := 0
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Her denemede yeni bir context oluştur (30 saniye zaman aşımı)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		logger.Debug("Alarm gönderme denemesi %d/%d başlıyor", attempt+1, maxRetries)
+
+		// Client durumunu kontrol et
+		if m.client == nil {
+			logger.Error("gRPC client nil durumda, yenileme gerekiyor")
+			if m.clientRefreshCallback != nil {
+				if newClient, err := m.clientRefreshCallback(); err == nil {
+					m.client = newClient
+					logger.Info("gRPC client başarıyla yenilendi")
+				} else {
+					logger.Error("gRPC client yenilenemedi: %v", err)
+				}
+			}
+		}
+
+		// Her denemede yeni bir context oluştur - DAHA KISA TIMEOUT
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // 30s timeout
+		logger.Debug("Context oluşturuldu - Timeout: 30s")
 
 		// İstek gönder
 		req := &pb.ReportAlarmRequest{
@@ -1209,8 +1231,13 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 			Events:  []*pb.AlarmEvent{event},
 		}
 
+		logger.Debug("ReportAlarm isteği gönderiliyor - Events sayısı: %d", len(req.Events))
+		startTime := time.Now()
 		resp, err := m.client.ReportAlarm(ctx, req)
+		duration := time.Since(startTime)
 		cancel() // Context'i hemen temizle
+
+		logger.Debug("ReportAlarm isteği tamamlandı - Süre: %v", duration)
 
 		if err != nil {
 			// Daha kapsamlı hata kontrol mekanizması
@@ -1219,7 +1246,10 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 				strings.Contains(err.Error(), "Canceled") ||
 				strings.Contains(err.Error(), "Deadline") ||
 				strings.Contains(err.Error(), "context") ||
-				strings.Contains(err.Error(), "closing")
+				strings.Contains(err.Error(), "closing") ||
+				strings.Contains(err.Error(), "RST_STREAM") ||
+				strings.Contains(err.Error(), "ENHANCE_YOUR_CALM") ||
+				strings.Contains(err.Error(), "Unavailable")
 
 			if attempt < maxRetries-1 {
 				if isConnectionError {
@@ -1254,11 +1284,18 @@ func (m *AlarmMonitor) reportAlarm(event *pb.AlarmEvent) error {
 						connectionRefreshCount = (connectionRefreshCount + 1) % 2 // Her 2 denemede bir
 					}
 
-					// Exponential backoff ile bekle
+					// Exponential backoff ile bekle - DAHA KISA BEKLEME
 					backoffTime := backoff * time.Duration(1<<uint(attempt))
 					if backoffTime > 30*time.Second {
 						backoffTime = 30 * time.Second // Maksimum 30 saniye
 					}
+
+					// ENHANCE_YOUR_CALM hatası için daha uzun bekle
+					if strings.Contains(err.Error(), "ENHANCE_YOUR_CALM") {
+						backoffTime = 45 * time.Second // ENHANCE_YOUR_CALM için 45s bekle
+						logger.Warning("ENHANCE_YOUR_CALM hatası nedeniyle %v bekleniyor...", backoffTime)
+					}
+
 					logger.Debug("Yeniden deneme için %v bekleniyor...", backoffTime)
 					time.Sleep(backoffTime)
 					continue
@@ -2721,6 +2758,7 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 
 // checkMSSQLDeadlocks SQL Server'da deadlock oluşumlarını kontrol eder ve alarm üretir
 func (m *AlarmMonitor) checkMSSQLDeadlocks() {
+
 	alarmKey := "mssql_deadlocks"
 
 	// Bağlantı bilgilerini al
@@ -2749,19 +2787,52 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 
 	logger.Debug("MSSQL deadlock kontrolü başlıyor...")
 
-	// Son 1 saat içindeki deadlock olaylarını sorgula
-	// system_health XEvent oturumundan deadlock bilgilerini çek
+	// Son 1 saat içindeki deadlock olaylarını sorgula - Daha detaylı bilgilerle
 	query := `
-	SELECT
-		CAST(event_data AS XML) AS DeadlockGraph,
-		DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) AS LocalTimeStamp
-	FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL)
-	WHERE object_name = 'xml_deadlock_report'
-	AND DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) > DATEADD(HOUR, -1, GETDATE())
-	ORDER BY timestamp_utc DESC`
+	WITH RawDeadlocks AS (
+		SELECT
+			CAST(event_data AS XML) AS DeadlockGraph,
+			DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) AS LocalTimeStamp
+		FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL)
+		WHERE object_name = 'xml_deadlock_report'
+		AND DATEADD(mi, DATEDIFF(mi, GETUTCDATE(), CURRENT_TIMESTAMP), CAST(timestamp_utc AS datetime)) > DATEADD(HOUR, -1, GETDATE())
+	),
+	DeadlockInfo AS (
+		SELECT
+			LocalTimeStamp,
+			DeadlockGraph,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@spid)[1]', 'int') as SPID1,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@spid)[2]', 'int') as SPID2,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@database)[1]', 'nvarchar(128)') as Database1,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@database)[2]', 'nvarchar(128)') as Database2,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@clientapp)[1]', 'nvarchar(128)') as App1,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@clientapp)[2]', 'nvarchar(128)') as App2,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@hostname)[1]', 'nvarchar(128)') as Host1,
+			DeadlockGraph.value('(/event/data/value/deadlock/process-list/process/@hostname)[2]', 'nvarchar(128)') as Host2
+		FROM RawDeadlocks
+	)
+	SELECT 
+		LocalTimeStamp,
+		CAST(DeadlockGraph AS nvarchar(max)) as DeadlockGraph,
+		ISNULL(SPID1, 0) as SPID1,
+		ISNULL(SPID2, 0) as SPID2,
+		ISNULL(Database1, 'Unknown') as Database1,
+		ISNULL(Database2, 'Unknown') as Database2,
+		ISNULL(App1, 'Unknown') as App1,
+		ISNULL(App2, 'Unknown') as App2,
+		ISNULL(Host1, 'Unknown') as Host1,
+		ISNULL(Host2, 'Unknown') as Host2
+	FROM DeadlockInfo
+	ORDER BY LocalTimeStamp DESC`
+
+	logger.Debug("Deadlock sorgusu: %s", query)
 
 	// Sorgu sonucunu okumak için hazırla
+	startTime := time.Now()
 	rows, err := db.Query(query)
+	queryDuration := time.Since(startTime)
+	logger.Debug("Deadlock sorgusu tamamlandı - Süre: %v", queryDuration)
+
 	if err != nil {
 		logger.Error("MSSQL deadlock sorgusu çalıştırılamadı: %v", err)
 		return
@@ -2769,18 +2840,26 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 	defer rows.Close()
 
 	type deadlockInfo struct {
-		TimeStamp     time.Time
-		DeadlockGraph string // XML içeriği
+		TimeStamp            time.Time
+		DeadlockGraph        string
+		SPID1, SPID2         int
+		Database1, Database2 string
+		App1, App2           string
+		Host1, Host2         string
 	}
 
 	var deadlocks []deadlockInfo
-	var databaseName string
+	logger.Debug("Deadlock sonuçları okunuyor...")
 
 	for rows.Next() {
 		var dl deadlockInfo
 		err := rows.Scan(
-			&dl.DeadlockGraph,
 			&dl.TimeStamp,
+			&dl.DeadlockGraph,
+			&dl.SPID1, &dl.SPID2,
+			&dl.Database1, &dl.Database2,
+			&dl.App1, &dl.App2,
+			&dl.Host1, &dl.Host2,
 		)
 
 		if err != nil {
@@ -2797,72 +2876,124 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 
 	// Eğer deadlock bulunmuşsa alarm oluştur
 	if len(deadlocks) > 0 {
-		logger.Debug("Son 1 saat içinde %d deadlock bulundu", len(deadlocks))
+		logger.Info("Son 1 saat içinde %d deadlock bulundu", len(deadlocks))
 
 		// Rate limiting kontrolü
 		m.alarmCacheLock.RLock()
 		prevAlarm, exists := m.alarmCache[alarmKey]
 		m.alarmCacheLock.RUnlock()
 
+		logger.Debug("Önceki alarm durumu: exists=%v, status=%s", exists,
+			func() string {
+				if exists {
+					return prevAlarm.Status
+				} else {
+					return "yok"
+				}
+			}())
+
 		// Sadece son deadlock durumundan farklıysa veya 30 dakikadan uzun süre geçtiyse bildir
 		shouldSendAlarm := true
 		if exists {
 			prevTimestamp, err := time.Parse(time.RFC3339, prevAlarm.Timestamp)
 			if err == nil {
-				// Benzer deadlock 30 dakikadan kısa süredir bildirilmişse tekrar alarm gönderme
-				if time.Since(prevTimestamp) < 30*time.Minute &&
+				timeSinceLastAlarm := time.Since(prevTimestamp)
+				logger.Debug("Son alarmdan bu yana geçen süre: %v", timeSinceLastAlarm)
+
+				if timeSinceLastAlarm < 30*time.Minute &&
 					strings.Contains(prevAlarm.Message, fmt.Sprintf("Found %d deadlocks", len(deadlocks))) {
+					logger.Debug("Son 30 dakika içinde benzer deadlock alarmı gönderilmiş, tekrar gönderilmeyecek")
 					shouldSendAlarm = false
 				}
 			}
 		}
 
 		if shouldSendAlarm {
-			// Deadlock detaylarını hazırla
-			var deadlockDetails []string
+			// Ana alarm mesajını oluştur
+			var messageBuilder strings.Builder
+			messageBuilder.WriteString(fmt.Sprintf("Found %d deadlocks in the last hour:\n\n", len(deadlocks)))
+
+			// Ana alarm ID'sini başta oluştur
+			mainAlarmID := uuid.New().String()
 
 			for i, dl := range deadlocks {
-				if i >= 5 { // Sadece ilk 5 deadlock hakkında detay göster
-					deadlockDetails = append(deadlockDetails, fmt.Sprintf("(Fazla deadlock nedeniyle diğer %d deadlock detayı gizlendi)", len(deadlocks)-5))
-					break
+				messageBuilder.WriteString(fmt.Sprintf("Deadlock #%d:\n", i+1))
+				messageBuilder.WriteString(fmt.Sprintf("Time: %s\n", dl.TimeStamp.Format("2006-01-02 15:04:05")))
+				messageBuilder.WriteString(fmt.Sprintf("Process 1: SPID=%d, Database=%s, App=%s, Host=%s\n",
+					dl.SPID1, dl.Database1, dl.App1, dl.Host1))
+				messageBuilder.WriteString(fmt.Sprintf("Process 2: SPID=%d, Database=%s, App=%s, Host=%s\n",
+					dl.SPID2, dl.Database2, dl.App2, dl.Host2))
+				messageBuilder.WriteString("\n")
+
+				// XML'i gzip ile sıkıştır
+				var compressedXML bytes.Buffer
+				gzipWriter := gzip.NewWriter(&compressedXML)
+				if _, err := gzipWriter.Write([]byte(dl.DeadlockGraph)); err != nil {
+					logger.Error("XML sıkıştırılamadı: %v", err)
+					continue
+				}
+				if err := gzipWriter.Close(); err != nil {
+					logger.Error("Gzip writer kapatılamadı: %v", err)
+					continue
 				}
 
-				// Deadlock detayı - sadece XML ve zaman bilgisi
-				deadlockDetail := fmt.Sprintf("Deadlock #%d (at %s):\n%s",
-					i+1,
-					dl.TimeStamp.Format("2006-01-02 15:04:05"),
-					dl.DeadlockGraph)
+				// Sıkıştırılmış veriyi base64 ile kodla
+				encodedXML := base64.StdEncoding.EncodeToString(compressedXML.Bytes())
 
-				deadlockDetails = append(deadlockDetails, deadlockDetail)
+				logger.Debug("Deadlock #%d XML sıkıştırma oranı: %.2f%% (Orijinal: %d bytes, Sıkıştırılmış: %d bytes)",
+					i+1,
+					(1-float64(len(encodedXML))/float64(len(dl.DeadlockGraph)))*100,
+					len(dl.DeadlockGraph),
+					len(encodedXML))
+
+				// Sıkıştırılmış XML'i ayrı bir alarm olarak gönder
+				xmlAlarm := &pb.AlarmEvent{
+					Id:          uuid.New().String(),
+					AlarmId:     fmt.Sprintf("%s_xml_%d", mainAlarmID, i+1),
+					AgentId:     m.agentID,
+					Status:      "triggered",
+					MetricName:  "mssql_deadlock_xml",
+					MetricValue: "compressed",
+					Message:     fmt.Sprintf("COMPRESSED_XML:%s", encodedXML),
+					Timestamp:   time.Now().Format(time.RFC3339),
+					Severity:    "info",
+					Database:    dl.Database1,
+				}
+
+				// XML alarmını gönder
+				if err := m.reportAlarm(xmlAlarm); err != nil {
+					logger.Error("Deadlock #%d XML alarmı gönderilemedi: %v", i+1, err)
+					continue
+				}
+
+				logger.Info("Deadlock #%d XML alarmı başarıyla gönderildi", i+1)
 			}
 
-			// Alarm mesajı oluştur
-			message := fmt.Sprintf("Found %d deadlocks in SQL Server in the last hour.\n\n%s",
-				len(deadlocks), strings.Join(deadlockDetails, "\n\n"))
-
-			alarmEvent := &pb.AlarmEvent{
-				Id:          uuid.New().String(),
+			// Ana alarmı gönder
+			mainAlarm := &pb.AlarmEvent{
+				Id:          mainAlarmID,
 				AlarmId:     alarmKey,
 				AgentId:     m.agentID,
 				Status:      "triggered",
-				MetricName:  "mssql_deadlocks",
+				MetricName:  "mssql_deadlock",
 				MetricValue: fmt.Sprintf("%d", len(deadlocks)),
-				Message:     message,
+				Message:     messageBuilder.String(),
 				Timestamp:   time.Now().Format(time.RFC3339),
-				Severity:    "critical", // Deadlock'lar kritik seviyededir
-				Database:    databaseName,
+				Severity:    "critical",
+				Database:    deadlocks[0].Database1,
 			}
 
-			if err := m.reportAlarm(alarmEvent); err != nil {
-				logger.Error("MSSQL deadlock alarmı gönderilemedi: %v", err)
-			} else {
-				m.alarmCacheLock.Lock()
-				m.alarmCache[alarmKey] = alarmEvent
-				m.alarmCacheLock.Unlock()
-				logger.Warning("MSSQL deadlock alarmı gönderildi (ID: %s, %d deadlock)", alarmEvent.Id, len(deadlocks))
+			logger.Debug("Ana deadlock alarmı gönderiliyor - AlarmID: %s", mainAlarmID)
+			if err := m.reportAlarm(mainAlarm); err != nil {
+				logger.Error("Ana deadlock alarmı gönderilemedi: %v", err)
+				return
 			}
+
+			// Başarılı gönderilen alarmı cache'e ekle
+			m.alarmCacheLock.Lock()
+			m.alarmCache[alarmKey] = mainAlarm
+			m.alarmCacheLock.Unlock()
+			logger.Warning("MSSQL deadlock alarmı gönderildi (ID: %s)", mainAlarmID)
 		}
-	} else {
-		logger.Info("Son 1 saat içinde deadlock bulunmadı")
 	}
 }

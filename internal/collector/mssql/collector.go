@@ -877,21 +877,39 @@ func (c *MSSQLCollector) formatBytes(bytes uint64) string {
 
 // BatchCollectSystemMetrics collects all system metrics with more efficient direct commands
 func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
-	// Check if we have cached metrics - increase cache duration from 1 hour to 6 hours
-	if cachedMetrics := c.getCachedSystemMetrics(); cachedMetrics != nil {
-		log.Printf("Using cached system metrics. Keys: %v", getMapKeys(cachedMetrics))
-		// Ensure cached metrics have consistent types
-		standardizedMetrics := standardizeMetricTypes(cachedMetrics)
-		return standardizedMetrics
+	// Get cached STATIC metrics (CPU count, total memory, IP address) - 6 hour cache
+	cachedStaticMetrics := c.getCachedSystemMetrics()
+
+	// Always collect DYNAMIC metrics fresh (CPU usage, memory usage, disk usage)
+	metrics := make(map[string]interface{})
+
+	// Start with cached static metrics if available
+	if cachedStaticMetrics != nil {
+		log.Printf("Using cached static metrics: %v", getMapKeys(cachedStaticMetrics))
+		for k, v := range cachedStaticMetrics {
+			if k != "timestamp" { // Don't copy timestamp
+				metrics[k] = v
+			}
+		}
 	}
 
 	// For non-Windows systems, fallback to individual calls
 	if runtime.GOOS != "windows" {
 		log.Printf("Non-Windows system detected, collecting metrics individually")
+
+		totalMem := int64(c.getTotalMemory())
+		freeMem := int64(float64(totalMem) * 0.2) // Estimate 20% free
+		memUsage := float64(80)                   // Estimate 80% usage
+
 		metrics := map[string]interface{}{
-			"cpu_count":    int32(c.getTotalvCpu()),   // Ensure int32
-			"total_memory": int64(c.getTotalMemory()), // Ensure int64
-			"ip_address":   string(c.getLocalIP()),    // Ensure string
+			"cpu_count":    int32(c.getTotalvCpu()),         // Ensure int32
+			"cpu_usage":    float64(0),                      // Default to 0% for Unix
+			"total_memory": totalMem,                        // Ensure int64
+			"free_memory":  freeMem,                         // Estimated free memory
+			"memory_usage": memUsage,                        // Estimated memory usage
+			"total_disk":   int64(100 * 1024 * 1024 * 1024), // 100GB default
+			"free_disk":    int64(30 * 1024 * 1024 * 1024),  // 30GB default
+			"ip_address":   string(c.getLocalIP()),          // Ensure string
 		}
 
 		// Cache the results
@@ -902,30 +920,73 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 	log.Printf("Collecting system metrics with lightweight direct commands")
 
 	// Use direct wmic commands for better performance
-	metrics := make(map[string]interface{})
+	// metrics map is already initialized above
 
-	// 1. Try getting CPU count using direct command
-	cmd := exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors", "/value")
+	// 1. Try getting CPU count and usage - First try computersystem for total count
+	cmd := exec.Command("wmic", "computersystem", "get", "NumberOfLogicalProcessors", "/value")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	cmdWithTimeout := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 	out, err := cmdWithTimeout.Output()
 	if err == nil {
-		// Parse the output line by line
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "NumberOfLogicalProcessors=") {
-				parts := strings.Split(line, "=")
-				if len(parts) == 2 {
-					cpuCountStr := strings.TrimSpace(parts[1])
-					if cpuCountStr != "" {
-						if cpuCount, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && cpuCount > 0 {
-							metrics["cpu_count"] = int32(cpuCount) // Ensure int32 type
-							break
+		// Parse the output for total logical processors
+		outStr := strings.TrimSpace(string(out))
+		if matches := regexp.MustCompile(`NumberOfLogicalProcessors=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+			if count, err := strconv.ParseInt(matches[1], 10, 32); err == nil && count > 0 {
+				metrics["cpu_count"] = int32(count)
+			}
+		}
+	}
+
+	// Get CPU usage percentage (ALWAYS fresh - don't cache)
+	cmd = exec.Command("wmic", "cpu", "get", "loadpercentage", "/value")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err = cmdWithTimeout.Output()
+	if err == nil {
+		outStr := strings.TrimSpace(string(out))
+		if matches := regexp.MustCompile(`LoadPercentage=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+			if usage, err := strconv.ParseFloat(matches[1], 64); err == nil {
+				metrics["cpu_usage"] = usage
+			}
+		}
+	}
+
+	// If computersystem failed, fall back to summing individual CPUs
+	if metrics["cpu_count"] == nil {
+		cmd = exec.Command("wmic", "cpu", "get", "NumberOfLogicalProcessors", "/value")
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+		out, err = cmdWithTimeout.Output()
+		if err == nil {
+			// Parse all CPU entries and sum them up
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			totalCores := int32(0)
+			cpuCount := 0
+
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.Contains(line, "NumberOfLogicalProcessors=") {
+					parts := strings.Split(line, "=")
+					if len(parts) == 2 {
+						cpuCountStr := strings.TrimSpace(parts[1])
+						if cpuCountStr != "" {
+							if count, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && count > 0 {
+								totalCores += int32(count)
+								cpuCount++
+							}
 						}
 					}
 				}
+			}
+
+			if totalCores > 0 {
+				metrics["cpu_count"] = totalCores
 			}
 		}
 	}
@@ -952,6 +1013,30 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 							break
 						}
 					}
+				}
+			}
+		}
+	}
+
+	// Get free memory and calculate memory usage (ALWAYS fresh - don't cache)
+	cmd = exec.Command("wmic", "OS", "get", "FreePhysicalMemory", "/value")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err = cmdWithTimeout.Output()
+	if err == nil {
+		outStr := strings.TrimSpace(string(out))
+		if matches := regexp.MustCompile(`FreePhysicalMemory=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+			if freeMem, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+				freeMemBytes := freeMem * 1024 // Convert KB to bytes
+				metrics["free_memory"] = freeMemBytes
+
+				// Calculate memory usage percentage if we have total memory
+				if totalMem, ok := metrics["total_memory"].(int64); ok && totalMem > 0 {
+					usedMem := totalMem - freeMemBytes
+					memUsage := float64(usedMem) / float64(totalMem) * 100
+					metrics["memory_usage"] = memUsage
 				}
 			}
 		}
@@ -996,89 +1081,57 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 		}
 	}
 
-	// If still missing any values, use existing fallback methods
+	// 4. Get disk space information for C: drive (ALWAYS fresh - don't cache)
+	cmd = exec.Command("wmic", "logicaldisk", "where", "DeviceID='C:'", "get", "Size,FreeSpace", "/value")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmdWithTimeout = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err = cmdWithTimeout.Output()
+	if err == nil {
+		outStr := strings.TrimSpace(string(out))
+
+		// Parse total disk size
+		if matches := regexp.MustCompile(`Size=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+			if totalDisk, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+				metrics["total_disk"] = totalDisk
+			}
+		}
+
+		// Parse free disk space
+		if matches := regexp.MustCompile(`FreeSpace=(\d+)`).FindStringSubmatch(outStr); len(matches) > 1 {
+			if freeDisk, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+				metrics["free_disk"] = freeDisk
+			}
+		}
+	}
+
+	// Fallback ONLY for STATIC metrics that couldn't be collected
 	if metrics["cpu_count"] == nil {
-		log.Printf("Using fallback for CPU count")
+		log.Printf("Using fallback for static CPU count")
 		metrics["cpu_count"] = int32(c.getTotalvCpu()) // Ensure int32
 	}
 
 	if metrics["total_memory"] == nil {
-		log.Printf("Using fallback for memory")
+		log.Printf("Using fallback for static total memory")
 		metrics["total_memory"] = int64(c.getTotalMemory()) // Ensure int64
 	}
 
 	if metrics["ip_address"] == nil {
-		log.Printf("Using fallback for IP address")
+		log.Printf("Using fallback for static IP address")
 		metrics["ip_address"] = string(c.getLocalIP()) // Ensure string
 	}
 
+	// DYNAMIC metrics are ALWAYS collected fresh - no fallbacks
+	// cpu_usage, memory_usage, free_memory, total_disk, free_disk
+	// These will be collected fresh every time above
+
 	// Cache the results for a longer period (6 hours)
-	log.Printf("Collected metrics - CPU: %v, Memory: %v, IP: %s",
-		metrics["cpu_count"], metrics["total_memory"], metrics["ip_address"])
 	c.cacheSystemMetrics(metrics)
 	return metrics
 }
 
-// standardizeMetricTypes ensures consistent types in metrics map
-func standardizeMetricTypes(metrics map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	// Copy all metrics
-	for k, v := range metrics {
-		result[k] = v
-	}
-
-	// Standardize CPU count
-	if cpuVal, ok := metrics["cpu_count"]; ok {
-		switch v := cpuVal.(type) {
-		case int32:
-			result["cpu_count"] = v
-		case int:
-			result["cpu_count"] = int32(v)
-		case int64:
-			result["cpu_count"] = int32(v)
-		case float64:
-			result["cpu_count"] = int32(v)
-		default:
-			// Remove invalid type
-			log.Printf("Removing invalid CPU count type: %T", cpuVal)
-			delete(result, "cpu_count")
-		}
-	}
-
-	// Standardize memory
-	if memVal, ok := metrics["total_memory"]; ok {
-		switch v := memVal.(type) {
-		case int64:
-			result["total_memory"] = v
-		case int:
-			result["total_memory"] = int64(v)
-		case int32:
-			result["total_memory"] = int64(v)
-		case float64:
-			result["total_memory"] = int64(v)
-		default:
-			// Remove invalid type
-			log.Printf("Removing invalid memory type: %T", memVal)
-			delete(result, "total_memory")
-		}
-	}
-
-	// Standardize IP address
-	if ipVal, ok := metrics["ip_address"]; ok {
-		if ipStr, ok := ipVal.(string); ok {
-			result["ip_address"] = ipStr
-		} else {
-			// Remove invalid type
-			log.Printf("Removing invalid IP address type: %T", ipVal)
-			delete(result, "ip_address")
-		}
-	}
-
-	return result
-}
-
-// Helper function to cache system metrics
+// Helper function to cache ONLY STATIC system metrics (not dynamic ones like CPU usage, memory usage, disk usage)
 func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 	cacheDir := c.getCacheDir()
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
@@ -1086,60 +1139,56 @@ func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 		return
 	}
 
-	// Standardize metrics format to prevent false change detection
-	standardizedMetrics := make(map[string]interface{})
+	// ONLY cache static metrics that don't change frequently
+	staticMetrics := make(map[string]interface{})
+
+	// Cache ONLY static values - exclude dynamic metrics
 	for k, v := range metrics {
 		switch k {
 		case "total_memory":
-			// Ensure memory is stored as int64 with explicit formatting
+			// Total memory rarely changes - cache it
 			if memVal, ok := v.(int64); ok && memVal > 0 {
-				standardizedMetrics[k] = memVal
-				log.Printf("Caching memory with consistent format: %d", memVal)
+				staticMetrics[k] = memVal
 			} else {
-				log.Printf("Invalid memory value for caching: %v (type: %T)", v, v)
-				standardizedMetrics[k] = int64(8 * 1024 * 1024 * 1024) // 8GB default
+				staticMetrics[k] = int64(8 * 1024 * 1024 * 1024) // 8GB default
 			}
 		case "cpu_count":
-			// Ensure CPU count is stored as int32
+			// CPU count rarely changes - cache it
 			if cpuVal, ok := v.(int32); ok && cpuVal > 0 {
-				standardizedMetrics[k] = cpuVal
+				staticMetrics[k] = cpuVal
 			} else {
-				log.Printf("Invalid CPU count for caching: %v (type: %T)", v, v)
-				standardizedMetrics[k] = int32(1) // Default to 1 CPU
+				staticMetrics[k] = int32(1) // Default to 1 CPU
 			}
 		case "ip_address":
-			// Ensure IP is stored as string
+			// IP address rarely changes - cache it
 			if ipVal, ok := v.(string); ok {
-				standardizedMetrics[k] = strings.TrimSpace(ipVal)
+				staticMetrics[k] = strings.TrimSpace(ipVal)
 			} else {
-				log.Printf("Invalid IP address for caching: %v (type: %T)", v, v)
-				standardizedMetrics[k] = "Unknown"
+				staticMetrics[k] = "Unknown"
 			}
+		case "cpu_usage", "memory_usage", "free_memory", "total_disk", "free_disk":
+			// DON'T cache dynamic metrics - they change frequently
+			// These will be collected fresh every time
 		default:
-			// Copy other values as-is
-			standardizedMetrics[k] = v
+			// Copy other static values as-is
+			staticMetrics[k] = v
 		}
 	}
 
 	// Add timestamp with consistent format
-	standardizedMetrics["timestamp"] = time.Now().Unix()
+	staticMetrics["timestamp"] = time.Now().Unix()
 
-	// Log the values being cached for verification
-	if memVal, ok := standardizedMetrics["total_memory"].(int64); ok {
-		log.Printf("CACHE FORMAT CHECK - Memory: %d, Scientific: %e", memVal, float64(memVal))
-	}
+	// Cache only static metrics
 
-	jsonData, err := json.Marshal(standardizedMetrics)
+	jsonData, err := json.Marshal(staticMetrics)
 	if err != nil {
-		log.Printf("System metrics JSON encode hatası: %v", err)
+		log.Printf("Static metrics JSON encode hatası: %v", err)
 		return
 	}
 
 	cacheFile := filepath.Join(cacheDir, "mssql_system_metrics.json")
 	if err := os.WriteFile(cacheFile, jsonData, 0644); err != nil {
-		log.Printf("System metrics önbelleğe kaydedilemedi: %v", err)
-	} else {
-		log.Printf("System metrics cached with standardized formatting")
+		log.Printf("Static metrics önbelleğe kaydedilemedi: %v", err)
 	}
 }
 
@@ -1925,7 +1974,6 @@ func (c *MSSQLCollector) getTotalMemory() int64 {
 								totalMemory = mem
 								// Cache the result
 								c.cacheMemory(totalMemory)
-								log.Printf("Got total memory via wmic command: %d bytes", totalMemory)
 								return totalMemory
 							}
 						}
@@ -1980,8 +2028,6 @@ func (c *MSSQLCollector) cacheMemory(memBytes int64) {
 	cacheFile := filepath.Join(cacheDir, "mssql_memory.txt")
 	if err := os.WriteFile(cacheFile, []byte(memoryStr), 0644); err != nil {
 		log.Printf("Memory önbelleğe kaydedilemedi: %v", err)
-	} else {
-		log.Printf("Memory cached with consistent format: %s bytes (value: %d)", memoryStr, memBytes)
 	}
 }
 
@@ -2529,7 +2575,6 @@ func (c *MSSQLCollector) getTotalvCpu() int32 {
 					result = int32(count)
 					// Cache the result
 					c.cacheCPUCount(result)
-					log.Printf("Got total CPU count via wmic computersystem: %d", result)
 					return result
 				}
 			}
@@ -2558,7 +2603,6 @@ func (c *MSSQLCollector) getTotalvCpu() int32 {
 							if count, err := strconv.ParseInt(cpuCountStr, 10, 32); err == nil && count > 0 {
 								totalCores += int32(count)
 								cpuCount++
-								log.Printf("Found CPU #%d with %d logical processors", cpuCount, count)
 							}
 						}
 					}
@@ -2569,7 +2613,6 @@ func (c *MSSQLCollector) getTotalvCpu() int32 {
 				result = totalCores
 				// Cache the result
 				c.cacheCPUCount(result)
-				log.Printf("Got total CPU count by summing %d CPUs: %d total logical processors", cpuCount, result)
 				return result
 			}
 		}

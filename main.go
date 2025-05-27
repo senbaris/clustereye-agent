@@ -117,8 +117,8 @@ func main() {
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(32*1024*1024), // 32MB
-			grpc.MaxCallSendMsgSize(32*1024*1024), // 32MB
+			grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB - Increased for large deadlock XML
+			grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB - Increased for large deadlock XML
 		),
 	}
 

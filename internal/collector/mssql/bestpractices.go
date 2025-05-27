@@ -337,55 +337,59 @@ func (b *BestPracticesCollector) collectPerformanceMetrics() {
 	// Missing indexes
 	missingIndexes := []map[string]interface{}{}
 	rows, err = db.Query(`
+		DECLARE @Databases TABLE (DBName sysname)
+		INSERT INTO @Databases
+		SELECT name FROM sys.databases 
+		WHERE state_desc = 'ONLINE' 
+		AND database_id > 4 -- Skip system databases
+
+		DECLARE @SQL nvarchar(max) = ''
+		SELECT @SQL = @SQL + 
+		'UNION ALL
 		SELECT TOP 25
-			DB_NAME(mid.database_id) AS database_name,
-			OBJECT_NAME(mid.object_id, mid.database_id) AS object_name,
+			''' + DBName + ''' COLLATE DATABASE_DEFAULT as database_name,
+			OBJECT_SCHEMA_NAME(mid.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as schema_name,
+			OBJECT_NAME(mid.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as object_name,
 			migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) AS improvement_measure,
-			'CREATE INDEX missing_index_' + CONVERT (VARCHAR, mid.index_handle) + ' ON ' + mid.statement + 
-			' (' + ISNULL (mid.equality_columns, '') + 
-			CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN ',' ELSE '' END + 
-			ISNULL (mid.inequality_columns, '') + ')' + 
-			ISNULL (' INCLUDE (' + mid.included_columns + ')', '') AS create_index_statement,
+			''CREATE INDEX missing_index_'' + CONVERT (VARCHAR, mid.index_handle) + '' ON ['' + ''' + DBName + ''' + ''].['' + 
+			OBJECT_SCHEMA_NAME(mid.object_id, DB_ID(''' + DBName + ''')) + ''].['' + 
+			OBJECT_NAME(mid.object_id, DB_ID(''' + DBName + ''')) + '']'' + 
+			'' ('' + ISNULL (mid.equality_columns, '''') + 
+			CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN '','' ELSE '''' END + 
+			ISNULL (mid.inequality_columns, '''') + '')''+
+			ISNULL ('' INCLUDE ('' + mid.included_columns + '')'', '''') COLLATE DATABASE_DEFAULT as create_index_statement,
 			migs.user_seeks,
 			migs.user_scans,
 			migs.avg_total_user_cost,
 			migs.avg_user_impact
-		FROM sys.dm_db_missing_index_groups mig
-		INNER JOIN sys.dm_db_missing_index_group_stats migs ON migs.group_handle = mig.index_group_handle
-		INNER JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
-		ORDER BY improvement_measure DESC
+		FROM [' + DBName + '].sys.dm_db_missing_index_groups mig
+		INNER JOIN [' + DBName + '].sys.dm_db_missing_index_group_stats migs ON migs.group_handle = mig.index_group_handle
+		INNER JOIN [' + DBName + '].sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+		'
+		FROM @Databases
+
+		SET @SQL = STUFF(@SQL, 1, 10, '') -- Remove first UNION ALL
+		SET @SQL = @SQL + ' ORDER BY improvement_measure DESC'
+
+		EXEC sp_executesql @SQL
 	`)
 
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
-			var dbName, objectName, createIndexStmt sql.NullString
+			var dbName, schemaName, objectName, createIndexStmt string
 			var improvementMeasure, avgTotalUserCost, avgUserImpact float64
 			var userSeeks, userScans int64
 
-			if err := rows.Scan(&dbName, &objectName, &improvementMeasure, &createIndexStmt,
+			if err := rows.Scan(&dbName, &schemaName, &objectName, &improvementMeasure, &createIndexStmt,
 				&userSeeks, &userScans, &avgTotalUserCost, &avgUserImpact); err == nil {
 
-				dbNameStr := "unknown"
-				if dbName.Valid {
-					dbNameStr = dbName.String
-				}
-
-				objectNameStr := "unknown"
-				if objectName.Valid {
-					objectNameStr = objectName.String
-				}
-
-				createIndexStmtStr := ""
-				if createIndexStmt.Valid {
-					createIndexStmtStr = createIndexStmt.String
-				}
-
 				missingIndexes = append(missingIndexes, map[string]interface{}{
-					"database_name":          dbNameStr,
-					"object_name":            objectNameStr,
+					"database_name":          dbName,
+					"schema_name":            schemaName,
+					"object_name":            objectName,
 					"improvement_measure":    improvementMeasure,
-					"create_index_statement": createIndexStmtStr,
+					"create_index_statement": createIndexStmt,
 					"user_seeks":             userSeeks,
 					"user_scans":             userScans,
 					"avg_total_user_cost":    avgTotalUserCost,
@@ -432,6 +436,73 @@ func (b *BestPracticesCollector) collectPerformanceMetrics() {
 		}
 		waitStats["wait_stats"] = waitStatsList
 		b.results["WaitStatistics"] = waitStats
+	}
+
+	// Fragmente olmuş indexleri kontrol et
+	fragmentedIndexes := []map[string]interface{}{}
+	rows, err = db.Query(`
+		DECLARE @Databases TABLE (DBName sysname)
+		INSERT INTO @Databases
+		SELECT name FROM sys.databases 
+		WHERE state_desc = 'ONLINE' 
+		AND database_id > 4 -- Skip system databases
+
+		DECLARE @SQL nvarchar(max) = ''
+		SELECT @SQL = @SQL + 
+		'UNION ALL
+		SELECT 
+			''' + DBName + ''' COLLATE DATABASE_DEFAULT as database_name,
+			OBJECT_SCHEMA_NAME(ps.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as schema_name,
+			OBJECT_NAME(ps.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as table_name,
+			i.name COLLATE DATABASE_DEFAULT as index_name,
+			ps.avg_fragmentation_in_percent,
+			ps.page_count,
+			ps.fragment_count,
+			ps.avg_fragment_size_in_pages,
+			CASE 
+				WHEN ps.avg_fragmentation_in_percent >= 30 THEN ''REBUILD''
+				ELSE ''REORGANIZE''
+			END COLLATE DATABASE_DEFAULT as recommended_action
+		FROM [' + DBName + '].sys.dm_db_index_physical_stats(
+			DB_ID(''' + DBName + '''), NULL, NULL, NULL, ''LIMITED'') ps
+		INNER JOIN [' + DBName + '].sys.indexes i 
+			ON ps.object_id = i.object_id 
+			AND ps.index_id = i.index_id
+		WHERE ps.avg_fragmentation_in_percent >= 30
+		AND ps.index_id > 0  -- Heap''leri hariç tut
+		AND ps.page_count > 1000  -- Küçük indexleri hariç tut
+		'
+		FROM @Databases
+
+		SET @SQL = STUFF(@SQL, 1, 10, '') -- Remove first UNION ALL
+
+		EXEC sp_executesql @SQL
+	`)
+
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var dbName, schemaName, tableName, indexName, recommendedAction string
+			var fragmentation, avgFragmentSize float64
+			var pageCount, fragmentCount int64
+
+			if err := rows.Scan(&dbName, &schemaName, &tableName, &indexName, &fragmentation,
+				&pageCount, &fragmentCount, &avgFragmentSize, &recommendedAction); err == nil {
+
+				fragmentedIndexes = append(fragmentedIndexes, map[string]interface{}{
+					"database_name":           dbName,
+					"schema_name":             schemaName,
+					"table_name":              tableName,
+					"index_name":              indexName,
+					"fragmentation_percent":   fragmentation,
+					"page_count":              pageCount,
+					"fragment_count":          fragmentCount,
+					"avg_fragment_size_pages": avgFragmentSize,
+					"recommended_action":      recommendedAction,
+				})
+			}
+		}
+		b.results["FragmentedIndexes"] = fragmentedIndexes
 	}
 }
 
@@ -556,9 +627,59 @@ func (b *BestPracticesCollector) collectSecuritySettings() {
 		}
 	}
 
+	// Orphaned users kontrolü
+	orphanedUsers := []map[string]interface{}{}
+	rows, err := db.Query(`
+		DECLARE @Databases TABLE (DBName sysname)
+		INSERT INTO @Databases
+		SELECT name FROM sys.databases 
+		WHERE state_desc = 'ONLINE' 
+		AND database_id > 4 -- Skip system databases
+
+		DECLARE @SQL nvarchar(max) = ''
+		SELECT @SQL = @SQL + 
+		'UNION ALL
+		SELECT 
+			''' + DBName + ''' COLLATE DATABASE_DEFAULT as database_name,
+			dp.name COLLATE DATABASE_DEFAULT as username,
+			dp.type_desc COLLATE DATABASE_DEFAULT as user_type,
+			dp.create_date,
+			dp.modify_date
+		FROM [' + DBName + '].sys.database_principals dp
+		LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+		WHERE sp.sid IS NULL
+		AND dp.type IN (''S'', ''U'', ''G'')
+		AND dp.name NOT IN (''dbo'', ''guest'', ''INFORMATION_SCHEMA'', ''sys'')
+		'
+		FROM @Databases
+
+		SET @SQL = STUFF(@SQL, 1, 10, '') -- Remove first UNION ALL
+
+		EXEC sp_executesql @SQL
+	`)
+
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var dbName, userName, userType string
+			var createDate, modifyDate time.Time
+
+			if err := rows.Scan(&dbName, &userName, &userType, &createDate, &modifyDate); err == nil {
+				orphanedUsers = append(orphanedUsers, map[string]interface{}{
+					"database_name": dbName,
+					"username":      userName,
+					"user_type":     userType,
+					"create_date":   createDate,
+					"modify_date":   modifyDate,
+				})
+			}
+		}
+		securitySettings["orphaned_users"] = orphanedUsers
+	}
+
 	// Şifreleme durumu
 	var tdeEnabled []string
-	rows, err := db.Query(`
+	rows, err = db.Query(`
 		SELECT name 
 		FROM sys.databases 
 		WHERE is_encrypted = 1
