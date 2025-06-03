@@ -68,10 +68,17 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 	// Get system metrics from existing collector
 	systemMetrics := m.collector.BatchCollectSystemMetrics()
 
+	// Debug logging: Show all collected system metrics
+	log.Printf("DEBUG: CollectSystemMetrics - Raw system metrics collected: %d items", len(systemMetrics))
+	for key, value := range systemMetrics {
+		log.Printf("DEBUG: SystemMetric[%s] = %v (type: %T)", key, value, value)
+	}
+
 	// System metrics collected successfully
 
 	// CPU Metrics
 	if cpuUsage, ok := systemMetrics["cpu_usage"].(float64); ok {
+		log.Printf("DEBUG: Adding CPU usage metric: %.2f", cpuUsage)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.cpu_usage",
 			Value:       MetricValue{DoubleValue: &cpuUsage},
@@ -80,11 +87,14 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "percent",
 			Description: "CPU usage percentage",
 		})
+	} else {
+		log.Printf("DEBUG: CPU usage metric not found or wrong type in system metrics")
 	}
 
 	// Fix: Use cpu_count instead of cpu_cores (matches collector output)
 	if cpuCount, ok := systemMetrics["cpu_count"].(int32); ok {
 		cores := int64(cpuCount)
+		log.Printf("DEBUG: Adding CPU cores metric: %d", cores)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.cpu_cores",
 			Value:       MetricValue{IntValue: &cores},
@@ -93,10 +103,13 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "count",
 			Description: "Number of CPU cores",
 		})
+	} else {
+		log.Printf("DEBUG: CPU count metric not found or wrong type in system metrics")
 	}
 
 	// Memory Metrics
 	if memUsage, ok := systemMetrics["memory_usage"].(float64); ok {
+		log.Printf("DEBUG: Adding memory usage metric: %.2f", memUsage)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.memory_usage",
 			Value:       MetricValue{DoubleValue: &memUsage},
@@ -105,9 +118,12 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "percent",
 			Description: "Memory usage percentage",
 		})
+	} else {
+		log.Printf("DEBUG: Memory usage metric not found or wrong type in system metrics")
 	}
 
 	if totalMem, ok := systemMetrics["total_memory"].(int64); ok {
+		log.Printf("DEBUG: Adding total memory metric: %d bytes", totalMem)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.total_memory",
 			Value:       MetricValue{IntValue: &totalMem},
@@ -116,9 +132,12 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Total system memory",
 		})
+	} else {
+		log.Printf("DEBUG: Total memory metric not found or wrong type in system metrics")
 	}
 
 	if freeMem, ok := systemMetrics["free_memory"].(int64); ok {
+		log.Printf("DEBUG: Adding free memory metric: %d bytes", freeMem)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.free_memory",
 			Value:       MetricValue{IntValue: &freeMem},
@@ -127,10 +146,13 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Free system memory",
 		})
+	} else {
+		log.Printf("DEBUG: Free memory metric not found or wrong type in system metrics")
 	}
 
 	// Disk Metrics
 	if totalDisk, ok := systemMetrics["total_disk"].(int64); ok {
+		log.Printf("DEBUG: Adding total disk metric: %d bytes", totalDisk)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.total_disk",
 			Value:       MetricValue{IntValue: &totalDisk},
@@ -139,9 +161,12 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Total disk space",
 		})
+	} else {
+		log.Printf("DEBUG: Total disk metric not found or wrong type in system metrics")
 	}
 
 	if freeDisk, ok := systemMetrics["free_disk"].(int64); ok {
+		log.Printf("DEBUG: Adding free disk metric: %d bytes", freeDisk)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.free_disk",
 			Value:       MetricValue{IntValue: &freeDisk},
@@ -150,6 +175,26 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Free disk space",
 		})
+	} else {
+		log.Printf("DEBUG: Free disk metric not found or wrong type in system metrics")
+	}
+
+	// Response Time Metric
+	if responseTime, ok := systemMetrics["response_time_ms"].(float64); ok {
+		metrics = append(metrics, Metric{
+			Name:        "mssql.system.response_time_ms",
+			Value:       MetricValue{DoubleValue: &responseTime},
+			Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}},
+			Timestamp:   timestamp,
+			Unit:        "milliseconds",
+			Description: "MSSQL response time for SELECT 1 query in milliseconds",
+		})
+	} else {
+		// Check if key exists but with different type
+		if _, exists := systemMetrics["response_time_ms"]; exists {
+		} else {
+			log.Printf("DEBUG: response_time_ms key does not exist in systemMetrics")
+		}
 	}
 
 	return &MetricBatch{

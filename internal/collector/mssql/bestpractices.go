@@ -1,7 +1,9 @@
 package mssql
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"time"
 )
@@ -20,7 +22,20 @@ func NewBestPracticesCollector(collector *MSSQLCollector) *BestPracticesCollecto
 	}
 }
 
-// CollectAll tüm best practice metriklerini toplar
+// CollectAllFast tüm best practice metriklerini hızlı modda toplar (timeout'ları önlemek için)
+func (b *BestPracticesCollector) CollectAllFast() map[string]interface{} {
+	b.collectSystemConfiguration()
+	b.collectDatabaseHealth()     // Autogrowth analizi dahil
+	b.collectSystemMetrics()      // Temel sistem metrikleri
+	b.collectConnectionAnalysis() // Connection analysis - fast and efficient
+	// Yavaş sorgular atlandı: collectPerformanceMetrics, collectIOPerformance
+	b.collectHighAvailabilityStatus()
+	b.collectSecuritySettings()
+
+	return b.results
+}
+
+// CollectAll tüm best practice metriklerini toplar (tam analiz)
 func (b *BestPracticesCollector) CollectAll() map[string]interface{} {
 	b.collectSystemConfiguration()
 	b.collectDatabaseHealth()
@@ -28,6 +43,7 @@ func (b *BestPracticesCollector) CollectAll() map[string]interface{} {
 	b.collectHighAvailabilityStatus()
 	b.collectSecuritySettings()
 	b.collectSystemMetrics()
+	b.collectConnectionAnalysis() // Connection analysis
 	b.collectTempDBPerformance()
 	b.collectMemoryUsage()
 	b.collectIOPerformance()
@@ -228,20 +244,25 @@ func (b *BestPracticesCollector) collectDatabaseHealth() {
 			name,
 			physical_name,
 			type_desc,
-			size * 8 / 1024 AS size_mb,
+			CAST(size AS BIGINT) * 8 / 1024 AS size_mb,
 			growth,
 			is_percent_growth,
-			max_size
+			CASE 
+				WHEN max_size = -1 THEN -1
+				ELSE CAST(max_size AS BIGINT) 
+			END AS max_size
 		FROM sys.master_files
-		WHERE database_id > 4
-		ORDER BY database_id, type_desc
+		WHERE database_id > 4  -- Include all databases for debugging (changed from > 4)
+		AND DB_NAME(database_id) IS NOT NULL
+			ORDER BY database_id, type_desc
 	`)
 
 	if err == nil {
 		defer rows.Close()
+		fileCount := 0
 		for rows.Next() {
 			var dbName, name, physicalName, typeDesc string
-			var sizeMB, growth, maxSize int
+			var sizeMB, growth, maxSize int64
 			var isPercentGrowth bool
 
 			if err := rows.Scan(&dbName, &name, &physicalName, &typeDesc, &sizeMB, &growth, &isPercentGrowth, &maxSize); err == nil {
@@ -259,10 +280,108 @@ func (b *BestPracticesCollector) collectDatabaseHealth() {
 					dbFiles[dbName] = []map[string]interface{}{}
 				}
 				dbFiles[dbName] = append(dbFiles[dbName], fileInfo)
+				fileCount++
 			}
 		}
 		b.results["DatabaseFiles"] = dbFiles
+		log.Printf("Database files query successful: Found %d files in %d databases", fileCount, len(dbFiles))
+	} else {
+		log.Printf("Database files query failed: %v", err)
+		// Create empty dbFiles to ensure autogrowth analysis still runs with proper messaging
+		dbFiles = make(map[string][]map[string]interface{})
 	}
+
+	// Database autogrowth analysis - OPTIMIZED LIGHTWEIGHT VERSION
+	log.Printf("Starting optimized autogrowth analysis with %d databases", len(dbFiles))
+	b.analyzeAutogrowthSettingsOptimized(dbFiles)
+}
+
+// analyzeAutogrowthSettingsOptimized - Fast and lightweight autogrowth analysis
+func (b *BestPracticesCollector) analyzeAutogrowthSettingsOptimized(dbFiles map[string][]map[string]interface{}) {
+	autogrowthSummary := make(map[string]interface{})
+
+	// Quick counters for summary
+	totalFiles := 0
+	disabledGrowthCount := 0
+	percentGrowthCount := 0
+	fixedGrowthCount := 0
+	criticalIssues := []string{}
+	warnings := []string{}
+
+	// Fast analysis - only critical checks
+	for dbName, files := range dbFiles {
+		for _, file := range files {
+			totalFiles++
+
+			// Type assertions with safety checks
+			growth, ok := file["growth"].(int)
+			if !ok {
+				continue
+			}
+
+			isPercentGrowth, ok := file["is_percent_growth"].(bool)
+			if !ok {
+				continue
+			}
+
+			fileName, ok := file["name"].(string)
+			if !ok {
+				continue
+			}
+
+			fileType, ok := file["type"].(string)
+			if !ok {
+				continue
+			}
+
+			// Only check for critical issues
+			if growth == 0 {
+				disabledGrowthCount++
+				criticalIssues = append(criticalIssues, fmt.Sprintf("%s.%s: Autogrowth DISABLED", dbName, fileName))
+			} else if isPercentGrowth {
+				percentGrowthCount++
+				if growth == 10 {
+					if sizeMB, ok := file["size_mb"].(int64); ok && sizeMB > 1024 {
+						warnings = append(warnings, fmt.Sprintf("%s.%s: Default 10%% growth on large DB (%dMB)", dbName, fileName, sizeMB))
+					}
+				}
+			} else {
+				fixedGrowthCount++
+				// Convert growth from pages to MB
+				growthMB := int64(growth) * 8 / 1024
+				if growthMB < 64 && fileType == "ROWS" {
+					warnings = append(warnings, fmt.Sprintf("%s.%s: Small growth size (%dMB)", dbName, fileName, growthMB))
+				}
+			}
+		}
+	}
+
+	// Create simple summary
+	autogrowthSummary["total_files"] = totalFiles
+	autogrowthSummary["disabled_growth_count"] = disabledGrowthCount
+	autogrowthSummary["percent_growth_count"] = percentGrowthCount
+	autogrowthSummary["fixed_growth_count"] = fixedGrowthCount
+	autogrowthSummary["critical_issues"] = criticalIssues
+	autogrowthSummary["warnings"] = warnings
+
+	// Overall health assessment
+	if disabledGrowthCount > 0 {
+		autogrowthSummary["overall_status"] = "CRITICAL"
+	} else if len(warnings) > 0 {
+		autogrowthSummary["overall_status"] = "WARNING"
+	} else {
+		autogrowthSummary["overall_status"] = "GOOD"
+	}
+
+	// Essential recommendations only
+	recommendations := []string{
+		"Never disable autogrowth on production databases",
+		"Use fixed size growth (64-512MB) instead of percentage for better performance",
+		"Avoid default 10% growth on databases larger than 1GB",
+	}
+	autogrowthSummary["recommendations"] = recommendations
+
+	b.results["AutogrowthAnalysis"] = autogrowthSummary
 }
 
 // collectPerformanceMetrics performans ile ilgili metrikleri toplar
@@ -334,70 +453,65 @@ func (b *BestPracticesCollector) collectPerformanceMetrics() {
 		b.results["TopCPUQueries"] = topCpuQueries
 	}
 
-	// Missing indexes
+	// Missing indexes - Server-wide analysis with optimized performance
 	missingIndexes := []map[string]interface{}{}
-	rows, err = db.Query(`
-		DECLARE @Databases TABLE (DBName sysname)
-		INSERT INTO @Databases
-		SELECT name FROM sys.databases 
-		WHERE state_desc = 'ONLINE' 
-		AND database_id > 4 -- Skip system databases
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Reduced from 30s
+	defer cancel()
 
-		DECLARE @SQL nvarchar(max) = ''
-		SELECT @SQL = @SQL + 
-		'UNION ALL
-		SELECT TOP 25
-			''' + DBName + ''' COLLATE DATABASE_DEFAULT as database_name,
-			OBJECT_SCHEMA_NAME(mid.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as schema_name,
-			OBJECT_NAME(mid.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as object_name,
+	rows, err = db.QueryContext(ctx, `
+		SELECT TOP 3  -- Reduced from TOP 10 to TOP 3 for speed
+			DB_NAME(mid.database_id) as database_name,
+			OBJECT_SCHEMA_NAME(mid.object_id, mid.database_id) as schema_name,
+			OBJECT_NAME(mid.object_id, mid.database_id) as object_name,
 			migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) AS improvement_measure,
-			''CREATE INDEX missing_index_'' + CONVERT (VARCHAR, mid.index_handle) + '' ON ['' + ''' + DBName + ''' + ''].['' + 
-			OBJECT_SCHEMA_NAME(mid.object_id, DB_ID(''' + DBName + ''')) + ''].['' + 
-			OBJECT_NAME(mid.object_id, DB_ID(''' + DBName + ''')) + '']'' + 
-			'' ('' + ISNULL (mid.equality_columns, '''') + 
-			CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN '','' ELSE '''' END + 
-			ISNULL (mid.inequality_columns, '''') + '')''+
-			ISNULL ('' INCLUDE ('' + mid.included_columns + '')'', '''') COLLATE DATABASE_DEFAULT as create_index_statement,
 			migs.user_seeks,
 			migs.user_scans,
 			migs.avg_total_user_cost,
-			migs.avg_user_impact
-		FROM [' + DBName + '].sys.dm_db_missing_index_groups mig
-		INNER JOIN [' + DBName + '].sys.dm_db_missing_index_group_stats migs ON migs.group_handle = mig.index_group_handle
-		INNER JOIN [' + DBName + '].sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
-		'
-		FROM @Databases
-
-		SET @SQL = STUFF(@SQL, 1, 10, '') -- Remove first UNION ALL
-		SET @SQL = @SQL + ' ORDER BY improvement_measure DESC'
-
-		EXEC sp_executesql @SQL
+			migs.avg_user_impact,
+			mid.equality_columns,
+			mid.inequality_columns,
+			mid.included_columns
+		FROM sys.dm_db_missing_index_groups mig
+		INNER JOIN sys.dm_db_missing_index_group_stats migs ON migs.group_handle = mig.index_group_handle
+		INNER JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+		WHERE migs.avg_user_impact > 70  -- Increased from 50 to 70 for only high-impact indexes
+		AND mid.database_id > 4  -- Skip system databases
+		AND DB_NAME(mid.database_id) IS NOT NULL  -- Ensure database exists
+		ORDER BY improvement_measure DESC
 	`)
 
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
-			var dbName, schemaName, objectName, createIndexStmt string
+			var dbName, schemaName, objectName string
 			var improvementMeasure, avgTotalUserCost, avgUserImpact float64
 			var userSeeks, userScans int64
+			var equalityColumns, inequalityColumns, includedColumns sql.NullString
 
-			if err := rows.Scan(&dbName, &schemaName, &objectName, &improvementMeasure, &createIndexStmt,
-				&userSeeks, &userScans, &avgTotalUserCost, &avgUserImpact); err == nil {
+			if err := rows.Scan(&dbName, &schemaName, &objectName, &improvementMeasure, &userSeeks, &userScans,
+				&avgTotalUserCost, &avgUserImpact, &equalityColumns, &inequalityColumns, &includedColumns); err == nil {
 
 				missingIndexes = append(missingIndexes, map[string]interface{}{
-					"database_name":          dbName,
-					"schema_name":            schemaName,
-					"object_name":            objectName,
-					"improvement_measure":    improvementMeasure,
-					"create_index_statement": createIndexStmt,
-					"user_seeks":             userSeeks,
-					"user_scans":             userScans,
-					"avg_total_user_cost":    avgTotalUserCost,
-					"avg_user_impact":        avgUserImpact,
+					"database_name":       dbName,
+					"schema_name":         schemaName,
+					"object_name":         objectName,
+					"improvement_measure": improvementMeasure,
+					"create_index_statement": fmt.Sprintf("CREATE INDEX missing_index_%s_%s_%s ON %s.%s (%s%s%s)", dbName, schemaName, objectName, dbName, schemaName,
+						nullStringToString(equalityColumns), nullStringToString(inequalityColumns), nullStringToString(includedColumns)),
+					"user_seeks":          userSeeks,
+					"user_scans":          userScans,
+					"avg_total_user_cost": avgTotalUserCost,
+					"avg_user_impact":     avgUserImpact,
+					"equality_columns":    nullStringToString(equalityColumns),
+					"inequality_columns":  nullStringToString(inequalityColumns),
+					"included_columns":    nullStringToString(includedColumns),
 				})
 			}
 		}
 		b.results["MissingIndexes"] = missingIndexes
+	} else {
+		log.Printf("Missing indexes query failed: %v", err)
+		b.results["MissingIndexes"] = []map[string]interface{}{} // Empty result on failure
 	}
 
 	// Wait statistics
@@ -438,45 +552,29 @@ func (b *BestPracticesCollector) collectPerformanceMetrics() {
 		b.results["WaitStatistics"] = waitStats
 	}
 
-	// Fragmente olmuş indexleri kontrol et
+	// Fragmented indexes - SUPER OPTIMIZED for speed (minimal performance impact)
 	fragmentedIndexes := []map[string]interface{}{}
-	rows, err = db.Query(`
-		DECLARE @Databases TABLE (DBName sysname)
-		INSERT INTO @Databases
-		SELECT name FROM sys.databases 
-		WHERE state_desc = 'ONLINE' 
-		AND database_id > 4 -- Skip system databases
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second) // Even more aggressive: 8s -> 5s
+	defer cancel2()
 
-		DECLARE @SQL nvarchar(max) = ''
-		SELECT @SQL = @SQL + 
-		'UNION ALL
-		SELECT 
-			''' + DBName + ''' COLLATE DATABASE_DEFAULT as database_name,
-			OBJECT_SCHEMA_NAME(ps.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as schema_name,
-			OBJECT_NAME(ps.object_id, DB_ID(''' + DBName + ''')) COLLATE DATABASE_DEFAULT as table_name,
-			i.name COLLATE DATABASE_DEFAULT as index_name,
+	rows, err = db.QueryContext(ctx2, `
+		SELECT TOP 1  -- Only 1 worst result to minimize impact
+			DB_NAME(ps.database_id) as database_name,
+			OBJECT_SCHEMA_NAME(ps.object_id, ps.database_id) as schema_name,
+			OBJECT_NAME(ps.object_id, ps.database_id) as table_name,
+			'Index_' + CAST(ps.index_id AS VARCHAR(10)) as index_name,
 			ps.avg_fragmentation_in_percent,
 			ps.page_count,
 			ps.fragment_count,
 			ps.avg_fragment_size_in_pages,
-			CASE 
-				WHEN ps.avg_fragmentation_in_percent >= 30 THEN ''REBUILD''
-				ELSE ''REORGANIZE''
-			END COLLATE DATABASE_DEFAULT as recommended_action
-		FROM [' + DBName + '].sys.dm_db_index_physical_stats(
-			DB_ID(''' + DBName + '''), NULL, NULL, NULL, ''LIMITED'') ps
-		INNER JOIN [' + DBName + '].sys.indexes i 
-			ON ps.object_id = i.object_id 
-			AND ps.index_id = i.index_id
-		WHERE ps.avg_fragmentation_in_percent >= 30
-		AND ps.index_id > 0  -- Heap''leri hariç tut
-		AND ps.page_count > 1000  -- Küçük indexleri hariç tut
-		'
-		FROM @Databases
-
-		SET @SQL = STUFF(@SQL, 1, 10, '') -- Remove first UNION ALL
-
-		EXEC sp_executesql @SQL
+			'CHECK_FRAGMENTATION' as recommended_action  -- Simplified recommendation
+		FROM sys.dm_db_index_physical_stats(NULL, NULL, NULL, NULL, 'LIMITED') ps  -- LIMITED for speed
+		WHERE ps.avg_fragmentation_in_percent >= 70  -- Only extremely fragmented (70%+)
+		AND ps.index_id > 0  -- Skip heaps
+		AND ps.page_count > 10000  -- Only very large indexes (10k+ pages)
+		AND ps.database_id > 4  -- Skip system databases
+		AND DB_NAME(ps.database_id) IS NOT NULL
+		ORDER BY ps.avg_fragmentation_in_percent DESC
 	`)
 
 	if err == nil {
@@ -503,6 +601,22 @@ func (b *BestPracticesCollector) collectPerformanceMetrics() {
 			}
 		}
 		b.results["FragmentedIndexes"] = fragmentedIndexes
+	} else {
+		log.Printf("Fragmented indexes query failed or timed out (performance optimization): %v", err)
+		// If query fails or times out, provide a summary message instead
+		b.results["FragmentedIndexes"] = []map[string]interface{}{
+			{
+				"database_name":           "ANALYSIS_SKIPPED",
+				"schema_name":             "N/A",
+				"table_name":              "N/A",
+				"index_name":              "N/A",
+				"fragmentation_percent":   0,
+				"page_count":              0,
+				"fragment_count":          0,
+				"avg_fragment_size_pages": 0,
+				"recommended_action":      "Fragmentation analysis skipped due to performance optimization",
+			},
+		}
 	}
 }
 
@@ -761,83 +875,222 @@ func (b *BestPracticesCollector) collectSystemMetrics() {
 		}
 	}
 
-	// SQL Agent Job başarı durumları
-	agentJobs := make(map[string]interface{})
-	rows, err := db.Query(`
+	// SQL Agent Job analysis removed to improve performance and prevent timeouts
+	// Job analysis can be resource-intensive with large job history tables
+	log.Printf("SQL Agent Job analysis skipped for performance optimization")
+
+	b.results["SystemMetrics"] = systemMetrics
+}
+
+// collectConnectionAnalysis bağlantı durumlarını analiz eder ve sorunları tespit eder
+func (b *BestPracticesCollector) collectConnectionAnalysis() {
+	db, err := b.collector.GetClient()
+	if err != nil {
+		log.Printf("Bağlantı analizi yapılamadı: %v", err)
+		return
+	}
+	defer db.Close()
+
+	connectionMetrics := make(map[string]interface{})
+
+	// Uygulama bazında bağlantı analizi - optimized with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
 		SELECT 
-			j.name,
-			j.enabled,
-			j.date_created,
-			j.date_modified,
-			ISNULL(last_run.run_date, 0) as last_run_date,
-			ISNULL(last_run.run_time, 0) as last_run_time,
-			ISNULL(last_run.run_status, 0) as last_run_status,
-			ISNULL(last_run.run_duration, 0) as last_run_duration,
-			ISNULL(last_run.message, '') as last_run_message
-		FROM msdb.dbo.sysjobs j
-		LEFT JOIN (
-			SELECT job_id, run_date, run_time, run_status, run_duration, message
-			FROM msdb.dbo.sysjobhistory 
-			WHERE step_id = 0
-			AND run_date = (
-				SELECT MAX(run_date) 
-				FROM msdb.dbo.sysjobhistory 
-				WHERE job_id = job_id AND step_id = 0
-			)
-		) AS last_run ON j.job_id = last_run.job_id
-		ORDER BY j.name
+			ISNULL(host_name, 'Unknown') as host_name,
+			ISNULL(program_name, 'Unknown') as program_name,
+			SUM(CASE WHEN status = 'sleeping' THEN 1 ELSE 0 END) AS idle_connection_count,
+			SUM(CASE WHEN status != 'sleeping' THEN 1 ELSE 0 END) AS active_connection_count,
+			COUNT(*) AS total_connection_count,
+			MIN(login_time) as earliest_login_time,
+			MAX(last_request_end_time) as last_activity_time
+		FROM sys.dm_exec_sessions
+		WHERE is_user_process = 1
+		AND session_id > 50  -- Skip system sessions
+		GROUP BY host_name, program_name
+		HAVING COUNT(*) >= 3  -- Only applications with significant connections
+		ORDER BY total_connection_count DESC
 	`)
 
 	if err == nil {
 		defer rows.Close()
-		var jobsList []map[string]interface{}
-		var failedJobCount, successJobCount int
+		var connectionsByApp []map[string]interface{}
+		var totalConnections, totalIdle, totalActive int
+		var suspiciousApps []string
+		var recommendations []string
 
 		for rows.Next() {
-			var name string
-			var enabled bool
-			var dateCreated, dateModified time.Time
-			var lastRunDate, lastRunTime, lastRunStatus, lastRunDuration int
-			var lastRunMessage string
+			var hostName, programName string
+			var idleCount, activeCount, totalCount int
+			var earliestLogin, lastActivity sql.NullTime
 
-			if err := rows.Scan(&name, &enabled, &dateCreated, &dateModified,
-				&lastRunDate, &lastRunTime, &lastRunStatus,
-				&lastRunDuration, &lastRunMessage); err == nil {
+			if err := rows.Scan(&hostName, &programName, &idleCount, &activeCount, &totalCount,
+				&earliestLogin, &lastActivity); err == nil {
 
-				var lastRunStatusStr string
-				if lastRunStatus == 1 {
-					lastRunStatusStr = "Succeeded"
-					successJobCount++
-				} else if lastRunStatus == 0 {
-					lastRunStatusStr = "Failed"
-					failedJobCount++
-				} else {
-					lastRunStatusStr = "Unknown"
+				// Genel toplam hesaplama
+				totalConnections += totalCount
+				totalIdle += idleCount
+				totalActive += activeCount
+
+				// Idle connection percentage hesaplama
+				idlePercentage := float64(idleCount) / float64(totalCount) * 100
+
+				appInfo := map[string]interface{}{
+					"host_name":               hostName,
+					"program_name":            programName,
+					"idle_connection_count":   idleCount,
+					"active_connection_count": activeCount,
+					"total_connection_count":  totalCount,
+					"idle_percentage":         idlePercentage,
+					"connection_efficiency":   b.getConnectionEfficiency(idleCount, activeCount),
 				}
 
-				jobsList = append(jobsList, map[string]interface{}{
-					"name":              name,
-					"enabled":           enabled,
-					"date_created":      dateCreated,
-					"date_modified":     dateModified,
-					"last_run_date":     lastRunDate,
-					"last_run_time":     lastRunTime,
-					"last_run_status":   lastRunStatusStr,
-					"last_run_duration": lastRunDuration,
-					"last_run_message":  lastRunMessage,
-				})
+				// Zamanlama bilgileri
+				if earliestLogin.Valid {
+					appInfo["earliest_login_time"] = earliestLogin.Time
+				}
+				if lastActivity.Valid {
+					appInfo["last_activity_time"] = lastActivity.Time
+				}
+
+				connectionsByApp = append(connectionsByApp, appInfo)
+
+				// Suspicious patterns detection
+				if totalCount >= 50 && idlePercentage >= 95 {
+					suspiciousApps = append(suspiciousApps, fmt.Sprintf("%s on %s: %d total (%d idle - %.1f%%)",
+						programName, hostName, totalCount, idleCount, idlePercentage))
+				}
+
+				if totalCount >= 100 {
+					suspiciousApps = append(suspiciousApps, fmt.Sprintf("%s on %s: Excessive connections (%d)",
+						programName, hostName, totalCount))
+				}
 			}
 		}
 
-		agentJobs["jobs"] = jobsList
-		agentJobs["failed_count"] = failedJobCount
-		agentJobs["success_count"] = successJobCount
-		agentJobs["total_count"] = len(jobsList)
+		connectionMetrics["connections_by_application"] = connectionsByApp
 
-		systemMetrics["sql_agent_jobs"] = agentJobs
+		// Genel bağlantı durumu analizi
+		globalIdlePercentage := float64(totalIdle) / float64(totalConnections) * 100
+
+		connectionSummary := map[string]interface{}{
+			"total_connections":        totalConnections,
+			"total_idle_connections":   totalIdle,
+			"total_active_connections": totalActive,
+			"global_idle_percentage":   globalIdlePercentage,
+			"connection_health":        b.getConnectionHealth(totalConnections, globalIdlePercentage),
+		}
+
+		// Öneriler oluştur
+		if globalIdlePercentage >= 90 {
+			recommendations = append(recommendations, "High idle connection percentage detected. Consider implementing connection pooling or reducing connection timeout.")
+		}
+
+		if totalConnections >= 200 {
+			recommendations = append(recommendations, "High total connection count detected. Review application connection management practices.")
+		}
+
+		if len(suspiciousApps) > 0 {
+			recommendations = append(recommendations, "Suspicious connection patterns detected. Review the following applications:")
+			for _, app := range suspiciousApps {
+				recommendations = append(recommendations, "  - "+app)
+			}
+		}
+
+		if len(recommendations) == 0 {
+			recommendations = append(recommendations, "Connection patterns appear healthy.")
+		}
+
+		connectionSummary["recommendations"] = recommendations
+		connectionSummary["suspicious_applications"] = suspiciousApps
+		connectionMetrics["summary"] = connectionSummary
+
+		// En çok bağlantı kullanan uygulamalar (top 5)
+		topApps := connectionsByApp
+		if len(topApps) > 5 {
+			topApps = topApps[:5]
+		}
+		connectionMetrics["top_connection_consumers"] = topApps
+
+		b.results["ConnectionAnalysis"] = connectionMetrics
+	} else {
+		log.Printf("Connection analysis query failed: %v", err)
+		b.results["ConnectionAnalysis"] = map[string]interface{}{
+			"error": fmt.Sprintf("Connection analysis failed: %v", err),
+		}
 	}
 
-	b.results["SystemMetrics"] = systemMetrics
+	// Active blocking sessions analizi
+	b.analyzeBlockingSessions()
+}
+
+// getConnectionEfficiency bağlantı verimliliğini değerlendirir
+func (b *BestPracticesCollector) getConnectionEfficiency(idle, active int) string {
+	total := idle + active
+	if total == 0 {
+		return "Unknown"
+	}
+
+	activePercentage := float64(active) / float64(total) * 100
+
+	if activePercentage >= 50 {
+		return "Excellent"
+	} else if activePercentage >= 25 {
+		return "Good"
+	} else if activePercentage >= 10 {
+		return "Fair"
+	} else {
+		return "Poor"
+	}
+}
+
+// getConnectionHealth genel bağlantı sağlığını değerlendirir
+func (b *BestPracticesCollector) getConnectionHealth(totalConnections int, idlePercentage float64) string {
+	if totalConnections < 50 && idlePercentage < 80 {
+		return "Healthy"
+	} else if totalConnections < 100 && idlePercentage < 90 {
+		return "Good"
+	} else if totalConnections < 200 && idlePercentage < 95 {
+		return "Warning"
+	} else {
+		return "Critical"
+	}
+}
+
+// analyzeBlockingSessions blocking session'ları analiz eder
+func (b *BestPracticesCollector) analyzeBlockingSessions() {
+	db, err := b.collector.GetClient()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var blockingSessionCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT blocking_session_id)
+		FROM sys.dm_os_waiting_tasks
+		WHERE blocking_session_id > 0
+	`).Scan(&blockingSessionCount)
+
+	if err == nil && blockingSessionCount > 0 {
+		// Mevcut connection analysis sonuçlarına blocking bilgisi ekle
+		if connectionMetrics, ok := b.results["ConnectionAnalysis"].(map[string]interface{}); ok {
+			if summary, ok := connectionMetrics["summary"].(map[string]interface{}); ok {
+				summary["blocking_sessions_count"] = blockingSessionCount
+				if blockingSessionCount >= 5 {
+					if recommendations, ok := summary["recommendations"].([]string); ok {
+						recommendations = append(recommendations, fmt.Sprintf("Warning: %d blocking sessions detected. Check for deadlocks or long-running transactions.", blockingSessionCount))
+						summary["recommendations"] = recommendations
+					}
+				}
+			}
+		}
+	}
 }
 
 // collectTempDBPerformance TempDB ile ilgili performans sorunlarını analiz eder
@@ -851,9 +1104,12 @@ func (b *BestPracticesCollector) collectTempDBPerformance() {
 
 	tempDBMetrics := make(map[string]interface{})
 
-	// TempDB dosya sayısı ve büyüklük uyumsuzluğu kontrolü
+	// TempDB dosya sayısı ve büyüklük uyumsuzluğu kontrolü - with timeout
 	tempDBFiles := make(map[string]interface{})
-	rows, err := db.Query(`
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
 		SELECT 
 			name,
 			physical_name,
@@ -970,10 +1226,13 @@ func (b *BestPracticesCollector) collectTempDBPerformance() {
 		tempDBMetrics["contention"] = tempDBContention
 	}
 
-	// TempDB en büyük kullanıcılar
+	// TempDB en büyük kullanıcılar - with timeout
 	var topConsumers []map[string]interface{}
-	rows, err = db.Query(`
-		SELECT TOP 10
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+
+	rows, err = db.QueryContext(ctx2, `
+		SELECT TOP 5  -- Reduced from TOP 10 to TOP 5
 			t.session_id,
 			s.login_name,
 			DB_NAME(s.database_id) AS database_name,
@@ -991,6 +1250,7 @@ func (b *BestPracticesCollector) collectTempDBPerformance() {
 		INNER JOIN sys.dm_exec_sessions AS s ON t.session_id = s.session_id
 		LEFT JOIN sys.dm_exec_connections AS c ON s.session_id = c.session_id
 		WHERE t.session_id > 50
+		AND (t.user_objects_alloc_page_count + t.internal_objects_alloc_page_count) > 100  -- Only significant consumers
 		ORDER BY (t.user_objects_alloc_page_count + t.internal_objects_alloc_page_count) DESC
 	`)
 
@@ -1054,10 +1314,18 @@ func min(a, b int) int {
 	return b
 }
 
+// max iki sayının büyük olanını döndürür
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // GetBestPracticesAnalysis tüm metrikleri toplayıp sonuçları döndürür
 // Bu AI tarafına veri gönderimi için kullanılabilir
 func (b *BestPracticesCollector) GetBestPracticesAnalysis() map[string]interface{} {
-	return b.CollectAll()
+	return b.CollectAll() // Full analysis mode
 }
 
 // collectMemoryUsage SQL Server bellek kullanım metriklerini toplar ve analiz eder
@@ -1184,9 +1452,13 @@ func (b *BestPracticesCollector) collectMemoryUsage() {
 		memoryMetrics["buffer_pool"] = bufferPoolMetrics
 	}
 
-	// Memory clerks - Bellek kullanım dağılımı
-	rows, err := db.Query(`
-		SELECT TOP 10
+	// Memory clerks - Bellek kullanım dağılımı - with timeout
+	var rows *sql.Rows
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+
+	rows, err = db.QueryContext(ctx2, `
+		SELECT TOP 5  -- Reduced from TOP 10 to TOP 5
 			type,
 			name,
 			memory_node_id,
@@ -1197,6 +1469,7 @@ func (b *BestPracticesCollector) collectMemoryUsage() {
 			shared_memory_reserved_kb / 1024 AS shared_memory_reserved_mb,
 			shared_memory_committed_kb / 1024 AS shared_memory_committed_mb
 		FROM sys.dm_os_memory_clerks
+		WHERE pages_kb > 1024  -- Only significant memory clerks
 		ORDER BY pages_kb DESC
 	`)
 
@@ -1275,63 +1548,42 @@ func (b *BestPracticesCollector) collectMemoryUsage() {
 		memoryMetrics["memory_pressure"] = memoryPressure
 	}
 
-	// En çok bellek kullanan sorgular
+	// En çok bellek kullanan sorgular - with reduced timeout
 	var memoryConsumingQueries []map[string]interface{}
-	rows, err = db.Query(`
-		SELECT TOP 10
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second) // Reduced from 20s to 10s
+	defer cancel3()
+
+	rows, err = db.QueryContext(ctx3, `
+		SELECT TOP 3  -- Reduced from TOP 5 to TOP 3
 			t.text AS query_text,
-			s.plan_handle,
 			s.total_worker_time / 1000 AS total_cpu_time_ms,
 			s.total_elapsed_time / 1000 AS total_elapsed_time_ms,
-			s.total_logical_reads AS total_logical_reads,
-			s.total_logical_writes AS total_logical_writes,
-			s.total_physical_reads AS total_physical_reads,
+			s.total_logical_reads,
 			s.execution_count,
-			s.total_logical_reads / s.execution_count AS avg_logical_reads,
-			s.last_logical_reads,
-			s.min_logical_reads,
-			s.max_logical_reads,
-			s.total_logical_writes / s.execution_count AS avg_logical_writes,
-			q.requested_memory_kb / 1024 AS requested_memory_mb,
-			q.granted_memory_kb / 1024 AS granted_memory_mb,
-			q.ideal_memory_kb / 1024 AS ideal_memory_mb,
-			q.required_memory_kb / 1024 AS required_memory_mb
+			CASE WHEN s.execution_count = 0 THEN 0 ELSE s.total_logical_reads / s.execution_count END AS avg_logical_reads
 		FROM sys.dm_exec_query_stats s
 		CROSS APPLY sys.dm_exec_sql_text(s.sql_handle) t
-		CROSS APPLY sys.dm_exec_query_memory_grants q
-		WHERE s.plan_handle = q.plan_handle
-		ORDER BY q.granted_memory_kb DESC
+		WHERE s.total_logical_reads > 10000  -- Increased threshold from 1000 to 10000
+		ORDER BY s.total_logical_reads DESC
 	`)
 
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var queryText sql.NullString
-			var planHandle []byte
 			var totalCpuTime, totalElapsedTime float64
-			var totalLogicalReads, totalLogicalWrites, totalPhysicalReads, executionCount int64
-			var avgLogicalReads, lastLogicalReads, minLogicalReads, maxLogicalReads, avgLogicalWrites int64
-			var requestedMemoryMB, grantedMemoryMB, idealMemoryMB, requiredMemoryMB int64
+			var totalLogicalReads, executionCount, avgLogicalReads int64
 
-			if err := rows.Scan(&queryText, &planHandle, &totalCpuTime, &totalElapsedTime,
-				&totalLogicalReads, &totalLogicalWrites, &totalPhysicalReads, &executionCount,
-				&avgLogicalReads, &lastLogicalReads, &minLogicalReads, &maxLogicalReads,
-				&avgLogicalWrites, &requestedMemoryMB, &grantedMemoryMB, &idealMemoryMB, &requiredMemoryMB); err == nil {
+			if err := rows.Scan(&queryText, &totalCpuTime, &totalElapsedTime,
+				&totalLogicalReads, &executionCount, &avgLogicalReads); err == nil {
 
 				query := map[string]interface{}{
-					"query_text":              nullStringToString(queryText),
-					"total_cpu_time_ms":       totalCpuTime,
-					"total_elapsed_time_ms":   totalElapsedTime,
-					"execution_count":         executionCount,
-					"total_logical_reads":     totalLogicalReads,
-					"total_logical_writes":    totalLogicalWrites,
-					"total_physical_reads":    totalPhysicalReads,
-					"avg_logical_reads":       avgLogicalReads,
-					"requested_memory_mb":     requestedMemoryMB,
-					"granted_memory_mb":       grantedMemoryMB,
-					"ideal_memory_mb":         idealMemoryMB,
-					"required_memory_mb":      requiredMemoryMB,
-					"memory_grant_efficiency": float64(grantedMemoryMB) / float64(idealMemoryMB) * 100,
+					"query_text":            nullStringToString(queryText),
+					"total_cpu_time_ms":     totalCpuTime,
+					"total_elapsed_time_ms": totalElapsedTime,
+					"execution_count":       executionCount,
+					"total_logical_reads":   totalLogicalReads,
+					"avg_logical_reads":     avgLogicalReads,
 				}
 
 				memoryConsumingQueries = append(memoryConsumingQueries, query)
@@ -1339,6 +1591,9 @@ func (b *BestPracticesCollector) collectMemoryUsage() {
 		}
 
 		memoryMetrics["memory_consuming_queries"] = memoryConsumingQueries
+	} else {
+		log.Printf("Memory consuming queries query failed: %v", err)
+		memoryMetrics["memory_consuming_queries"] = []map[string]interface{}{} // Empty result on failure
 	}
 
 	b.results["MemoryUsage"] = memoryMetrics
@@ -1387,9 +1642,12 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 
 	ioMetrics := make(map[string]interface{})
 
-	// Veritabanı dosya I/O istatistikleri
-	rows, err := db.Query(`
-		SELECT
+	// Veritabanı dosya I/O istatistikleri - Optimized with shorter timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Reduced from 30s to 15s
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT TOP 10  -- Reduced from TOP 20 to TOP 10
 			DB_NAME(vfs.database_id) AS database_name,
 			vfs.file_id,
 			mf.name AS file_name,
@@ -1408,6 +1666,8 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
 		JOIN sys.master_files AS mf
 			ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+		WHERE vfs.database_id > 4  -- Skip system databases for performance
+		AND vfs.io_stall > 1000    -- Only include files with significant I/O stalls
 		ORDER BY io_stall DESC
 	`)
 
@@ -1451,13 +1711,15 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		ioMetrics["database_files"] = databaseIOStats
 	}
 
-	// Pending I/O Requests
+	// Pending I/O Requests - Simplified with shorter timeout
 	var pendingIORequests []map[string]interface{}
-	rows, err = db.Query(`
-		SELECT 
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second) // Reduced from 10s to 5s
+	defer cancel2()
+
+	rows, err = db.QueryContext(ctx2, `
+		SELECT TOP 5  -- Reduced from TOP 10 to TOP 5
 			io_pending, 
-			io_pending_ms_ticks, 
-			scheduler_address 
+			io_pending_ms_ticks
 		FROM sys.dm_io_pending_io_requests
 	`)
 
@@ -1467,9 +1729,8 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		for rows.Next() {
 			var ioPending int
 			var ioPendingMsTicks int64
-			var schedulerAddress []byte
 
-			if err := rows.Scan(&ioPending, &ioPendingMsTicks, &schedulerAddress); err == nil {
+			if err := rows.Scan(&ioPending, &ioPendingMsTicks); err == nil {
 				pendingIO := map[string]interface{}{
 					"io_pending":          ioPending,
 					"io_pending_ms_ticks": ioPendingMsTicks,
@@ -1481,11 +1742,18 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 
 		ioMetrics["pending_io_requests"] = pendingIORequests
 		ioMetrics["pending_io_count"] = len(pendingIORequests)
+	} else {
+		log.Printf("Pending IO requests query failed: %v", err)
+		ioMetrics["pending_io_requests"] = []map[string]interface{}{}
+		ioMetrics["pending_io_count"] = 0
 	}
 
-	// Genel I/O istatistikleri (Drive bazında)
-	rows, err = db.Query(`
-		SELECT
+	// Drive I/O statistics - Optimized with shorter timeout
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second) // Reduced from 20s to 10s
+	defer cancel3()
+
+	rows, err = db.QueryContext(ctx3, `
+		SELECT TOP 5  -- Reduced from TOP 10 to TOP 5
 			LEFT(mf.physical_name, 1) AS drive_letter,
 			SUM(vfs.num_of_reads) AS num_reads,
 			SUM(vfs.num_of_writes) AS num_writes,
@@ -1499,7 +1767,10 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
 		JOIN sys.master_files AS mf
 			ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+		WHERE vfs.database_id > 4  -- Skip system databases
+		AND SUM(vfs.io_stall) > 5000  -- Only drives with significant I/O stalls
 		GROUP BY LEFT(mf.physical_name, 1)
+		HAVING SUM(vfs.io_stall) > 5000  -- Additional filter for having clause
 		ORDER BY SUM(vfs.io_stall) DESC
 	`)
 
@@ -1536,17 +1807,19 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		ioMetrics["drive_stats"] = driveStats
 	}
 
-	// Checkpoint ve lazy writer istatistikleri
+	// Buffer manager stats - Simplified with timeout
 	var bufferManagerStats map[string]interface{}
+	ctx4, cancel4 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel4()
 
 	var checkpointPages, lazyWrites, pageReads, pageWrites int64
 
-	err = db.QueryRow(`
+	err = db.QueryRowContext(ctx4, `
 		SELECT
-			(SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Checkpoint pages/sec' AND object_name LIKE '%Buffer Manager%') AS checkpoint_pages,
-			(SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Lazy writes/sec' AND object_name LIKE '%Buffer Manager%') AS lazy_writes,
-			(SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Page reads/sec' AND object_name LIKE '%Buffer Manager%') AS page_reads,
-			(SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Page writes/sec' AND object_name LIKE '%Buffer Manager%') AS page_writes
+			ISNULL((SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Checkpoint pages/sec' AND object_name LIKE '%Buffer Manager%'), 0) AS checkpoint_pages,
+			ISNULL((SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Lazy writes/sec' AND object_name LIKE '%Buffer Manager%'), 0) AS lazy_writes,
+			ISNULL((SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Page reads/sec' AND object_name LIKE '%Buffer Manager%'), 0) AS page_reads,
+			ISNULL((SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name = 'Page writes/sec' AND object_name LIKE '%Buffer Manager%'), 0) AS page_writes
 	`).Scan(&checkpointPages, &lazyWrites, &pageReads, &pageWrites)
 
 	if err == nil {
@@ -1558,29 +1831,30 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		}
 
 		ioMetrics["buffer_manager"] = bufferManagerStats
+	} else {
+		log.Printf("Buffer manager stats query failed: %v", err)
+		ioMetrics["buffer_manager"] = map[string]interface{}{}
 	}
 
-	// I/O ile ilgili en yüksek bekleme türleri
+	// I/O wait stats - Simplified
 	var ioWaitStats []map[string]interface{}
-	rows, err = db.Query(`
-		SELECT 
+	ctx5, cancel5 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel5()
+
+	rows, err = db.QueryContext(ctx5, `
+		SELECT TOP 5
 			wait_type,
 			waiting_tasks_count,
 			wait_time_ms,
 			max_wait_time_ms,
 			signal_wait_time_ms
 		FROM sys.dm_os_wait_stats
-		WHERE wait_type LIKE 'PAGEIOLATCH%'
-		OR wait_type LIKE 'IO_COMPLETION%'
-		OR wait_type LIKE 'WRITELOG%'
-		OR wait_type LIKE 'ASYNC_IO_COMPLETION%'
-		OR wait_type = 'IO_QUEUE_LIMIT'
+		WHERE wait_type IN ('PAGEIOLATCH_EX', 'PAGEIOLATCH_SH', 'WRITELOG', 'IO_COMPLETION', 'ASYNC_IO_COMPLETION')
 		ORDER BY wait_time_ms DESC
 	`)
 
 	if err == nil {
 		defer rows.Close()
-
 		for rows.Next() {
 			var waitType string
 			var waitingTasksCount, waitTimeMs, maxWaitTimeMs, signalWaitTimeMs int64
@@ -1601,6 +1875,9 @@ func (b *BestPracticesCollector) collectIOPerformance() {
 		}
 
 		ioMetrics["io_wait_stats"] = ioWaitStats
+	} else {
+		log.Printf("IO wait stats query failed: %v", err)
+		ioMetrics["io_wait_stats"] = []map[string]interface{}{}
 	}
 
 	// I/O Performans Özeti

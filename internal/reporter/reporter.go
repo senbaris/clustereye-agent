@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -63,18 +64,15 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 	// Debug için hangi veritabanında çalıştığımızı kontrol et
 	var currentDB string
 	p.db.QueryRow("SELECT current_database()").Scan(&currentDB)
-	log.Printf("[DEBUG] Mevcut veritabanı: %s, İstenen veritabanı: %s", currentDB, database)
 
 	// Veritabanını seç
 	if database != "" && database != currentDB {
-		log.Printf("[DEBUG] Veritabanı değişikliği gerekiyor: %s -> %s", currentDB, database)
 
 		// Mevcut bağlantıdan host bilgisini al
 		var currentHost string
 		err := p.db.QueryRow("SELECT inet_server_addr()").Scan(&currentHost)
 		if err != nil {
 			currentHost = "localhost"
-			log.Printf("[DEBUG] Host bilgisi alınamadı, varsayılan olarak localhost kullanılacak")
 		}
 
 		// Mevcut bağlantıdan port bilgisini al
@@ -82,7 +80,6 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 		err = p.db.QueryRow("SELECT inet_server_port()").Scan(&currentPort)
 		if err != nil {
 			currentPort = "5432"
-			log.Printf("[DEBUG] Port bilgisi alınamadı, varsayılan olarak 5432 kullanılacak")
 		}
 
 		// Config'den kullanıcı adı ve şifreyi al
@@ -93,13 +90,9 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 		connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 			currentHost, currentPort, user, pass, database)
 
-		log.Printf("[DEBUG] Yeni connection string oluşturuldu (kullanıcı: %s, host: %s, port: %s, db: %s)",
-			user, currentHost, currentPort, database)
-
 		// Mevcut bağlantıyı kapat
 		if p.db != nil {
 			if err := p.db.Close(); err != nil {
-				log.Printf("[WARN] Mevcut bağlantı kapatılırken hata: %v", err)
 			}
 		}
 
@@ -137,7 +130,6 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 		if err != nil {
 			log.Printf("[ERROR] Veritabanı kontrolü yapılamadı: %v", err)
 		} else {
-			log.Printf("[DEBUG] Şu anki veritabanı: %s", currentDB)
 		}
 	}
 
@@ -162,7 +154,6 @@ func (p *QueryProcessor) processQuery(command string, database string) map[strin
 
 	// Özel sorgu kontrolü - unused indexes
 	if strings.Contains(command, "unused_indexes") || strings.Contains(command, "stats_child.idx_scan = 0") {
-		log.Printf("[DEBUG] Unused indexes sorgusu tespit edildi, özel sorgu kullanılacak")
 
 		// Debug için önce tüm indexleri listele
 		debugRows, err := p.db.Query(`
@@ -928,6 +919,12 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			if err := r.SendPostgresInfo(); err != nil {
 				log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
 			}
+
+			// Start periodic metrics collection for PostgreSQL
+			if r.metricsSender != nil {
+				log.Printf("Starting periodic PostgreSQL metrics collection...")
+				r.metricsSender.StartPeriodicPostgreSQLMetricsCollection(60 * time.Second) // Collect every minute
+			}
 		} else if platform == "mongo" {
 			// İlk MongoDB bilgilerini gönder
 			if err := r.SendMongoInfo(); err != nil {
@@ -1469,14 +1466,8 @@ func (r *Reporter) listenForCommands() {
 								continue
 							}
 
-							// Önce tüm time.Time değerlerini string'e dönüştür
-							processedResults := convertTimeValues(results).(map[string]interface{})
-
-							// Serialization through JSON to ensure all types are properly converted
-							processedResults, err = serializeViaJSON(processedResults)
-							if err != nil {
-								log.Printf("Serialization error: %v, continuing with original data", err)
-							}
+							// Önce tüm problematik değerleri temizle (time.Time, NaN, unsupported types)
+							processedResults := sanitizeData(results).(map[string]interface{})
 
 							// Analiz sonuçlarını başarılı olarak döndür
 							processedResults["status"] = "success"
@@ -2948,10 +2939,27 @@ func (r *Reporter) listenForCommands() {
 
 // sendQueryResult yardımcı fonksiyonu, map sonucunu gRPC yanıtına dönüştürüp gönderir
 func sendQueryResult(stream pb.AgentService_ConnectClient, queryId string, result map[string]interface{}) {
-	resultStruct, err := structpb.NewStruct(result)
+	// Önce veriyi protobuf uyumlu hale getir (NaN, complex types, etc.)
+	sanitizedResult := sanitizeData(result).(map[string]interface{})
+
+	resultStruct, err := structpb.NewStruct(sanitizedResult)
 	if err != nil {
 		log.Printf("Struct'a dönüştürme hatası: %v", err)
-		return
+
+		// Hata durumunda daha basit bir veri yapısı deneyelim
+		fallbackResult := map[string]interface{}{
+			"status":         "error",
+			"message":        fmt.Sprintf("Veri dönüştürme hatası: %v", err),
+			"original_error": err.Error(),
+		}
+
+		// Fallback veriyi de sanitize et
+		sanitizedFallback := sanitizeData(fallbackResult).(map[string]interface{})
+		resultStruct, err = structpb.NewStruct(sanitizedFallback)
+		if err != nil {
+			log.Printf("Fallback struct'a dönüştürme de başarısız: %v", err)
+			return
+		}
 	}
 
 	anyResult, err := anypb.New(resultStruct)
@@ -2992,41 +3000,9 @@ func shortenString(s string, maxLen int) string {
 	return s
 }
 
-// convertTimeValues recursively traverses a data structure and converts time.Time values to RFC3339 strings
+// convertTimeValues fonksiyonu sanitizeData ile değiştirildi
 func convertTimeValues(data interface{}) interface{} {
-	switch v := data.(type) {
-	case time.Time:
-		// Convert time.Time to RFC3339 string
-		return v.Format(time.RFC3339)
-
-	case map[string]interface{}:
-		// Process each value in the map
-		result := make(map[string]interface{})
-		for key, value := range v {
-			result[key] = convertTimeValues(value)
-		}
-		return result
-
-	case []interface{}:
-		// Process each item in the slice
-		result := make([]interface{}, len(v))
-		for i, item := range v {
-			result[i] = convertTimeValues(item)
-		}
-		return result
-
-	case []map[string]interface{}:
-		// Process each map in the slice
-		result := make([]map[string]interface{}, len(v))
-		for i, item := range v {
-			result[i] = convertTimeValues(item).(map[string]interface{})
-		}
-		return result
-
-	default:
-		// Return other types as is
-		return v
-	}
+	return sanitizeData(data)
 }
 
 // flattenMap converts a nested map structure into a flat map with concatenated keys
@@ -5288,4 +5264,137 @@ func (r *Reporter) getWindowsUptime() int64 {
 	}
 
 	return 0
+}
+
+// sanitizeData recursively traverses a data structure and sanitizes problematic values
+// for protobuf compatibility (NaN values, unsupported types, etc.)
+func sanitizeData(data interface{}) interface{} {
+	switch v := data.(type) {
+	case time.Time:
+		// Convert time.Time to RFC3339 string
+		return v.Format(time.RFC3339)
+
+	case float64:
+		// Handle NaN and infinity values
+		if math.IsNaN(v) {
+			return 0.0 // Convert NaN to 0
+		}
+		if math.IsInf(v, 0) {
+			if math.IsInf(v, 1) {
+				return 999999999.0 // Convert +Inf to large number
+			} else {
+				return -999999999.0 // Convert -Inf to large negative number
+			}
+		}
+		return v
+
+	case float32:
+		// Handle NaN and infinity values for float32
+		if math.IsNaN(float64(v)) {
+			return float32(0.0)
+		}
+		if math.IsInf(float64(v), 0) {
+			if math.IsInf(float64(v), 1) {
+				return float32(999999.0)
+			} else {
+				return float32(-999999.0)
+			}
+		}
+		return v
+
+	case []string:
+		// Convert []string to map with indexed keys for protobuf compatibility
+		result := make(map[string]interface{})
+		result["count"] = len(v)
+		for i, item := range v {
+			result[fmt.Sprintf("item_%d", i)] = item
+		}
+		return result
+
+	case map[string]interface{}:
+		// Process each value in the map
+		result := make(map[string]interface{})
+		for key, value := range v {
+			result[key] = sanitizeData(value)
+		}
+		return result
+
+	case []interface{}:
+		// Process each item in the slice
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = sanitizeData(item)
+		}
+		return result
+
+	case []map[string]interface{}:
+		// Process each map in the slice
+		result := make([]map[string]interface{}, len(v))
+		for i, item := range v {
+			result[i] = sanitizeData(item).(map[string]interface{})
+		}
+		return result
+
+	case []int:
+		// Convert []int to []interface{} for compatibility
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = item
+		}
+		return result
+
+	case []int64:
+		// Convert []int64 to []interface{} for compatibility
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = item
+		}
+		return result
+
+	case []float64:
+		// Convert []float64 to []interface{} and sanitize each value
+		result := make([]interface{}, len(v))
+		for i, item := range v {
+			result[i] = sanitizeData(item)
+		}
+		return result
+
+	case map[string][]map[string]interface{}:
+		// Handle problematic map[string][]map[string]interface{} type
+		result := make(map[string]interface{})
+		for key, arrayOfMaps := range v {
+			// Convert array of maps to a flattened structure
+			arrayResult := make(map[string]interface{})
+			arrayResult["count"] = len(arrayOfMaps)
+
+			for i, mapItem := range arrayOfMaps {
+				sanitizedMap := sanitizeData(mapItem).(map[string]interface{})
+				for mapKey, mapValue := range sanitizedMap {
+					arrayResult[fmt.Sprintf("item_%d_%s", i, mapKey)] = mapValue
+				}
+			}
+			result[key] = arrayResult
+		}
+		return result
+
+	case map[string][]interface{}:
+		// Handle map[string][]interface{} type
+		result := make(map[string]interface{})
+		for key, array := range v {
+			// Convert array to a flattened structure
+			arrayResult := make(map[string]interface{})
+			arrayResult["count"] = len(array)
+
+			for i, item := range array {
+				sanitizedItem := sanitizeData(item)
+				arrayResult[fmt.Sprintf("item_%d", i)] = sanitizedItem
+			}
+			result[key] = arrayResult
+		}
+		return result
+
+	default:
+		// Return other types as is
+		return v
+	}
 }

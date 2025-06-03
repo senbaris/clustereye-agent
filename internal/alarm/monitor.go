@@ -1467,7 +1467,56 @@ func getOSVersion() string {
 	return strings.TrimSpace(string(output))
 }
 
-// checkMSSQLSlowQueries yavaş MSSQL sorgularını kontrol eder ve alarm üretir
+// createMSSQLDSN creates a proper DSN connection string for MSSQL including instance support
+func (m *AlarmMonitor) createMSSQLDSN() string {
+	host := m.config.MSSQL.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := m.config.MSSQL.Port
+	if port == "" {
+		port = "1433"
+	}
+
+	instance := m.config.MSSQL.Instance
+	database := m.config.MSSQL.Database
+	if database == "" {
+		database = "master"
+	}
+
+	var dsn string
+
+	// Windows authentication
+	if m.config.MSSQL.WindowsAuth {
+		if instance != "" {
+			dsn = fmt.Sprintf("server=%s\\%s;database=%s;trusted_connection=yes", host, instance, database)
+		} else {
+			dsn = fmt.Sprintf("server=%s,%s;database=%s;trusted_connection=yes", host, port, database)
+		}
+	} else {
+		// SQL Server authentication
+		if instance != "" {
+			dsn = fmt.Sprintf("server=%s\\%s;user id=%s;password=%s;database=%s",
+				host, instance, m.config.MSSQL.User, m.config.MSSQL.Pass, database)
+		} else {
+			dsn = fmt.Sprintf("server=%s,%s;user id=%s;password=%s;database=%s",
+				host, port, m.config.MSSQL.User, m.config.MSSQL.Pass, database)
+		}
+	}
+
+	// Add TrustServerCertificate if needed
+	if m.config.MSSQL.TrustCert {
+		dsn += ";trustservercertificate=true"
+	}
+
+	// Additional connection parameters
+	dsn += ";connection timeout=10;dial timeout=5;keepalive=30"
+
+	return dsn
+}
+
+// checkMSSQLSlowQueries yavaş MSSQL sorgularını kontrol eder ve alarm gönderir
 func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 	if m.thresholds == nil || m.thresholds.SlowQueryThresholdMs == 0 {
 		logger.Warning("MSSQL Slow query threshold değeri ayarlanmamış")
@@ -1479,14 +1528,7 @@ func (m *AlarmMonitor) checkMSSQLSlowQueries() {
 	alarmKey := "mssql_slow_queries"
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
@@ -1768,14 +1810,7 @@ func (m *AlarmMonitor) checkMSSQLCPUUsage() {
 	alarmKey := "mssql_cpu_usage"
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
@@ -2013,14 +2048,7 @@ func (m *AlarmMonitor) checkMSSQLBlockingQueries() {
 	alarmKey := "mssql_blocking_queries"
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
@@ -2263,14 +2291,7 @@ func (m *AlarmMonitor) checkMSSQLServiceStatus() {
 	haStateKey := "mssql_ha_state" // Son bilinen HA durumunu saklamak için
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
@@ -2485,14 +2506,7 @@ func (m *AlarmMonitor) checkMSSQLFailover() {
 	alarmKey := "mssql_failover"
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)
@@ -2762,14 +2776,7 @@ func (m *AlarmMonitor) checkMSSQLDeadlocks() {
 	alarmKey := "mssql_deadlocks"
 
 	// Bağlantı bilgilerini al
-	dsn := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s",
-		m.config.MSSQL.Host, m.config.MSSQL.User, m.config.MSSQL.Pass, m.config.MSSQL.Port)
-
-	// Windows olduğu için yerel kimlik doğrulama da destekleyelim
-	if m.config.MSSQL.WindowsAuth {
-		dsn = fmt.Sprintf("server=%s;port=%s;trusted_connection=yes",
-			m.config.MSSQL.Host, m.config.MSSQL.Port)
-	}
+	dsn := m.createMSSQLDSN()
 
 	// Veritabanı bağlantısını aç
 	db, err := sql.Open("sqlserver", dsn)

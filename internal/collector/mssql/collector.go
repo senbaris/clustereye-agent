@@ -893,6 +893,9 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 		}
 	}
 
+	// Measure MSSQL response time (ALWAYS fresh - don't cache)
+	c.measureResponseTime(metrics)
+
 	// For non-Windows systems, fallback to individual calls
 	if runtime.GOOS != "windows" {
 		log.Printf("Non-Windows system detected, collecting metrics individually")
@@ -902,15 +905,19 @@ func (c *MSSQLCollector) BatchCollectSystemMetrics() map[string]interface{} {
 		memUsage := float64(80)                   // Estimate 80% usage
 
 		metrics := map[string]interface{}{
-			"cpu_count":    int32(c.getTotalvCpu()),         // Ensure int32
-			"cpu_usage":    float64(0),                      // Default to 0% for Unix
-			"total_memory": totalMem,                        // Ensure int64
-			"free_memory":  freeMem,                         // Estimated free memory
-			"memory_usage": memUsage,                        // Estimated memory usage
-			"total_disk":   int64(100 * 1024 * 1024 * 1024), // 100GB default
-			"free_disk":    int64(30 * 1024 * 1024 * 1024),  // 30GB default
-			"ip_address":   string(c.getLocalIP()),          // Ensure string
+			"cpu_count":        int32(c.getTotalvCpu()),         // Ensure int32
+			"cpu_usage":        float64(0),                      // Default to 0% for Unix
+			"total_memory":     totalMem,                        // Ensure int64
+			"free_memory":      freeMem,                         // Estimated free memory
+			"memory_usage":     memUsage,                        // Estimated memory usage
+			"total_disk":       int64(100 * 1024 * 1024 * 1024), // 100GB default
+			"free_disk":        int64(30 * 1024 * 1024 * 1024),  // 30GB default
+			"ip_address":       string(c.getLocalIP()),          // Ensure string
+			"response_time_ms": float64(0),
 		}
+
+		// Add response time for non-Windows systems too
+		c.measureResponseTime(metrics)
 
 		// Cache the results
 		c.cacheSystemMetrics(metrics)
@@ -1166,7 +1173,7 @@ func (c *MSSQLCollector) cacheSystemMetrics(metrics map[string]interface{}) {
 			} else {
 				staticMetrics[k] = "Unknown"
 			}
-		case "cpu_usage", "memory_usage", "free_memory", "total_disk", "free_disk":
+		case "cpu_usage", "memory_usage", "free_memory", "total_disk", "free_disk", "response_time_ms":
 			// DON'T cache dynamic metrics - they change frequently
 			// These will be collected fresh every time
 		default:
@@ -3826,4 +3833,65 @@ func UpdateDefaultMSSQLCollector(cfg *config.AgentConfig) {
 // GetDefaultMSSQLCollector returns the default collector instance (thread-safe)
 func GetDefaultMSSQLCollector() *MSSQLCollector {
 	return GetDefaultCollectorSafe()
+}
+
+// measureResponseTime measures MSSQL response time by executing a simple SELECT 1 query
+func (c *MSSQLCollector) measureResponseTime(metrics map[string]interface{}) {
+	log.Printf("DEBUG: measureResponseTime - Starting response time measurement")
+
+	// Try to get database connection with a short timeout
+	db, err := c.GetClient()
+	if err != nil {
+		log.Printf("DEBUG: measureResponseTime - Database connection failed: %v", err)
+		log.Printf("MSSQL bağlantısı kurulamadı, response time ölçülemiyor: %v", err)
+		// Set response time to -1 to indicate connection failure
+		metrics["response_time_ms"] = float64(-1)
+		log.Printf("DEBUG: measureResponseTime - Set response_time_ms = -1 (connection failure)")
+		return
+	}
+	defer func() {
+		log.Printf("DEBUG: measureResponseTime - Closing database connection")
+		db.Close()
+	}()
+
+	log.Printf("DEBUG: measureResponseTime - Database connection successful, starting query execution")
+
+	// Execute simple SELECT 1 query to measure response time with high precision
+	queryStart := time.Now()
+	var result int
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	log.Printf("DEBUG: measureResponseTime - Executing 'SELECT 1' query with 3 second timeout")
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
+	duration := time.Since(queryStart)
+
+	log.Printf("DEBUG: measureResponseTime - Query completed in %v (nanoseconds: %d)", duration, duration.Nanoseconds())
+
+	if err != nil {
+		log.Printf("DEBUG: measureResponseTime - Query execution failed: %v", err)
+		log.Printf("MSSQL response time query failed: %v", err)
+		// Set response time to -1 to indicate query failure
+		metrics["response_time_ms"] = float64(-1)
+		log.Printf("DEBUG: measureResponseTime - Set response_time_ms = -1 (query failure)")
+		return
+	}
+
+	log.Printf("DEBUG: measureResponseTime - Query returned result: %d", result)
+
+	// Convert to milliseconds for API compatibility (nanoseconds / 1,000,000)
+	responseTimeMs := float64(duration.Nanoseconds()) / 1e6
+
+	// Ensure minimum response time to avoid 0.00 values that might be filtered
+	// If response time is 0 or extremely small, set to 0.001 ms minimum (1 microsecond)
+	if responseTimeMs < 0.001 {
+		log.Printf("DEBUG: measureResponseTime - Response time too small (%.6f ms), setting minimum to 0.001 ms", responseTimeMs)
+		responseTimeMs = 0.001
+	}
+
+	metrics["response_time_ms"] = responseTimeMs
+
+	log.Printf("DEBUG: measureResponseTime - Calculated response time: %.6f ms (nanoseconds: %d)", responseTimeMs, duration.Nanoseconds())
+	log.Printf("DEBUG: measureResponseTime - Set metrics[\"response_time_ms\"] = %.6f", responseTimeMs)
+	log.Printf("MSSQL response time measured: %.6f ms", responseTimeMs)
 }

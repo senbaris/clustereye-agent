@@ -2373,3 +2373,135 @@ func ReadPostgresConfig(configPath string) ([]*pb.PostgresConfigEntry, error) {
 }
 
 // AnalyzePostgresLog PostgreSQL log dosyasını analiz eder
+
+// BatchCollectSystemMetrics collects various system metrics including response time
+func (c *PostgresCollector) BatchCollectSystemMetrics() map[string]interface{} {
+	log.Printf("DEBUG: PostgreSQL BatchCollectSystemMetrics - Starting system metrics collection")
+
+	metrics := make(map[string]interface{})
+
+	// CPU Metrics
+	cpuCores := GetTotalvCpu()
+	metrics["cpu_count"] = cpuCores
+	log.Printf("DEBUG: PostgreSQL - CPU cores: %d", cpuCores)
+
+	// Get CPU usage
+	if cpuUsage, err := getCPUUsage(); err == nil {
+		metrics["cpu_usage"] = cpuUsage
+		log.Printf("DEBUG: PostgreSQL - CPU usage: %.2f%%", cpuUsage)
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get CPU usage: %v", err)
+		metrics["cpu_usage"] = float64(0)
+	}
+
+	// Memory Metrics
+	totalMemory := GetTotalMemory()
+	metrics["total_memory"] = totalMemory
+	log.Printf("DEBUG: PostgreSQL - Total memory: %d bytes", totalMemory)
+
+	// Get memory usage
+	if ramInfo, err := getRAMUsage(); err == nil {
+		if usedPercent, ok := ramInfo["used_percent"].(float64); ok {
+			metrics["memory_usage"] = usedPercent
+			log.Printf("DEBUG: PostgreSQL - Memory usage: %.2f%%", usedPercent)
+		}
+		if free, ok := ramInfo["free"].(int64); ok {
+			metrics["free_memory"] = free
+			log.Printf("DEBUG: PostgreSQL - Free memory: %d bytes", free)
+		} else if freeFloat, ok := ramInfo["free"].(float64); ok {
+			metrics["free_memory"] = int64(freeFloat)
+			log.Printf("DEBUG: PostgreSQL - Free memory: %d bytes (converted from float)", int64(freeFloat))
+		} else {
+			// Calculate free memory from total and used
+			if usedPercent, ok := ramInfo["used_percent"].(float64); ok {
+				freeMemory := int64(float64(totalMemory) * (100 - usedPercent) / 100)
+				metrics["free_memory"] = freeMemory
+				log.Printf("DEBUG: PostgreSQL - Free memory calculated: %d bytes", freeMemory)
+			} else {
+				metrics["free_memory"] = int64(0)
+			}
+		}
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get RAM usage: %v", err)
+		metrics["memory_usage"] = float64(0)
+		metrics["free_memory"] = int64(0)
+	}
+
+	// Disk Metrics
+	if diskInfo, err := getDiskUsage(); err == nil {
+		if total, ok := diskInfo["total"].(int64); ok {
+			metrics["total_disk"] = total
+			log.Printf("DEBUG: PostgreSQL - Total disk: %d bytes", total)
+		} else if totalFloat, ok := diskInfo["total"].(float64); ok {
+			metrics["total_disk"] = int64(totalFloat)
+			log.Printf("DEBUG: PostgreSQL - Total disk: %d bytes (converted from float)", int64(totalFloat))
+		} else {
+			metrics["total_disk"] = int64(0)
+		}
+
+		if free, ok := diskInfo["free"].(int64); ok {
+			metrics["free_disk"] = free
+			log.Printf("DEBUG: PostgreSQL - Free disk: %d bytes", free)
+		} else if freeFloat, ok := diskInfo["free"].(float64); ok {
+			metrics["free_disk"] = int64(freeFloat)
+			log.Printf("DEBUG: PostgreSQL - Free disk: %d bytes (converted from float)", int64(freeFloat))
+		} else {
+			metrics["free_disk"] = int64(0)
+		}
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get disk usage: %v", err)
+		metrics["total_disk"] = int64(0)
+		metrics["free_disk"] = int64(0)
+	}
+
+	// PostgreSQL Response Time
+	responseTime := c.measurePostgreSQLResponseTime()
+	metrics["response_time_ms"] = responseTime
+	log.Printf("DEBUG: PostgreSQL - Response time: %.6f ms", responseTime)
+
+	// IP Address
+	if ip := c.getLocalIP(); ip != "" {
+		metrics["ip_address"] = ip
+		log.Printf("DEBUG: PostgreSQL - IP address: %s", ip)
+	} else {
+		metrics["ip_address"] = "unknown"
+	}
+
+	log.Printf("DEBUG: PostgreSQL BatchCollectSystemMetrics - Collected %d metrics", len(metrics))
+	for key, value := range metrics {
+		log.Printf("DEBUG: PostgreSQL Metric[%s] = %v (type: %T)", key, value, value)
+	}
+
+	return metrics
+}
+
+// measurePostgreSQLResponseTime measures PostgreSQL response time with a simple query
+func (c *PostgresCollector) measurePostgreSQLResponseTime() float64 {
+	start := time.Now()
+
+	// Get database connection
+	db, err := c.openDB()
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL response time measurement failed - DB connection error: %v", err)
+		return -1.0
+	}
+	defer db.Close()
+
+	// Execute simple test query
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var result int
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
+
+	elapsed := time.Since(start)
+	responseTimeMs := float64(elapsed.Nanoseconds()) / 1000000.0
+
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL response time measurement failed - Query error: %v", err)
+		return -1.0
+	}
+
+	log.Printf("DEBUG: PostgreSQL response time measurement successful: %.6f ms", responseTimeMs)
+	return responseTimeMs
+}

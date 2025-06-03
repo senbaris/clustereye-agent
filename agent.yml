@@ -1,0 +1,28 @@
+key: 3342-5622-7658-9977
+name: Agent
+grpc:
+  server_address: 143.198.61.173:50051
+postgresql:
+  host: 192.168.64.2
+  user: postgres
+  pass: Dkjf334utre1
+  port: 5432
+  cluster: postgresnew
+  location: istanbul
+mongo:
+  host: localhost
+  user: admin
+  pass: Dkjf334utre1!
+  port: 27017
+  replset: rs0
+  location: istanbul
+mssql:
+  host: TEST-SQL-01
+  user: testuser
+  pass: Dkjf334utre1!
+  port: 1433
+  instance: 
+  database: master
+  location: istanbul
+  trust_cert: true
+  windows_auth: false
