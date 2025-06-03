@@ -900,6 +900,13 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			} else {
 				log.Printf("PostgreSQL collector initialization failed")
 			}
+
+			// PostgreSQL için metrics collection başlat (MongoDB gibi)
+			if r.metricsSender != nil {
+				log.Printf("Starting periodic PostgreSQL metrics collection...")
+				r.metricsSender.InitPostgreSQLCollector()
+				r.metricsSender.StartPeriodicPostgreSQLMetricsCollection(60 * time.Second) // Collect every minute
+			}
 		} else if platform == "mssql" {
 			// MSSQL collector startup recovery
 			log.Printf("Initializing MSSQL collector...")
@@ -940,12 +947,6 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			// İlk PostgreSQL bilgilerini gönder
 			if err := r.SendPostgresInfo(); err != nil {
 				log.Printf("PostgreSQL bilgileri gönderilemedi: %v", err)
-			}
-
-			// Start periodic metrics collection for PostgreSQL
-			if r.metricsSender != nil {
-				log.Printf("Starting periodic PostgreSQL metrics collection...")
-				r.metricsSender.StartPeriodicPostgreSQLMetricsCollection(60 * time.Second) // Collect every minute
 			}
 		} else if platform == "mssql" {
 			// İlk MSSQL bilgilerini gönder
