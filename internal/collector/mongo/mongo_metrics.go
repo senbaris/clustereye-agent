@@ -742,24 +742,50 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 							Description: "Replica set member state",
 						})
 
-						// Optime lag for secondary members
-						if state == 2 { // SECONDARY
-							if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
-								if primaryOptimeDate, ok := m.getPrimaryOptimeDate(replSetStatus); ok {
-									lagMs := primaryOptimeDate.Sub(optimeDate).Milliseconds()
-									lagMsFloat := float64(lagMs)
-									if lagMs >= 0 {
-										metrics = append(metrics, Metric{
-											Name:        "mongodb.replication.lag_ms",
-											Value:       MetricValue{DoubleValue: &lagMsFloat},
-											Tags:        memberTags,
-											Timestamp:   timestamp,
-											Unit:        "milliseconds",
-											Description: "Replication lag in milliseconds",
-										})
-									}
+						// Enhanced lag calculation for all members
+						log.Printf("DEBUG: MongoDB Replication - Processing member %s with state %d", name, state)
+
+						if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
+							log.Printf("DEBUG: MongoDB Replication - Member %s optimeDate: %v", name, optimeDate)
+
+							if primaryOptimeDate, ok := m.getPrimaryOptimeDate(replSetStatus); ok {
+								log.Printf("DEBUG: MongoDB Replication - Primary optimeDate: %v", primaryOptimeDate)
+
+								lagMs := primaryOptimeDate.Sub(optimeDate).Milliseconds()
+								lagMsFloat := float64(lagMs)
+
+								log.Printf("DEBUG: MongoDB Replication - Member %s lag: %d ms", name, lagMs)
+
+								// Include lag for all members (PRIMARY will be 0, SECONDARY will be actual lag)
+								if state == 1 { // PRIMARY - lag is 0
+									zeroLag := float64(0)
+									metrics = append(metrics, Metric{
+										Name:        "mongodb.replication.lag_ms",
+										Value:       MetricValue{DoubleValue: &zeroLag},
+										Tags:        memberTags,
+										Timestamp:   timestamp,
+										Unit:        "milliseconds",
+										Description: "Replication lag in milliseconds (PRIMARY=0)",
+									})
+									log.Printf("DEBUG: MongoDB Replication - Added PRIMARY lag metric (0ms) for %s", name)
+								} else if state == 2 && lagMs >= 0 { // SECONDARY with valid lag
+									metrics = append(metrics, Metric{
+										Name:        "mongodb.replication.lag_ms",
+										Value:       MetricValue{DoubleValue: &lagMsFloat},
+										Tags:        memberTags,
+										Timestamp:   timestamp,
+										Unit:        "milliseconds",
+										Description: "Replication lag in milliseconds",
+									})
+									log.Printf("DEBUG: MongoDB Replication - Added SECONDARY lag metric (%dms) for %s", lagMs, name)
+								} else {
+									log.Printf("DEBUG: MongoDB Replication - Skipped lag metric for %s: state=%d, lag=%dms", name, state, lagMs)
 								}
+							} else {
+								log.Printf("DEBUG: MongoDB Replication - Could not get primary optime for lag calculation")
 							}
+						} else {
+							log.Printf("DEBUG: MongoDB Replication - No optimeDate found for member %s", name)
 						}
 					}
 				}
