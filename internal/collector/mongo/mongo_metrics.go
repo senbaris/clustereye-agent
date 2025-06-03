@@ -11,6 +11,7 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -764,9 +765,25 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 						// Enhanced lag calculation for all members
 						log.Printf("DEBUG: MongoDB Replication - Processing member %s with state %d", name, state)
 
-						if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
-							log.Printf("DEBUG: MongoDB Replication - Member %s optimeDate: %v", name, optimeDate)
+						// Try different types for optimeDate since MongoDB can return different types
+						var optimeDate time.Time
+						var optimeFound bool
 
+						// Try time.Time first
+						if optime, ok := memberMap["optimeDate"].(time.Time); ok {
+							optimeDate = optime
+							optimeFound = true
+							log.Printf("DEBUG: MongoDB Replication - Member %s optimeDate (time.Time): %v", name, optimeDate)
+						} else if optime, ok := memberMap["optimeDate"].(primitive.DateTime); ok {
+							// Convert primitive.DateTime to time.Time
+							optimeDate = optime.Time()
+							optimeFound = true
+							log.Printf("DEBUG: MongoDB Replication - Member %s optimeDate (primitive.DateTime): %v -> %v", name, optime, optimeDate)
+						} else {
+							log.Printf("DEBUG: MongoDB Replication - Member %s optimeDate not found or unsupported type: %T", name, memberMap["optimeDate"])
+						}
+
+						if optimeFound {
 							if primaryOptimeDate, ok := m.getPrimaryOptimeDate(replSetStatus); ok {
 								log.Printf("DEBUG: MongoDB Replication - Primary optimeDate: %v", primaryOptimeDate)
 
@@ -900,11 +917,18 @@ func (m *MongoDBMetricsCollector) getPrimaryOptimeDate(replSetStatus bson.M) (ti
 					if state == 1 { // PRIMARY
 						log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY member %d", i)
 
+						// Try different types for optimeDate
 						if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
-							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY optimeDate: %v", optimeDate)
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY optimeDate (time.Time): %v", optimeDate)
 							return optimeDate, true
+						} else if optimeDate, ok := memberMap["optimeDate"].(primitive.DateTime); ok {
+							// Convert primitive.DateTime to time.Time
+							timeValue := optimeDate.Time()
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY optimeDate (primitive.DateTime): %v -> %v", optimeDate, timeValue)
+							return timeValue, true
 						} else {
-							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate PRIMARY member %d has no optimeDate (available fields: %v)", i, func() []string {
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate PRIMARY member %d has unsupported optimeDate type: %T (value: %v)", i, memberMap["optimeDate"], memberMap["optimeDate"])
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate PRIMARY member %d available fields: %v", i, func() []string {
 								var fields []string
 								for k := range memberMap {
 									fields = append(fields, k)
