@@ -788,9 +788,18 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 								log.Printf("DEBUG: MongoDB Replication - Primary optimeDate: %v", primaryOptimeDate)
 
 								lagMs := primaryOptimeDate.Sub(optimeDate).Milliseconds()
-								lagMsFloat := float64(lagMs)
 
-								log.Printf("DEBUG: MongoDB Replication - Member %s lag: %d ms", name, lagMs)
+								// Handle negative lag (Secondary ahead of Primary) - this shouldn't happen normally
+								// but can occur due to clock skew or MongoDB internal timing
+								if lagMs < 0 {
+									// If secondary appears ahead, calculate reverse lag and take absolute value
+									absLagMs := optimeDate.Sub(primaryOptimeDate).Milliseconds()
+									log.Printf("DEBUG: MongoDB Replication - Member %s appears ahead of primary (negative lag: %dms), using absolute value: %dms", name, lagMs, absLagMs)
+									lagMs = absLagMs
+								}
+
+								lagMsFloat := float64(lagMs)
+								log.Printf("DEBUG: MongoDB Replication - Member %s final lag: %d ms", name, lagMs)
 
 								// Include lag for all members (PRIMARY will be 0, SECONDARY will be actual lag)
 								if state == 1 { // PRIMARY - lag is 0
@@ -804,7 +813,7 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 										Description: "Replication lag in milliseconds (PRIMARY=0)",
 									})
 									log.Printf("DEBUG: MongoDB Replication - Added PRIMARY lag metric (0ms) for %s", name)
-								} else if state == 2 && lagMs >= 0 { // SECONDARY with valid lag
+								} else if state == 2 { // SECONDARY - always add lag metric (positive value)
 									metrics = append(metrics, Metric{
 										Name:        "mongodb.replication.lag_ms",
 										Value:       MetricValue{DoubleValue: &lagMsFloat},
@@ -815,7 +824,7 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 									})
 									log.Printf("DEBUG: MongoDB Replication - Added SECONDARY lag metric (%dms) for %s", lagMs, name)
 								} else {
-									log.Printf("DEBUG: MongoDB Replication - Skipped lag metric for %s: state=%d, lag=%dms", name, state, lagMs)
+									log.Printf("DEBUG: MongoDB Replication - Skipped lag metric for %s: state=%d (not PRIMARY or SECONDARY)", name, state)
 								}
 							} else {
 								log.Printf("DEBUG: MongoDB Replication - Could not get primary optime for lag calculation")
