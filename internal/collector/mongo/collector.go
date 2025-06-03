@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
@@ -23,6 +25,39 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
+
+// Global MongoDB collector instance management
+var (
+	globalMongoCollector *MongoCollector
+	mongoCollectorMutex  sync.RWMutex
+	mongoCollectorOnce   sync.Once
+)
+
+// GetDefaultMongoCollector returns the global MongoDB collector instance
+func GetDefaultMongoCollector() *MongoCollector {
+	mongoCollectorMutex.RLock()
+	defer mongoCollectorMutex.RUnlock()
+	return globalMongoCollector
+}
+
+// UpdateDefaultMongoCollector creates or updates the global MongoDB collector instance
+func UpdateDefaultMongoCollector(cfg *config.AgentConfig) {
+	mongoCollectorOnce.Do(func() {
+		mongoCollectorMutex.Lock()
+		defer mongoCollectorMutex.Unlock()
+
+		log.Printf("Creating global MongoDB collector instance")
+		globalMongoCollector = NewMongoCollector(cfg)
+
+		// Perform startup recovery only once
+		go func() {
+			time.Sleep(2 * time.Second) // Brief delay to avoid startup race conditions
+			globalMongoCollector.StartupRecovery()
+		}()
+
+		log.Printf("Global MongoDB collector instance created and startup recovery initiated")
+	})
+}
 
 // MongoCollector mongodb için veri toplama yapısı
 type MongoCollector struct {

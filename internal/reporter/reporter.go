@@ -911,6 +911,28 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			} else {
 				log.Printf("MSSQL collector initialization failed")
 			}
+		} else if platform == "mongo" {
+			// MongoDB collector startup recovery
+			log.Printf("Initializing MongoDB collector...")
+			mongo.UpdateDefaultMongoCollector(r.cfg)
+			if collector := mongo.GetDefaultMongoCollector(); collector != nil {
+				collector.StartupRecovery()
+				log.Printf("MongoDB collector startup recovery completed")
+			} else {
+				log.Printf("MongoDB collector initialization failed")
+			}
+
+			// İlk MongoDB bilgilerini gönder
+			if err := r.SendMongoInfo(); err != nil {
+				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
+			}
+
+			// MongoDB için metrics collection başlat
+			if r.metricsSender != nil {
+				log.Printf("Starting periodic MongoDB metrics collection...")
+				r.metricsSender.InitMongoDBCollector()
+				r.metricsSender.StartMongoDBPeriodicCollection(60 * time.Second) // Collect every minute
+			}
 		}
 
 		// Platform seçimine göre ilk bilgileri gönder
@@ -925,11 +947,6 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 				log.Printf("Starting periodic PostgreSQL metrics collection...")
 				r.metricsSender.StartPeriodicPostgreSQLMetricsCollection(60 * time.Second) // Collect every minute
 			}
-		} else if platform == "mongo" {
-			// İlk MongoDB bilgilerini gönder
-			if err := r.SendMongoInfo(); err != nil {
-				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
-			}
 		} else if platform == "mssql" {
 			// İlk MSSQL bilgilerini gönder
 			if err := r.SendMSSQLInfo(); err != nil {
@@ -940,6 +957,11 @@ func (r *Reporter) AgentRegistration(testResult string, platform string) error {
 			if r.metricsSender != nil {
 				log.Printf("Starting periodic MSSQL metrics collection...")
 				r.metricsSender.StartPeriodicMetricsCollection(60 * time.Second) // Collect every minute
+			}
+		} else if platform == "mongo" {
+			// İlk MongoDB bilgilerini gönder
+			if err := r.SendMongoInfo(); err != nil {
+				log.Printf("MongoDB bilgileri gönderilemedi: %v", err)
 			}
 		}
 
