@@ -708,6 +708,8 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 		totalMembers := int64(len(members))
 		healthyMembers := int64(0)
 
+		log.Printf("DEBUG: MongoDB Replication - Found %d members in replica set", totalMembers)
+
 		metrics = append(metrics, Metric{
 			Name:        "mongodb.replication.members_total",
 			Value:       MetricValue{IntValue: &totalMembers},
@@ -717,15 +719,32 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 			Description: "Total replica set members",
 		})
 
-		for _, member := range members {
+		for i, member := range members {
+			log.Printf("DEBUG: MongoDB Replication - Processing member %d", i)
+
 			if memberMap, ok := member.(bson.M); ok {
+				log.Printf("DEBUG: MongoDB Replication - Member %d is valid bson.M", i)
+
+				// Log all fields in memberMap for debugging
+				log.Printf("DEBUG: MongoDB Replication - Member %d fields:", i)
+				for key, value := range memberMap {
+					log.Printf("DEBUG: MongoDB Replication - Member %d field[%s] = %v (type: %T)", i, key, value, value)
+				}
+
 				if health, ok := memberMap["health"].(float64); ok && health == 1.0 {
 					healthyMembers++
+					log.Printf("DEBUG: MongoDB Replication - Member %d is healthy", i)
+				} else {
+					log.Printf("DEBUG: MongoDB Replication - Member %d health check: health=%v, ok=%v", i, memberMap["health"], ok)
 				}
 
 				// Individual member lag metrics
 				if state, ok := memberMap["state"].(int32); ok {
+					log.Printf("DEBUG: MongoDB Replication - Member %d has state %d", i, state)
+
 					if name, ok := memberMap["name"].(string); ok {
+						log.Printf("DEBUG: MongoDB Replication - Member %d name: %s", i, name)
+
 						stateInt := int64(state)
 						memberTags := []MetricTag{
 							{Key: "host", Value: m.getHostname()},
@@ -785,10 +804,28 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 								log.Printf("DEBUG: MongoDB Replication - Could not get primary optime for lag calculation")
 							}
 						} else {
-							log.Printf("DEBUG: MongoDB Replication - No optimeDate found for member %s", name)
+							log.Printf("DEBUG: MongoDB Replication - No optimeDate found for member %s (available fields: %v)", name, func() []string {
+								var fields []string
+								for k := range memberMap {
+									fields = append(fields, k)
+								}
+								return fields
+							}())
 						}
+					} else {
+						log.Printf("DEBUG: MongoDB Replication - Member %d has no name field (available fields: %v)", i, func() []string {
+							var fields []string
+							for k := range memberMap {
+								fields = append(fields, k)
+							}
+							return fields
+						}())
 					}
+				} else {
+					log.Printf("DEBUG: MongoDB Replication - Member %d has no state field or wrong type (value: %v, type: %T)", i, memberMap["state"], memberMap["state"])
 				}
+			} else {
+				log.Printf("DEBUG: MongoDB Replication - Member %d is not a valid bson.M (type: %T)", i, member)
 			}
 		}
 
@@ -846,17 +883,49 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 
 // getPrimaryOptimeDate finds the primary member's optime date
 func (m *MongoDBMetricsCollector) getPrimaryOptimeDate(replSetStatus bson.M) (time.Time, bool) {
+	log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate called")
+
 	if members, ok := replSetStatus["members"].(bson.A); ok {
-		for _, member := range members {
+		log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found %d members", len(members))
+
+		for i, member := range members {
+			log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate checking member %d", i)
+
 			if memberMap, ok := member.(bson.M); ok {
-				if state, ok := memberMap["state"].(int32); ok && state == 1 { // PRIMARY
-					if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
-						return optimeDate, true
+				log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate member %d is valid bson.M", i)
+
+				if state, ok := memberMap["state"].(int32); ok {
+					log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate member %d has state %d", i, state)
+
+					if state == 1 { // PRIMARY
+						log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY member %d", i)
+
+						if optimeDate, ok := memberMap["optimeDate"].(time.Time); ok {
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate found PRIMARY optimeDate: %v", optimeDate)
+							return optimeDate, true
+						} else {
+							log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate PRIMARY member %d has no optimeDate (available fields: %v)", i, func() []string {
+								var fields []string
+								for k := range memberMap {
+									fields = append(fields, k)
+								}
+								return fields
+							}())
+						}
 					}
+				} else {
+					log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate member %d has no state field (type: %T, value: %v)", i, memberMap["state"], memberMap["state"])
 				}
+			} else {
+				log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate member %d is not bson.M (type: %T)", i, member)
 			}
 		}
+
+		log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate no PRIMARY member found with optimeDate")
+	} else {
+		log.Printf("DEBUG: MongoDB Replication - getPrimaryOptimeDate no members array found in replSetStatus")
 	}
+
 	return time.Time{}, false
 }
 
