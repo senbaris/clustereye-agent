@@ -805,7 +805,7 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 								if state == 1 { // PRIMARY - lag is 0
 									zeroLag := float64(0)
 									metrics = append(metrics, Metric{
-										Name:        "mongodb.replication.lag_ms",
+										Name:        "mongodb.replication.lag_ms_num",
 										Value:       MetricValue{DoubleValue: &zeroLag},
 										Tags:        memberTags,
 										Timestamp:   timestamp,
@@ -815,7 +815,7 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 									log.Printf("DEBUG: MongoDB Replication - Added PRIMARY lag metric (0ms) for %s", name)
 								} else if state == 2 { // SECONDARY - always add lag metric (positive value)
 									metrics = append(metrics, Metric{
-										Name:        "mongodb.replication.lag_ms",
+										Name:        "mongodb.replication.lag_ms_num",
 										Value:       MetricValue{DoubleValue: &lagMsFloat},
 										Tags:        memberTags,
 										Timestamp:   timestamp,
