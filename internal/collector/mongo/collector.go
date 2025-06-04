@@ -641,6 +641,9 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 		return "N/A", "N/A", 0
 	}
 
+	// DEBUG: df çıktısını log'la
+	logger.Debug("MongoDB GetDiskUsage - df -h çıktısı:\n%s", string(out))
+
 	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
@@ -650,6 +653,7 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 	var maxSize uint64 = 0
 	var selectedTotal, selectedFree string
 	var selectedUsage int
+	var selectedFilesystem, selectedMountPoint string
 
 	// Her satırı işle (başlık satırını atla)
 	for _, line := range lines[1:] {
@@ -661,6 +665,9 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 		filesystem := fields[0]
 		mountPoint := fields[5]
 
+		// DEBUG: Her filesystem için log
+		logger.Debug("MongoDB GetDiskUsage - Processing: %s -> %s", filesystem, mountPoint)
+
 		// Geçici dosya sistemlerini ve özel bölümleri atla
 		if strings.HasPrefix(filesystem, "tmpfs") ||
 			strings.HasPrefix(filesystem, "devtmpfs") ||
@@ -668,6 +675,7 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 			strings.Contains(mountPoint, "/boot") ||
 			strings.Contains(mountPoint, "/run") ||
 			strings.Contains(mountPoint, "/dev") {
+			logger.Debug("MongoDB GetDiskUsage - Skipping: %s (temporary/special filesystem)", filesystem)
 			continue
 		}
 
@@ -679,8 +687,12 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 		// Boyutu byte cinsine çevir
 		sizeInBytes, err := c.convertToBytes(size)
 		if err != nil {
+			logger.Debug("MongoDB GetDiskUsage - convertToBytes error for %s (%s): %v", filesystem, size, err)
 			continue
 		}
+
+		logger.Debug("MongoDB GetDiskUsage - %s: Size=%s (%d bytes), Free=%s, Usage=%s%%, MountPoint=%s",
+			filesystem, size, sizeInBytes, free, usage, mountPoint)
 
 		// En büyük diski veya root dizinini seç
 		if sizeInBytes > maxSize || mountPoint == "/" {
@@ -688,22 +700,26 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 			selectedTotal = size
 			selectedFree = free
 			selectedUsage, _ = strconv.Atoi(usage)
-			logger.Debug(" DiskUsage - Filesystem: %s, MountPoint: %s, Total: %s, Free: %s, Usage: %s%%",
-				filesystem, mountPoint, size, free, usage)
+			selectedFilesystem = filesystem
+			selectedMountPoint = mountPoint
+			logger.Debug("MongoDB GetDiskUsage - SELECTED: %s -> %s (Size: %s, Free: %s, Usage: %s%%)",
+				selectedFilesystem, selectedMountPoint, selectedTotal, selectedFree, usage)
 		}
 	}
 
 	if maxSize == 0 {
-		logger.Debug(" GetDiskUsage - Uygun disk bulunamadı, N/A döndürülüyor")
+		logger.Debug("MongoDB GetDiskUsage - Uygun disk bulunamadı, N/A döndürülüyor")
 		return "N/A", "N/A", 0
 	}
 
-	logger.Debug(" GetDiskUsage tamamlandı - Sonuç: Total=%s, Free=%s, Usage=%d%%", selectedTotal, selectedFree, selectedUsage)
+	logger.Debug("MongoDB GetDiskUsage - FINAL RESULT: Filesystem=%s, MountPoint=%s, Total=%s, Free=%s, Usage=%d%%",
+		selectedFilesystem, selectedMountPoint, selectedTotal, selectedFree, selectedUsage)
 	return selectedTotal, selectedFree, selectedUsage
 }
 
 // convertToBytes boyut string'ini (1K, 1M, 1G gibi) byte cinsine çevirir
 func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
+	originalSize := size
 	size = strings.TrimSpace(size)
 	if len(size) == 0 {
 		return 0, fmt.Errorf("empty size")
@@ -736,7 +752,13 @@ func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
 		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
 	}
 
-	return uint64(num * float64(multiplier)), nil
+	result := uint64(num * float64(multiplier))
+
+	// DEBUG: Parse işlemini log'la
+	logger.Debug("MongoDB convertToBytes: '%s' -> num=%.2f, unit='%s', multiplier=%d, result=%d",
+		originalSize, num, unit, multiplier, result)
+
+	return result, nil
 }
 
 // getTotalvCpu sistemdeki toplam vCPU sayısını döndürür
