@@ -642,7 +642,7 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 	}
 
 	// DEBUG: df çıktısını log'la
-	logger.Debug("MongoDB GetDiskUsage - df -h çıktısı:\n%s", string(out))
+	log.Printf("DEBUG: MongoDB GetDiskUsage - df -h çıktısı:\n%s", string(out))
 
 	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
@@ -691,7 +691,7 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 			continue
 		}
 
-		logger.Debug("MongoDB GetDiskUsage - %s: Size=%s (%d bytes), Free=%s, Usage=%s%%, MountPoint=%s",
+		log.Printf("DEBUG: MongoDB GetDiskUsage - %s: Size=%s (%d bytes), Free=%s, Usage=%s%%, MountPoint=%s",
 			filesystem, size, sizeInBytes, free, usage, mountPoint)
 
 		// En büyük diski veya root dizinini seç
@@ -755,7 +755,7 @@ func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
 	result := uint64(num * float64(multiplier))
 
 	// DEBUG: Parse işlemini log'la
-	logger.Debug("MongoDB convertToBytes: '%s' -> num=%.2f, unit='%s', multiplier=%d, result=%d",
+	log.Printf("DEBUG: MongoDB convertToBytes: '%s' -> num=%.2f, unit='%s', multiplier=%d, result=%d",
 		originalSize, num, unit, multiplier, result)
 
 	return result, nil
