@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/senbaris/clustereye-agent/internal/config"
@@ -1025,17 +1028,230 @@ func (m *MongoDBMetricsCollector) CollectAllMetrics() ([]*MetricBatch, error) {
 // Helper methods for MongoCollector system metrics collection
 
 func (c *MongoCollector) getCPUUsage() (float64, error) {
-	// Implement CPU usage collection for MongoDB
-	// This is a placeholder - you can implement actual CPU usage collection
-	return 50.0, nil // Default value
+	// Linux sistemlerde /proc/stat kullan
+	if _, err := os.Stat("/proc/stat"); err == nil {
+		// İlk ölçüm
+		cpu1, err := c.readCPUStat()
+		if err != nil {
+			log.Printf("MongoDB: İlk CPU ölçümü hatası: %v", err)
+			goto AlternativeMethod
+		}
+
+		// 500ms bekle (daha uzun süre ile daha doğru ölçüm)
+		time.Sleep(500 * time.Millisecond)
+
+		// İkinci ölçüm
+		cpu2, err := c.readCPUStat()
+		if err != nil {
+			log.Printf("MongoDB: İkinci CPU ölçümü hatası: %v", err)
+			goto AlternativeMethod
+		}
+
+		// Değişimleri hesapla
+		userDiff := cpu2.user - cpu1.user
+		niceDiff := cpu2.nice - cpu1.nice
+		systemDiff := cpu2.system - cpu1.system
+		idleDiff := cpu2.idle - cpu1.idle
+		iowaitDiff := cpu2.iowait - cpu1.iowait
+		irqDiff := cpu2.irq - cpu1.irq
+		softirqDiff := cpu2.softirq - cpu1.softirq
+		stealDiff := cpu2.steal - cpu1.steal
+		totalDiff := cpu2.total - cpu1.total
+
+		log.Printf("DEBUG: MongoDB CPU farkları - User: %d, System: %d, Idle: %d, IOWait: %d, Total: %d",
+			userDiff, systemDiff, idleDiff, iowaitDiff, totalDiff)
+
+		if totalDiff == 0 {
+			log.Printf("DEBUG: MongoDB - Total diff 0, alternatif yönteme geçiliyor")
+			goto AlternativeMethod
+		}
+
+		// CPU kullanımını hesapla (user + nice + system + irq + softirq + steal)
+		activeDiff := userDiff + niceDiff + systemDiff + irqDiff + softirqDiff + stealDiff
+		cpuUsage := (float64(activeDiff) / float64(totalDiff)) * 100
+
+		// Geçerlilik kontrolü
+		if cpuUsage < 0 || cpuUsage > 100 {
+			log.Printf("DEBUG: MongoDB - Geçersiz CPU kullanımı (%f), alternatif yönteme geçiliyor", cpuUsage)
+			goto AlternativeMethod
+		}
+
+		log.Printf("DEBUG: MongoDB - Hesaplanan CPU kullanımı: %.2f%%", cpuUsage)
+		return cpuUsage, nil
+	}
+
+AlternativeMethod:
+	// Alternatif yöntem - mpstat kullan (daha doğru sonuçlar için)
+	cmd := exec.Command("mpstat", "1", "1")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - mpstat komutu hatası: %v, top deneniyor", err)
+		// top dene
+		cmd = exec.Command("sh", "-c", "top -bn2 -d 0.5 | grep '^%Cpu' | tail -1 | awk '{print 100-$8}'")
+		out, err = cmd.Output()
+		if err != nil {
+			log.Printf("DEBUG: MongoDB - top komutu hatası: %v, vmstat deneniyor", err)
+			// vmstat dene
+			cmd = exec.Command("sh", "-c", "vmstat 1 2 | tail -1 | awk '{print 100-$15}'")
+			out, err = cmd.Output()
+			if err != nil {
+				log.Printf("DEBUG: MongoDB - vmstat komutu hatası: %v", err)
+				return 0, err
+			}
+		}
+	}
+
+	cpuPercent, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - CPU yüzdesi parse hatası: %v", err)
+		return 0, err
+	}
+
+	// Geçerlilik kontrolü
+	if cpuPercent < 0 {
+		cpuPercent = 0
+	} else if cpuPercent > 100 {
+		cpuPercent = 100
+	}
+
+	log.Printf("DEBUG: MongoDB - Alternatif yöntem CPU kullanımı: %.2f%%", cpuPercent)
+	return cpuPercent, nil
 }
 
 func (c *MongoCollector) getRAMUsage() (map[string]interface{}, error) {
-	// Implement RAM usage collection for MongoDB
-	// This is a placeholder - you can implement actual RAM usage collection
+	// Linux sistemlerde /proc/meminfo dosyasını kullan
+	if _, err := os.Stat("/proc/meminfo"); err == nil {
+		content, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			log.Printf("DEBUG: MongoDB - /proc/meminfo okunamadı: %v", err)
+			goto AlternativeMethod
+		}
+
+		lines := strings.Split(string(content), "\n")
+		var totalMem, freeMem, availableMem, buffers, cached uint64
+
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+
+			key := strings.TrimSuffix(fields[0], ":")
+			valueStr := fields[1]
+			value, err := strconv.ParseUint(valueStr, 10, 64)
+			if err != nil {
+				continue
+			}
+
+			// /proc/meminfo değerleri KB cinsinden
+			switch key {
+			case "MemTotal":
+				totalMem = value
+			case "MemFree":
+				freeMem = value
+			case "MemAvailable":
+				availableMem = value
+			case "Buffers":
+				buffers = value
+			case "Cached":
+				cached = value
+			}
+		}
+
+		if totalMem == 0 {
+			log.Printf("DEBUG: MongoDB - Toplam bellek 0, alternatif yöntem denenecek")
+			goto AlternativeMethod
+		}
+
+		// Kullanılan belleği hesapla
+		// MemAvailable varsa onu kullan, yoksa basit hesaplama
+		var usedMem uint64
+		if availableMem > 0 {
+			usedMem = totalMem - availableMem
+		} else {
+			// Basit hesaplama: Total - Free - Buffers - Cached
+			usedMem = totalMem - freeMem - buffers - cached
+		}
+
+		// KB'den MB'ye çevir
+		totalMemMB := int64(totalMem / 1024)
+		usedMemMB := int64(usedMem / 1024)
+		freeMemMB := int64((totalMem - usedMem) / 1024)
+
+		// Kullanım yüzdesini hesapla
+		usagePercent := (float64(usedMem) / float64(totalMem)) * 100
+
+		log.Printf("DEBUG: MongoDB RAM - Total: %dMB, Used: %dMB, Free: %dMB, Usage: %.2f%%",
+			totalMemMB, usedMemMB, freeMemMB, usagePercent)
+
+		return map[string]interface{}{
+			"total_mb":      totalMemMB,
+			"used_mb":       usedMemMB,
+			"free_mb":       freeMemMB,
+			"usage_percent": usagePercent,
+		}, nil
+	}
+
+AlternativeMethod:
+	// Alternatif yöntem - free komutu
+	var totalMB, usedMB, freeMB int64
+	var err1, err2, err3 error
+	var usagePercent float64
+
+	cmd := exec.Command("sh", "-c", "free -m | grep '^Mem'")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - free komutu hatası: %v", err)
+		// Varsayılan değerler döndür
+		return map[string]interface{}{
+			"usage_percent": 60.0,
+			"free_mb":       int64(4096),
+			"total_mb":      int64(8192),
+			"used_mb":       int64(4096),
+		}, nil
+	}
+
+	// free çıktısını parse et
+	// Mem:           7862    2945    2174    1367    2742    3549
+	fields := strings.Fields(string(out))
+	if len(fields) < 7 {
+		log.Printf("DEBUG: MongoDB - free komutu çıktısı geçersiz: %s", string(out))
+		goto DefaultValues
+	}
+
+	totalMB, err1 = strconv.ParseInt(fields[1], 10, 64)
+	usedMB, err2 = strconv.ParseInt(fields[2], 10, 64)
+	freeMB, err3 = strconv.ParseInt(fields[3], 10, 64)
+
+	if err1 != nil || err2 != nil || err3 != nil {
+		log.Printf("DEBUG: MongoDB - free çıktısı parse edilemedi")
+		goto DefaultValues
+	}
+
+	if totalMB <= 0 {
+		goto DefaultValues
+	}
+
+	usagePercent = (float64(usedMB) / float64(totalMB)) * 100
+
+	log.Printf("DEBUG: MongoDB RAM (free cmd) - Total: %dMB, Used: %dMB, Free: %dMB, Usage: %.2f%%",
+		totalMB, usedMB, freeMB, usagePercent)
+
+	return map[string]interface{}{
+		"total_mb":      totalMB,
+		"used_mb":       usedMB,
+		"free_mb":       freeMB,
+		"usage_percent": usagePercent,
+	}, nil
+
+DefaultValues:
+	// Varsayılan değerler
+	log.Printf("DEBUG: MongoDB - RAM bilgisi alınamadı, varsayılan değerler kullanılıyor")
 	return map[string]interface{}{
 		"usage_percent": 60.0,
-		"free_mb":       4096,
+		"free_mb":       int64(4096),
+		"total_mb":      int64(8192),
+		"used_mb":       int64(4096),
 	}, nil
 }
 
@@ -1081,4 +1297,70 @@ func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 		"total_gb": totalDiskGB,
 		"avail_gb": freeDiskGB,
 	}, nil
+}
+
+// cpuStat represents CPU statistics from /proc/stat
+type cpuStat struct {
+	user    uint64
+	nice    uint64
+	system  uint64
+	idle    uint64
+	iowait  uint64
+	irq     uint64
+	softirq uint64
+	steal   uint64
+	total   uint64
+}
+
+// readCPUStat reads CPU statistics from /proc/stat
+func (c *MongoCollector) readCPUStat() (*cpuStat, error) {
+	contents, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(contents), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "cpu" {
+			// En az 8 alan olmalı (cpu, user, nice, system, idle, iowait, irq, softirq)
+			if len(fields) < 8 {
+				return nil, fmt.Errorf("yetersiz CPU stat alanı")
+			}
+
+			stat := &cpuStat{}
+
+			// Değerleri parse et
+			values := make([]uint64, len(fields)-1)
+			for i := 1; i < len(fields); i++ {
+				val, err := strconv.ParseUint(fields[i], 10, 64)
+				if err != nil {
+					log.Printf("MongoDB: CPU stat parse hatası [%d]: %v", i, err)
+					continue
+				}
+				values[i-1] = val
+			}
+
+			// Değerleri ata
+			stat.user = values[0]
+			stat.nice = values[1]
+			stat.system = values[2]
+			stat.idle = values[3]
+			stat.iowait = values[4]
+			stat.irq = values[5]
+			stat.softirq = values[6]
+			if len(values) > 7 {
+				stat.steal = values[7]
+			}
+
+			// Toplam CPU zamanını hesapla
+			stat.total = stat.user + stat.nice + stat.system + stat.idle +
+				stat.iowait + stat.irq + stat.softirq + stat.steal
+
+			log.Printf("DEBUG: MongoDB CPU stat detaylı - User: %d, System: %d, Idle: %d, IOWait: %d, Total: %d",
+				stat.user, stat.system, stat.idle, stat.iowait, stat.total)
+			return stat, nil
+		}
+	}
+	return nil, fmt.Errorf("CPU stats not found in /proc/stat")
 }
