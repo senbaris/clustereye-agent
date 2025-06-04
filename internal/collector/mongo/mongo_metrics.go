@@ -1257,10 +1257,20 @@ DefaultValues:
 
 func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 	// Use the existing GetDiskUsage method which provides real disk information
-	freeDiskStr, usagePercent := c.GetDiskUsage()
+	totalDiskStr, freeDiskStr, usagePercent := c.GetDiskUsage()
 
-	if freeDiskStr == "N/A" {
+	if freeDiskStr == "N/A" || totalDiskStr == "N/A" {
 		log.Printf("DEBUG: MongoDB getDiskUsage - No disk info available")
+		return map[string]interface{}{
+			"total_gb": int64(0),
+			"avail_gb": int64(0),
+		}, nil
+	}
+
+	// Parse total disk size
+	totalDiskBytes, err := c.convertToBytes(totalDiskStr)
+	if err != nil {
+		log.Printf("DEBUG: MongoDB getDiskUsage - Failed to parse total disk: %v", err)
 		return map[string]interface{}{
 			"total_gb": int64(0),
 			"avail_gb": int64(0),
@@ -1277,21 +1287,12 @@ func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 		}, nil
 	}
 
-	// Calculate total disk from free disk and usage percentage
-	// If usage is 60% and free is 40%, then total = free / 0.4
-	freePercent := 100 - usagePercent
-	if freePercent <= 0 {
-		freePercent = 1 // Prevent division by zero
-	}
-
-	totalDiskBytes := (freeDiskBytes * 100) / uint64(freePercent)
-
 	// Convert to GB
-	freeDiskGB := int64(freeDiskBytes / (1024 * 1024 * 1024))
 	totalDiskGB := int64(totalDiskBytes / (1024 * 1024 * 1024))
+	freeDiskGB := int64(freeDiskBytes / (1024 * 1024 * 1024))
 
-	log.Printf("DEBUG: MongoDB getDiskUsage - Real disk info: Free=%s (%dGB), Usage=%d%%, Total=%dGB",
-		freeDiskStr, freeDiskGB, usagePercent, totalDiskGB)
+	log.Printf("DEBUG: MongoDB getDiskUsage - Real disk info: Total=%s (%dGB), Free=%s (%dGB), Usage=%d%%",
+		totalDiskStr, totalDiskGB, freeDiskStr, freeDiskGB, usagePercent)
 
 	return map[string]interface{}{
 		"total_gb": totalDiskGB,

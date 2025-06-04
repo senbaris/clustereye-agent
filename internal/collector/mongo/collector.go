@@ -630,25 +630,25 @@ func (c *MongoCollector) GetReplicationLagSec() int64 {
 	return int64(lag)
 }
 
-// GetDiskUsage disk kullanım bilgilerini döndürür
-func (c *MongoCollector) GetDiskUsage() (string, int) {
+// GetDiskUsage disk kullanım bilgilerini döndürür: (totalSize, freeSize, usagePercent)
+func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 
 	// df komutunu çalıştır
 	cmd := exec.Command("df", "-h")
 	out, err := cmd.Output()
 	if err != nil {
 		logger.Warning("Disk bilgileri alınamadı: %v", err)
-		return "N/A", 0
+		return "N/A", "N/A", 0
 	}
 
 	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
-		return "N/A", 0
+		return "N/A", "N/A", 0
 	}
 
 	var maxSize uint64 = 0
-	var selectedFree string
+	var selectedTotal, selectedFree string
 	var selectedUsage int
 
 	// Her satırı işle (başlık satırını atla)
@@ -685,20 +685,21 @@ func (c *MongoCollector) GetDiskUsage() (string, int) {
 		// En büyük diski veya root dizinini seç
 		if sizeInBytes > maxSize || mountPoint == "/" {
 			maxSize = sizeInBytes
+			selectedTotal = size
 			selectedFree = free
 			selectedUsage, _ = strconv.Atoi(usage)
-			logger.Debug(" DiskUsage - Filesystem: %s, MountPoint: %s, Size: %s, Free: %s, Usage: %s%%",
+			logger.Debug(" DiskUsage - Filesystem: %s, MountPoint: %s, Total: %s, Free: %s, Usage: %s%%",
 				filesystem, mountPoint, size, free, usage)
 		}
 	}
 
 	if maxSize == 0 {
 		logger.Debug(" GetDiskUsage - Uygun disk bulunamadı, N/A döndürülüyor")
-		return "N/A", 0
+		return "N/A", "N/A", 0
 	}
 
-	logger.Debug(" GetDiskUsage tamamlandı - Sonuç: Free=%s, Usage=%d%%", selectedFree, selectedUsage)
-	return selectedFree, selectedUsage
+	logger.Debug(" GetDiskUsage tamamlandı - Sonuç: Total=%s, Free=%s, Usage=%d%%", selectedTotal, selectedFree, selectedUsage)
+	return selectedTotal, selectedFree, selectedUsage
 }
 
 // convertToBytes boyut string'ini (1K, 1M, 1G gibi) byte cinsine çevirir
@@ -850,7 +851,7 @@ func (c *MongoCollector) GetMongoInfo() *MongoInfo {
 
 	hostname, _ := os.Hostname()
 	ip := c.getLocalIP()
-	freeDisk, usagePercent := c.GetDiskUsage()
+	_, freeDisk, usagePercent := c.GetDiskUsage()
 
 	// Get raw values first and normalize them
 	rawTotalvCpu := c.getTotalvCpu()
