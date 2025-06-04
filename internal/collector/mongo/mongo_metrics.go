@@ -1256,8 +1256,13 @@ DefaultValues:
 }
 
 func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
+	log.Printf("DEBUG: MongoDB mongo_metrics.go - getDiskUsage() called")
+
 	// Use the existing GetDiskUsage method which provides real disk information
 	totalDiskStr, freeDiskStr, usagePercent := c.GetDiskUsage()
+
+	log.Printf("DEBUG: MongoDB mongo_metrics.go - GetDiskUsage() returned: total=%s, free=%s, usage=%d%%",
+		totalDiskStr, freeDiskStr, usagePercent)
 
 	if freeDiskStr == "N/A" || totalDiskStr == "N/A" {
 		log.Printf("DEBUG: MongoDB getDiskUsage - No disk info available")
@@ -1291,7 +1296,7 @@ func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 	totalDiskGB := int64(totalDiskBytes / (1024 * 1024 * 1024))
 	freeDiskGB := int64(freeDiskBytes / (1024 * 1024 * 1024))
 
-	log.Printf("DEBUG: MongoDB getDiskUsage - Real disk info: Total=%s (%dGB), Free=%s (%dGB), Usage=%d%%",
+	log.Printf("DEBUG: MongoDB getDiskUsage - Final result: Total=%s (%dGB), Free=%s (%dGB), Usage=%d%%",
 		totalDiskStr, totalDiskGB, freeDiskStr, freeDiskGB, usagePercent)
 
 	return map[string]interface{}{
