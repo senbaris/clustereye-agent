@@ -641,9 +641,6 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 		return "N/A", "N/A", 0
 	}
 
-	// DEBUG: df çıktısını log'la
-	log.Printf("DEBUG: MongoDB GetDiskUsage - df -h çıktısı:\n%s", string(out))
-
 	// Çıktıyı satırlara böl
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
@@ -664,9 +661,6 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 
 		filesystem := fields[0]
 		mountPoint := fields[5]
-
-		// DEBUG: Her filesystem için log
-		logger.Debug("MongoDB GetDiskUsage - Processing: %s -> %s", filesystem, mountPoint)
 
 		// Geçici dosya sistemlerini ve özel bölümleri atla
 		if strings.HasPrefix(filesystem, "tmpfs") ||
@@ -690,9 +684,6 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 			logger.Debug("MongoDB GetDiskUsage - convertToBytes error for %s (%s): %v", filesystem, size, err)
 			continue
 		}
-
-		log.Printf("DEBUG: MongoDB GetDiskUsage - %s: Size=%s (%d bytes), Free=%s, Usage=%s%%, MountPoint=%s",
-			filesystem, size, sizeInBytes, free, usage, mountPoint)
 
 		// En büyük diski veya root dizinini seç
 		if sizeInBytes > maxSize || mountPoint == "/" {
