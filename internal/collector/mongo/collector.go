@@ -719,7 +719,7 @@ func (c *MongoCollector) GetDiskUsage() (string, string, int) {
 
 // convertToBytes boyut string'ini (1K, 1M, 1G gibi) byte cinsine çevirir
 func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
-	originalSize := size
+
 	size = strings.TrimSpace(size)
 	if len(size) == 0 {
 		return 0, fmt.Errorf("empty size")
@@ -753,10 +753,6 @@ func (c *MongoCollector) convertToBytes(size string) (uint64, error) {
 	}
 
 	result := uint64(num * float64(multiplier))
-
-	// DEBUG: Parse işlemini log'la
-	log.Printf("DEBUG: MongoDB convertToBytes: '%s' -> num=%.2f, unit='%s', multiplier=%d, result=%d",
-		originalSize, num, unit, multiplier, result)
 
 	return result, nil
 }

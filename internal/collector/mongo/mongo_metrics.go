@@ -366,6 +366,8 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	log.Printf("DEBUG: MongoDB collectConnectionMetrics - Starting connection metrics collection")
+
 	adminDB := client.Database("admin")
 	var serverStatus bson.M
 	err := adminDB.RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&serverStatus)
@@ -381,8 +383,11 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 
 	// Basic connection metrics
 	if connections, ok := serverStatus["connections"].(bson.M); ok {
+		log.Printf("DEBUG: MongoDB - Found connections in serverStatus: %+v", connections)
+
 		if current, ok := connections["current"].(int32); ok {
 			currentInt := int64(current)
+			log.Printf("DEBUG: MongoDB - Adding current connections metric: %d", currentInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.current",
 				Value:       MetricValue{IntValue: &currentInt},
@@ -391,10 +396,13 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 				Unit:        "count",
 				Description: "Current number of connections",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connections.current not found or wrong type: %T", connections["current"])
 		}
 
 		if available, ok := connections["available"].(int32); ok {
 			availableInt := int64(available)
+			log.Printf("DEBUG: MongoDB - Adding available connections metric: %d", availableInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.available",
 				Value:       MetricValue{IntValue: &availableInt},
@@ -409,6 +417,7 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 				totalCapacity := int64(current) + availableInt
 				if totalCapacity > 0 {
 					utilization := (float64(current) / float64(totalCapacity)) * 100
+					log.Printf("DEBUG: MongoDB - Adding pool utilization metric: %.2f%%", utilization)
 					*metrics = append(*metrics, Metric{
 						Name:        "mongodb.connections.pool_utilization",
 						Value:       MetricValue{DoubleValue: &utilization},
@@ -419,9 +428,12 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 					})
 				}
 			}
+		} else {
+			log.Printf("DEBUG: MongoDB - connections.available not found or wrong type: %T", connections["available"])
 		}
 
 		if totalCreated, ok := connections["totalCreated"].(int64); ok {
+			log.Printf("DEBUG: MongoDB - Adding total created connections metric: %d", totalCreated)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.total_created",
 				Value:       MetricValue{IntValue: &totalCreated},
@@ -430,35 +442,76 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 				Unit:        "count",
 				Description: "Total connections created",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connections.totalCreated not found or wrong type: %T", connections["totalCreated"])
 		}
 
 		// Connection pool efficiency metrics
 		if current, ok := connections["current"].(int32); ok {
-			if totalCreated, ok := connections["totalCreated"].(int64); ok {
-				if totalCreated > 0 {
-					connectionReuse := float64(current) / float64(totalCreated)
-					*metrics = append(*metrics, Metric{
-						Name:        "mongodb.connections.reuse_ratio",
-						Value:       MetricValue{DoubleValue: &connectionReuse},
-						Tags:        tags,
-						Timestamp:   timestamp,
-						Unit:        "ratio",
-						Description: "Connection reuse efficiency ratio",
-					})
+			log.Printf("DEBUG: MongoDB - Current connections for reuse ratio: %d", current)
+
+			// Try different types for totalCreated
+			var totalCreated int64 = 0
+			var totalCreatedFound bool = false
+
+			if tc, ok := connections["totalCreated"].(int64); ok {
+				totalCreated = tc
+				totalCreatedFound = true
+				log.Printf("DEBUG: MongoDB - totalCreated found as int64: %d", totalCreated)
+			} else if tc, ok := connections["totalCreated"].(int32); ok {
+				totalCreated = int64(tc)
+				totalCreatedFound = true
+				log.Printf("DEBUG: MongoDB - totalCreated found as int32: %d", totalCreated)
+			} else if tc, ok := connections["totalCreated"].(float64); ok {
+				totalCreated = int64(tc)
+				totalCreatedFound = true
+				log.Printf("DEBUG: MongoDB - totalCreated found as float64: %.0f", tc)
+			} else {
+				log.Printf("DEBUG: MongoDB - totalCreated not found or unsupported type: %T, value: %v", connections["totalCreated"], connections["totalCreated"])
+
+				// Debug all fields in connections
+				log.Printf("DEBUG: MongoDB - All connections fields:")
+				for key, value := range connections {
+					log.Printf("DEBUG: MongoDB - connections[%s] = %v (type: %T)", key, value, value)
 				}
 			}
+
+			if totalCreatedFound && totalCreated > 0 {
+				connectionReuse := float64(current) / float64(totalCreated)
+				log.Printf("DEBUG: MongoDB - Adding connection reuse ratio metric: %.4f (current=%d, totalCreated=%d)", connectionReuse, current, totalCreated)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.reuse_ratio",
+					Value:       MetricValue{DoubleValue: &connectionReuse},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "ratio",
+					Description: "Connection reuse efficiency ratio",
+				})
+			} else if totalCreatedFound {
+				log.Printf("DEBUG: MongoDB - totalCreated is 0, skipping reuse ratio calculation")
+			} else {
+				log.Printf("DEBUG: MongoDB - totalCreated not available for reuse ratio calculation")
+			}
+		} else {
+			log.Printf("DEBUG: MongoDB - current connections not available for reuse ratio calculation, type: %T", connections["current"])
 		}
+	} else {
+		log.Printf("DEBUG: MongoDB - connections object not found in serverStatus")
 	}
 
+	log.Printf("DEBUG: MongoDB - Calling collectConnectionPoolAdvancedMetrics")
 	// Collect advanced connection pool metrics
 	m.collectConnectionPoolAdvancedMetrics(client, metrics, timestamp, tags)
 
+	log.Printf("DEBUG: MongoDB - Calling collectConnectionWaitMetrics")
 	// Collect connection wait time metrics
 	m.collectConnectionWaitMetrics(client, metrics, timestamp, tags)
 }
 
 // collectConnectionPoolAdvancedMetrics collects advanced connection pool metrics
 func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	log.Printf("DEBUG: MongoDB collectConnectionPoolAdvancedMetrics - Starting advanced metrics collection")
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -474,11 +527,12 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 
 	// Check for connection pool specific metrics in serverStatus
 	if connectionPool, ok := serverStatus["connectionPool"].(bson.M); ok {
-		log.Printf("DEBUG: MongoDB - Found connectionPool in serverStatus")
+		log.Printf("DEBUG: MongoDB - Found connectionPool in serverStatus: %+v", connectionPool)
 
 		// Pool size metrics
 		if totalInUse, ok := connectionPool["totalInUse"].(int32); ok {
 			totalInUseInt := int64(totalInUse)
+			log.Printf("DEBUG: MongoDB - Adding pool_in_use metric: %d", totalInUseInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.pool_in_use",
 				Value:       MetricValue{IntValue: &totalInUseInt},
@@ -487,10 +541,13 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 				Unit:        "count",
 				Description: "Total connections currently in use",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connectionPool.totalInUse not found or wrong type: %T", connectionPool["totalInUse"])
 		}
 
 		if totalAvailable, ok := connectionPool["totalAvailable"].(int32); ok {
 			totalAvailableInt := int64(totalAvailable)
+			log.Printf("DEBUG: MongoDB - Adding pool_available metric: %d", totalAvailableInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.pool_available",
 				Value:       MetricValue{IntValue: &totalAvailableInt},
@@ -499,10 +556,13 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 				Unit:        "count",
 				Description: "Total available connections in pool",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connectionPool.totalAvailable not found or wrong type: %T", connectionPool["totalAvailable"])
 		}
 
 		if totalCreated, ok := connectionPool["totalCreated"].(int32); ok {
 			totalCreatedInt := int64(totalCreated)
+			log.Printf("DEBUG: MongoDB - Adding pool_total_created metric: %d", totalCreatedInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.pool_total_created",
 				Value:       MetricValue{IntValue: &totalCreatedInt},
@@ -511,10 +571,13 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 				Unit:        "count",
 				Description: "Total connections created by pool",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connectionPool.totalCreated not found or wrong type: %T", connectionPool["totalCreated"])
 		}
 
 		if totalRefreshing, ok := connectionPool["totalRefreshing"].(int32); ok {
 			totalRefreshingInt := int64(totalRefreshing)
+			log.Printf("DEBUG: MongoDB - Adding pool_refreshing metric: %d", totalRefreshingInt)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.pool_refreshing",
 				Value:       MetricValue{IntValue: &totalRefreshingInt},
@@ -523,10 +586,15 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 				Unit:        "count",
 				Description: "Connections currently being refreshed",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - connectionPool.totalRefreshing not found or wrong type: %T", connectionPool["totalRefreshing"])
 		}
+	} else {
+		log.Printf("DEBUG: MongoDB - connectionPool not found in serverStatus, trying currentOp analysis")
 	}
 
 	// Alternative: Get connection info from currentOp
+	log.Printf("DEBUG: MongoDB - Getting currentOp for connection analysis")
 	cursor, err := adminDB.RunCommandCursor(ctx, bson.D{{Key: "currentOp", Value: 1}})
 	if err != nil {
 		log.Printf("DEBUG: MongoDB - Failed to get currentOp for connection analysis: %v", err)
@@ -540,35 +608,70 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 			log.Printf("DEBUG: MongoDB - Failed to decode currentOp: %v", err)
 			return
 		}
+	} else {
+		log.Printf("DEBUG: MongoDB - No data returned from currentOp")
+		return
 	}
 
+	log.Printf("DEBUG: MongoDB - currentOp keys: %v", func() []string {
+		var keys []string
+		for k := range currentOp {
+			keys = append(keys, k)
+		}
+		return keys
+	}())
+
 	if inprog, ok := currentOp["inprog"].(bson.A); ok {
+		log.Printf("DEBUG: MongoDB - Found %d operations in currentOp.inprog", len(inprog))
+
 		var connectionsByClient = make(map[string]int64)
 		var longRunningConnections int64 = 0
 		var idleConnections int64 = 0
 
-		for _, op := range inprog {
+		for i, op := range inprog {
 			if opMap, ok := op.(bson.M); ok {
+				log.Printf("DEBUG: MongoDB - Processing operation %d, keys: %v", i, func() []string {
+					var keys []string
+					for k := range opMap {
+						keys = append(keys, k)
+					}
+					return keys
+				}())
+
 				// Analyze connection patterns
 				if client, ok := opMap["client"].(string); ok {
 					connectionsByClient[client]++
+					log.Printf("DEBUG: MongoDB - Found client: %s", client)
+				} else {
+					log.Printf("DEBUG: MongoDB - No client field in operation %d", i)
 				}
 
 				// Count long-running connections (>5 minutes)
 				if secs, ok := opMap["secs_running"].(int32); ok {
+					log.Printf("DEBUG: MongoDB - Operation %d has been running for %d seconds", i, secs)
 					if secs > 300 { // 5 minutes
 						longRunningConnections++
 					}
+				} else {
+					log.Printf("DEBUG: MongoDB - No secs_running field in operation %d", i)
 				}
 
 				// Count idle connections
-				if op, ok := opMap["op"].(string); ok && op == "none" {
-					idleConnections++
+				if op, ok := opMap["op"].(string); ok {
+					log.Printf("DEBUG: MongoDB - Operation %d type: %s", i, op)
+					if op == "none" {
+						idleConnections++
+					}
+				} else {
+					log.Printf("DEBUG: MongoDB - No op field in operation %d", i)
 				}
+			} else {
+				log.Printf("DEBUG: MongoDB - Operation %d is not a valid bson.M (type: %T)", i, op)
 			}
 		}
 
 		// Long-running connections metric
+		log.Printf("DEBUG: MongoDB - Adding long_running connections metric: %d", longRunningConnections)
 		*metrics = append(*metrics, Metric{
 			Name:        "mongodb.connections.long_running",
 			Value:       MetricValue{IntValue: &longRunningConnections},
@@ -579,6 +682,7 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 		})
 
 		// Idle connections metric
+		log.Printf("DEBUG: MongoDB - Adding idle connections metric: %d", idleConnections)
 		*metrics = append(*metrics, Metric{
 			Name:        "mongodb.connections.idle",
 			Value:       MetricValue{IntValue: &idleConnections},
@@ -590,6 +694,7 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 
 		// Unique clients count
 		uniqueClients := int64(len(connectionsByClient))
+		log.Printf("DEBUG: MongoDB - Adding unique_clients metric: %d", uniqueClients)
 		*metrics = append(*metrics, Metric{
 			Name:        "mongodb.connections.unique_clients",
 			Value:       MetricValue{IntValue: &uniqueClients},
@@ -603,6 +708,7 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 		if uniqueClients > 0 {
 			totalConnections := int64(len(inprog))
 			avgConnectionsPerClient := float64(totalConnections) / float64(uniqueClients)
+			log.Printf("DEBUG: MongoDB - Adding avg_per_client metric: %.2f", avgConnectionsPerClient)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.avg_per_client",
 				Value:       MetricValue{DoubleValue: &avgConnectionsPerClient},
@@ -611,8 +717,14 @@ func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *m
 				Unit:        "ratio",
 				Description: "Average connections per client",
 			})
+		} else {
+			log.Printf("DEBUG: MongoDB - No unique clients found, skipping avg_per_client metric")
 		}
+	} else {
+		log.Printf("DEBUG: MongoDB - inprog not found in currentOp or wrong type: %T", currentOp["inprog"])
 	}
+
+	log.Printf("DEBUG: MongoDB collectConnectionPoolAdvancedMetrics - Completed advanced metrics collection")
 }
 
 // collectConnectionWaitMetrics collects connection wait time and blocking metrics
@@ -1853,7 +1965,6 @@ func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 		totalDiskStr, freeDiskStr, usagePercent)
 
 	if freeDiskStr == "N/A" || totalDiskStr == "N/A" {
-		log.Printf("DEBUG: MongoDB getDiskUsage - No disk info available")
 		return map[string]interface{}{
 			"total_gb": int64(0),
 			"avail_gb": int64(0),
@@ -1883,9 +1994,6 @@ func (c *MongoCollector) getDiskUsage() (map[string]interface{}, error) {
 	// Convert to GB
 	totalDiskGB := int64(totalDiskBytes / (1024 * 1024 * 1024))
 	freeDiskGB := int64(freeDiskBytes / (1024 * 1024 * 1024))
-
-	log.Printf("DEBUG: MongoDB getDiskUsage - Final result: Total=%s (%dGB), Free=%s (%dGB), Usage=%d%%",
-		totalDiskStr, totalDiskGB, freeDiskStr, freeDiskGB, usagePercent)
 
 	return map[string]interface{}{
 		"total_gb": totalDiskGB,
