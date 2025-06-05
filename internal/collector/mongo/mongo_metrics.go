@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -373,14 +374,19 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 		return
 	}
 
-	// Connection metrics
+	tags := []MetricTag{
+		{Key: "host", Value: m.getHostname()},
+		{Key: "replica_set", Value: m.getReplicaSetName()},
+	}
+
+	// Basic connection metrics
 	if connections, ok := serverStatus["connections"].(bson.M); ok {
 		if current, ok := connections["current"].(int32); ok {
 			currentInt := int64(current)
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.current",
 				Value:       MetricValue{IntValue: &currentInt},
-				Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: m.getReplicaSetName()}},
+				Tags:        tags,
 				Timestamp:   timestamp,
 				Unit:        "count",
 				Description: "Current number of connections",
@@ -392,21 +398,364 @@ func (m *MongoDBMetricsCollector) collectConnectionMetrics(client *mongo.Client,
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.available",
 				Value:       MetricValue{IntValue: &availableInt},
-				Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: m.getReplicaSetName()}},
+				Tags:        tags,
 				Timestamp:   timestamp,
 				Unit:        "count",
 				Description: "Available connections",
 			})
+
+			// Calculate pool utilization percentage
+			if current, ok := connections["current"].(int32); ok {
+				totalCapacity := int64(current) + availableInt
+				if totalCapacity > 0 {
+					utilization := (float64(current) / float64(totalCapacity)) * 100
+					*metrics = append(*metrics, Metric{
+						Name:        "mongodb.connections.pool_utilization",
+						Value:       MetricValue{DoubleValue: &utilization},
+						Tags:        tags,
+						Timestamp:   timestamp,
+						Unit:        "percent",
+						Description: "Connection pool utilization percentage",
+					})
+				}
+			}
 		}
 
 		if totalCreated, ok := connections["totalCreated"].(int64); ok {
 			*metrics = append(*metrics, Metric{
 				Name:        "mongodb.connections.total_created",
 				Value:       MetricValue{IntValue: &totalCreated},
-				Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: m.getReplicaSetName()}},
+				Tags:        tags,
 				Timestamp:   timestamp,
 				Unit:        "count",
 				Description: "Total connections created",
+			})
+		}
+
+		// Connection pool efficiency metrics
+		if current, ok := connections["current"].(int32); ok {
+			if totalCreated, ok := connections["totalCreated"].(int64); ok {
+				if totalCreated > 0 {
+					connectionReuse := float64(current) / float64(totalCreated)
+					*metrics = append(*metrics, Metric{
+						Name:        "mongodb.connections.reuse_ratio",
+						Value:       MetricValue{DoubleValue: &connectionReuse},
+						Tags:        tags,
+						Timestamp:   timestamp,
+						Unit:        "ratio",
+						Description: "Connection reuse efficiency ratio",
+					})
+				}
+			}
+		}
+	}
+
+	// Collect advanced connection pool metrics
+	m.collectConnectionPoolAdvancedMetrics(client, metrics, timestamp, tags)
+
+	// Collect connection wait time metrics
+	m.collectConnectionWaitMetrics(client, metrics, timestamp, tags)
+}
+
+// collectConnectionPoolAdvancedMetrics collects advanced connection pool metrics
+func (m *MongoDBMetricsCollector) collectConnectionPoolAdvancedMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	adminDB := client.Database("admin")
+
+	// Get connection pool stats from serverStatus
+	var serverStatus bson.M
+	err := adminDB.RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&serverStatus)
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - Failed to get serverStatus for pool metrics: %v", err)
+		return
+	}
+
+	// Check for connection pool specific metrics in serverStatus
+	if connectionPool, ok := serverStatus["connectionPool"].(bson.M); ok {
+		log.Printf("DEBUG: MongoDB - Found connectionPool in serverStatus")
+
+		// Pool size metrics
+		if totalInUse, ok := connectionPool["totalInUse"].(int32); ok {
+			totalInUseInt := int64(totalInUse)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.pool_in_use",
+				Value:       MetricValue{IntValue: &totalInUseInt},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Total connections currently in use",
+			})
+		}
+
+		if totalAvailable, ok := connectionPool["totalAvailable"].(int32); ok {
+			totalAvailableInt := int64(totalAvailable)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.pool_available",
+				Value:       MetricValue{IntValue: &totalAvailableInt},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Total available connections in pool",
+			})
+		}
+
+		if totalCreated, ok := connectionPool["totalCreated"].(int32); ok {
+			totalCreatedInt := int64(totalCreated)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.pool_total_created",
+				Value:       MetricValue{IntValue: &totalCreatedInt},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Total connections created by pool",
+			})
+		}
+
+		if totalRefreshing, ok := connectionPool["totalRefreshing"].(int32); ok {
+			totalRefreshingInt := int64(totalRefreshing)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.pool_refreshing",
+				Value:       MetricValue{IntValue: &totalRefreshingInt},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Connections currently being refreshed",
+			})
+		}
+	}
+
+	// Alternative: Get connection info from currentOp
+	cursor, err := adminDB.RunCommandCursor(ctx, bson.D{{Key: "currentOp", Value: 1}})
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - Failed to get currentOp for connection analysis: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var currentOp bson.M
+	if cursor.Next(ctx) {
+		if err := cursor.Decode(&currentOp); err != nil {
+			log.Printf("DEBUG: MongoDB - Failed to decode currentOp: %v", err)
+			return
+		}
+	}
+
+	if inprog, ok := currentOp["inprog"].(bson.A); ok {
+		var connectionsByClient = make(map[string]int64)
+		var longRunningConnections int64 = 0
+		var idleConnections int64 = 0
+
+		for _, op := range inprog {
+			if opMap, ok := op.(bson.M); ok {
+				// Analyze connection patterns
+				if client, ok := opMap["client"].(string); ok {
+					connectionsByClient[client]++
+				}
+
+				// Count long-running connections (>5 minutes)
+				if secs, ok := opMap["secs_running"].(int32); ok {
+					if secs > 300 { // 5 minutes
+						longRunningConnections++
+					}
+				}
+
+				// Count idle connections
+				if op, ok := opMap["op"].(string); ok && op == "none" {
+					idleConnections++
+				}
+			}
+		}
+
+		// Long-running connections metric
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.connections.long_running",
+			Value:       MetricValue{IntValue: &longRunningConnections},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Connections running for more than 5 minutes",
+		})
+
+		// Idle connections metric
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.connections.idle",
+			Value:       MetricValue{IntValue: &idleConnections},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Idle connections",
+		})
+
+		// Unique clients count
+		uniqueClients := int64(len(connectionsByClient))
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.connections.unique_clients",
+			Value:       MetricValue{IntValue: &uniqueClients},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Number of unique client connections",
+		})
+
+		// Average connections per client
+		if uniqueClients > 0 {
+			totalConnections := int64(len(inprog))
+			avgConnectionsPerClient := float64(totalConnections) / float64(uniqueClients)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.avg_per_client",
+				Value:       MetricValue{DoubleValue: &avgConnectionsPerClient},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "ratio",
+				Description: "Average connections per client",
+			})
+		}
+	}
+}
+
+// collectConnectionWaitMetrics collects connection wait time and blocking metrics
+func (m *MongoDBMetricsCollector) collectConnectionWaitMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	adminDB := client.Database("admin")
+
+	// Get global lock wait metrics as a proxy for connection contention
+	var serverStatus bson.M
+	err := adminDB.RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&serverStatus)
+	if err != nil {
+		return
+	}
+
+	if globalLock, ok := serverStatus["globalLock"].(bson.M); ok {
+		if currentQueue, ok := globalLock["currentQueue"].(bson.M); ok {
+			// Total waiting connections
+			if total, ok := currentQueue["total"].(int32); ok {
+				totalInt := int64(total)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.waiting_total",
+					Value:       MetricValue{IntValue: &totalInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Total connections waiting for global lock",
+				})
+			}
+
+			if readers, ok := currentQueue["readers"].(int32); ok {
+				readersInt := int64(readers)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.waiting_readers",
+					Value:       MetricValue{IntValue: &readersInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Reader connections waiting for lock",
+				})
+			}
+
+			if writers, ok := currentQueue["writers"].(int32); ok {
+				writersInt := int64(writers)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.waiting_writers",
+					Value:       MetricValue{IntValue: &writersInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Writer connections waiting for lock",
+				})
+			}
+		}
+
+		// Active clients metrics
+		if activeClients, ok := globalLock["activeClients"].(bson.M); ok {
+			if total, ok := activeClients["total"].(int32); ok {
+				totalInt := int64(total)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.active_total",
+					Value:       MetricValue{IntValue: &totalInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Total active client connections",
+				})
+			}
+
+			if readers, ok := activeClients["readers"].(int32); ok {
+				readersInt := int64(readers)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.active_readers",
+					Value:       MetricValue{IntValue: &readersInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Active reader connections",
+				})
+			}
+
+			if writers, ok := activeClients["writers"].(int32); ok {
+				writersInt := int64(writers)
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.connections.active_writers",
+					Value:       MetricValue{IntValue: &writersInt},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Active writer connections",
+				})
+			}
+		}
+	}
+
+	// Connection timeout and error metrics from serverStatus
+	if asserts, ok := serverStatus["asserts"].(bson.M); ok {
+		if warning, ok := asserts["warning"].(int32); ok {
+			warningInt := int64(warning)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.warnings",
+				Value:       MetricValue{IntValue: &warningInt},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Connection-related warnings",
+			})
+		}
+	}
+
+	// Network metrics that affect connection performance
+	if network, ok := serverStatus["network"].(bson.M); ok {
+		if bytesIn, ok := network["bytesIn"].(int64); ok {
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.bytes_in",
+				Value:       MetricValue{IntValue: &bytesIn},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "bytes",
+				Description: "Total bytes received from connections",
+			})
+		}
+
+		if bytesOut, ok := network["bytesOut"].(int64); ok {
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.bytes_out",
+				Value:       MetricValue{IntValue: &bytesOut},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "bytes",
+				Description: "Total bytes sent to connections",
+			})
+		}
+
+		if numRequests, ok := network["numRequests"].(int64); ok {
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.connections.total_requests",
+				Value:       MetricValue{IntValue: &numRequests},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "count",
+				Description: "Total network requests received",
 			})
 		}
 	}
@@ -592,6 +941,9 @@ func (m *MongoDBMetricsCollector) collectPerformanceMetrics(client *mongo.Client
 		return
 	}
 
+	// Collect query performance metrics
+	m.collectQueryPerformanceMetrics(client, metrics, timestamp, serverStatus)
+
 	// WiredTiger cache metrics (if using WiredTiger)
 	if wiredTiger, ok := serverStatus["wiredTiger"].(bson.M); ok {
 		if cache, ok := wiredTiger["cache"].(bson.M); ok {
@@ -665,6 +1017,242 @@ func (m *MongoDBMetricsCollector) collectPerformanceMetrics(client *mongo.Client
 			})
 		}
 	}
+}
+
+// collectQueryPerformanceMetrics collects detailed query performance metrics
+func (m *MongoDBMetricsCollector) collectQueryPerformanceMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, serverStatus bson.M) {
+	tags := []MetricTag{
+		{Key: "host", Value: m.getHostname()},
+		{Key: "replica_set", Value: m.getReplicaSetName()},
+	}
+
+	// 1. Queries Per Second (QPS) from opcounters
+	if opcounters, ok := serverStatus["opcounters"].(bson.M); ok {
+		var totalOps int64
+		for _, opType := range []string{"insert", "query", "update", "delete", "getmore", "command"} {
+			if count, ok := opcounters[opType].(int64); ok {
+				totalOps += count
+			}
+		}
+
+		// Calculate QPS (approximate - based on total operations since startup)
+		if uptime, ok := serverStatus["uptime"].(int32); ok && uptime > 0 {
+			qps := float64(totalOps) / float64(uptime)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.performance.queries_per_sec",
+				Value:       MetricValue{DoubleValue: &qps},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "operations_per_second",
+				Description: "Queries per second (approximate)",
+			})
+		}
+
+		// 2. Read/Write Ratio
+		readOps := int64(0)
+		writeOps := int64(0)
+
+		if query, ok := opcounters["query"].(int64); ok {
+			readOps += query
+		}
+		if getmore, ok := opcounters["getmore"].(int64); ok {
+			readOps += getmore
+		}
+
+		if insert, ok := opcounters["insert"].(int64); ok {
+			writeOps += insert
+		}
+		if update, ok := opcounters["update"].(int64); ok {
+			writeOps += update
+		}
+		if delete, ok := opcounters["delete"].(int64); ok {
+			writeOps += delete
+		}
+
+		if writeOps > 0 {
+			readWriteRatio := float64(readOps) / float64(writeOps)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.performance.read_write_ratio",
+				Value:       MetricValue{DoubleValue: &readWriteRatio},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "ratio",
+				Description: "Read to write operations ratio",
+			})
+		}
+	}
+
+	// 3. Current Operations Analysis (for real-time query performance)
+	m.collectCurrentOperationsMetrics(client, metrics, timestamp, tags)
+
+	// 4. Profiler Data Analysis (if profiler is enabled)
+	m.collectProfilerMetrics(client, metrics, timestamp, tags)
+}
+
+// collectCurrentOperationsMetrics analyzes currently running operations
+func (m *MongoDBMetricsCollector) collectCurrentOperationsMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	adminDB := client.Database("admin")
+
+	// Get current operations
+	cursor, err := adminDB.RunCommandCursor(ctx, bson.D{{Key: "currentOp", Value: 1}})
+	if err != nil {
+		log.Printf("DEBUG: MongoDB - Failed to get current operations: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var currentOp bson.M
+	if cursor.Next(ctx) {
+		if err := cursor.Decode(&currentOp); err != nil {
+			log.Printf("DEBUG: MongoDB - Failed to decode current operations: %v", err)
+			return
+		}
+	}
+
+	if inprog, ok := currentOp["inprog"].(bson.A); ok {
+		var slowQueryCount int64 = 0
+		var totalQueryTime float64 = 0
+		var queryCount int64 = 0
+		var queryTimes []float64
+
+		for _, op := range inprog {
+			if opMap, ok := op.(bson.M); ok {
+				// Check if it's a query operation
+				if opType, exists := opMap["op"]; exists {
+					if opTypeStr, ok := opType.(string); ok && (opTypeStr == "query" || opTypeStr == "getmore" || opTypeStr == "command") {
+						// Get operation duration
+						if secs, ok := opMap["secs_running"].(int32); ok {
+							duration := float64(secs) * 1000 // Convert to milliseconds
+							queryTimes = append(queryTimes, duration)
+							totalQueryTime += duration
+							queryCount++
+
+							// Count slow queries (>100ms)
+							if duration > 100 {
+								slowQueryCount++
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 5. Slow Queries Count
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.performance.slow_queries_count",
+			Value:       MetricValue{IntValue: &slowQueryCount},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Number of currently running slow queries (>100ms)",
+		})
+
+		// 6. Average Query Time
+		if queryCount > 0 {
+			avgQueryTime := totalQueryTime / float64(queryCount)
+			*metrics = append(*metrics, Metric{
+				Name:        "mongodb.performance.avg_query_time_ms",
+				Value:       MetricValue{DoubleValue: &avgQueryTime},
+				Tags:        tags,
+				Timestamp:   timestamp,
+				Unit:        "milliseconds",
+				Description: "Average query execution time",
+			})
+
+			// 7. Query Time Percentiles
+			if len(queryTimes) > 0 {
+				// Sort query times for percentile calculation
+				sort.Float64s(queryTimes)
+
+				// 95th percentile
+				p95Index := int(float64(len(queryTimes)) * 0.95)
+				if p95Index >= len(queryTimes) {
+					p95Index = len(queryTimes) - 1
+				}
+				p95Value := queryTimes[p95Index]
+
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.performance.query_time_p95_ms",
+					Value:       MetricValue{DoubleValue: &p95Value},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "milliseconds",
+					Description: "95th percentile query execution time",
+				})
+
+				// 99th percentile
+				p99Index := int(float64(len(queryTimes)) * 0.99)
+				if p99Index >= len(queryTimes) {
+					p99Index = len(queryTimes) - 1
+				}
+				p99Value := queryTimes[p99Index]
+
+				*metrics = append(*metrics, Metric{
+					Name:        "mongodb.performance.query_time_p99_ms",
+					Value:       MetricValue{DoubleValue: &p99Value},
+					Tags:        tags,
+					Timestamp:   timestamp,
+					Unit:        "milliseconds",
+					Description: "99th percentile query execution time",
+				})
+			}
+		}
+
+		// 8. Active Queries Count
+		activeQueries := int64(queryCount)
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.performance.active_queries_count",
+			Value:       MetricValue{IntValue: &activeQueries},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Number of currently active queries",
+		})
+	}
+}
+
+// collectProfilerMetrics collects metrics from MongoDB profiler (if enabled)
+func (m *MongoDBMetricsCollector) collectProfilerMetrics(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	// This will analyze profiler data if profiling is enabled
+	// For now, we'll implement a basic version that checks if profiler is enabled
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Check each database for profiler status
+	databases, err := client.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return
+	}
+
+	var profiledDatabases int64 = 0
+	for _, dbName := range databases {
+		if dbName == "admin" || dbName == "local" || dbName == "config" {
+			continue
+		}
+
+		db := client.Database(dbName)
+		var profileStatus bson.M
+		err := db.RunCommand(ctx, bson.D{{Key: "profile", Value: -1}}).Decode(&profileStatus)
+		if err == nil {
+			if level, ok := profileStatus["was"].(int32); ok && level > 0 {
+				profiledDatabases++
+			}
+		}
+	}
+
+	// Profiler enabled databases count
+	*metrics = append(*metrics, Metric{
+		Name:        "mongodb.performance.profiler_enabled_dbs",
+		Value:       MetricValue{IntValue: &profiledDatabases},
+		Tags:        tags,
+		Timestamp:   timestamp,
+		Unit:        "count",
+		Description: "Number of databases with profiler enabled",
+	})
 }
 
 // CollectReplicationMetrics collects replication-specific metrics
