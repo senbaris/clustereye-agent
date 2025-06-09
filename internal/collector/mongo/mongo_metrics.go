@@ -1568,34 +1568,207 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 		})
 	}
 
-	// Oplog metrics
+	// Oplog metrics - explicitly use local database
 	var oplogStats bson.M
 	localDB := client.Database("local")
+
+	// Verify local database connection and run collStats on oplog.rs
+	log.Printf("DEBUG: MongoDB - Collecting oplog stats from local database")
 	err = localDB.RunCommand(ctx, bson.D{{Key: "collStats", Value: "oplog.rs"}}).Decode(&oplogStats)
-	if err == nil {
-		if size, ok := oplogStats["size"].(int64); ok {
-			oplogSizeMB := size / (1024 * 1024)
-			metrics = append(metrics, Metric{
-				Name:        "mongodb.replication.oplog_size_mb",
-				Value:       MetricValue{IntValue: &oplogSizeMB},
-				Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
-				Timestamp:   timestamp,
-				Unit:        "megabytes",
-				Description: "Oplog size in MB",
-			})
+	if err != nil {
+		log.Printf("ERROR: MongoDB - Failed to get oplog stats: %v", err)
+	} else {
+		log.Printf("DEBUG: MongoDB - Oplog stats collected successfully")
+
+		// Log all available oplog stats fields for debugging
+		log.Printf("DEBUG: MongoDB - Oplog stats keys: %v", func() []string {
+			var keys []string
+			for k := range oplogStats {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
+
+		// Check if size field exists and log its type and value
+		if sizeVal, exists := oplogStats["size"]; exists {
+			log.Printf("DEBUG: MongoDB - Oplog size field found: type=%T, value=%v", sizeVal, sizeVal)
+
+			// Try different numeric types for size
+			var oplogSizeMB int64
+			var sizeProcessed bool
+
+			if size, ok := sizeVal.(int64); ok {
+				oplogSizeMB = size / (1024 * 1024)
+				sizeProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog size (int64): %d bytes = %d MB", size, oplogSizeMB)
+			} else if size, ok := sizeVal.(int32); ok {
+				oplogSizeMB = int64(size) / (1024 * 1024)
+				sizeProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog size (int32): %d bytes = %d MB", size, oplogSizeMB)
+			} else if size, ok := sizeVal.(float64); ok {
+				oplogSizeMB = int64(size) / (1024 * 1024)
+				sizeProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog size (float64): %.0f bytes = %d MB", size, oplogSizeMB)
+			}
+
+			if sizeProcessed {
+				metrics = append(metrics, Metric{
+					Name:        "mongodb.replication.oplog_size_mb",
+					Value:       MetricValue{IntValue: &oplogSizeMB},
+					Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+					Timestamp:   timestamp,
+					Unit:        "megabytes",
+					Description: "Oplog size in MB",
+				})
+				log.Printf("DEBUG: MongoDB - Added oplog_size_mb metric: %d MB", oplogSizeMB)
+			} else {
+				log.Printf("ERROR: MongoDB - Oplog size field has unsupported type: %T", sizeVal)
+			}
+		} else {
+			log.Printf("ERROR: MongoDB - Oplog size field not found in stats")
 		}
 
-		if storageSize, ok := oplogStats["storageSize"].(int64); ok {
-			oplogStorageMB := storageSize / (1024 * 1024)
-			metrics = append(metrics, Metric{
-				Name:        "mongodb.replication.oplog_storage_mb",
-				Value:       MetricValue{IntValue: &oplogStorageMB},
-				Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
-				Timestamp:   timestamp,
-				Unit:        "megabytes",
-				Description: "Oplog storage size in MB",
-			})
+		// Check if storageSize field exists and log its type and value
+		if storageSizeVal, exists := oplogStats["storageSize"]; exists {
+			log.Printf("DEBUG: MongoDB - Oplog storageSize field found: type=%T, value=%v", storageSizeVal, storageSizeVal)
+
+			// Try different numeric types for storageSize
+			var oplogStorageMB int64
+			var storageProcessed bool
+
+			if storageSize, ok := storageSizeVal.(int64); ok {
+				oplogStorageMB = storageSize / (1024 * 1024)
+				storageProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog storageSize (int64): %d bytes = %d MB", storageSize, oplogStorageMB)
+			} else if storageSize, ok := storageSizeVal.(int32); ok {
+				oplogStorageMB = int64(storageSize) / (1024 * 1024)
+				storageProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog storageSize (int32): %d bytes = %d MB", storageSize, oplogStorageMB)
+			} else if storageSize, ok := storageSizeVal.(float64); ok {
+				oplogStorageMB = int64(storageSize) / (1024 * 1024)
+				storageProcessed = true
+				log.Printf("DEBUG: MongoDB - Oplog storageSize (float64): %.0f bytes = %d MB", storageSize, oplogStorageMB)
+			}
+
+			if storageProcessed {
+				metrics = append(metrics, Metric{
+					Name:        "mongodb.replication.oplog_storage_mb",
+					Value:       MetricValue{IntValue: &oplogStorageMB},
+					Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+					Timestamp:   timestamp,
+					Unit:        "megabytes",
+					Description: "Oplog storage size in MB",
+				})
+				log.Printf("DEBUG: MongoDB - Added oplog_storage_mb metric: %d MB", oplogStorageMB)
+			} else {
+				log.Printf("ERROR: MongoDB - Oplog storageSize field has unsupported type: %T", storageSizeVal)
+			}
+		} else {
+			log.Printf("ERROR: MongoDB - Oplog storageSize field not found in stats")
 		}
+
+		// Add additional oplog metrics from your output
+		if count, exists := oplogStats["count"]; exists {
+			if countVal, ok := count.(int64); ok {
+				metrics = append(metrics, Metric{
+					Name:        "mongodb.replication.oplog_count",
+					Value:       MetricValue{IntValue: &countVal},
+					Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Number of documents in oplog",
+				})
+				log.Printf("DEBUG: MongoDB - Added oplog_count metric: %d", countVal)
+			} else if countVal, ok := count.(int32); ok {
+				countInt64 := int64(countVal)
+				metrics = append(metrics, Metric{
+					Name:        "mongodb.replication.oplog_count",
+					Value:       MetricValue{IntValue: &countInt64},
+					Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+					Timestamp:   timestamp,
+					Unit:        "count",
+					Description: "Number of documents in oplog",
+				})
+				log.Printf("DEBUG: MongoDB - Added oplog_count metric: %d", countInt64)
+			}
+		}
+
+		// Add maxSize metric (capped collection max size)
+		if maxSize, exists := oplogStats["maxSize"]; exists {
+			log.Printf("DEBUG: MongoDB - Oplog maxSize field found: type=%T, value=%v", maxSize, maxSize)
+
+			var maxSizeMB int64
+			var maxSizeProcessed bool
+
+			if size, ok := maxSize.(int64); ok {
+				maxSizeMB = size / (1024 * 1024)
+				maxSizeProcessed = true
+			} else if size, ok := maxSize.(int32); ok {
+				maxSizeMB = int64(size) / (1024 * 1024)
+				maxSizeProcessed = true
+			} else if size, ok := maxSize.(float64); ok {
+				maxSizeMB = int64(size) / (1024 * 1024)
+				maxSizeProcessed = true
+			}
+
+			if maxSizeProcessed {
+				metrics = append(metrics, Metric{
+					Name:        "mongodb.replication.oplog_max_size_mb",
+					Value:       MetricValue{IntValue: &maxSizeMB},
+					Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+					Timestamp:   timestamp,
+					Unit:        "megabytes",
+					Description: "Oplog maximum size in MB",
+				})
+				log.Printf("DEBUG: MongoDB - Added oplog_max_size_mb metric: %d MB", maxSizeMB)
+			}
+		}
+
+		// Calculate oplog utilization percentage
+		if sizeVal, sizeExists := oplogStats["size"]; sizeExists {
+			if maxSizeVal, maxExists := oplogStats["maxSize"]; maxExists {
+				var size, maxSize int64
+				var utilizationCalculated bool
+
+				// Get size value
+				if s, ok := sizeVal.(int64); ok {
+					size = s
+				} else if s, ok := sizeVal.(int32); ok {
+					size = int64(s)
+				} else if s, ok := sizeVal.(float64); ok {
+					size = int64(s)
+				}
+
+				// Get maxSize value
+				if ms, ok := maxSizeVal.(int64); ok {
+					maxSize = ms
+				} else if ms, ok := maxSizeVal.(int32); ok {
+					maxSize = int64(ms)
+				} else if ms, ok := maxSizeVal.(float64); ok {
+					maxSize = int64(ms)
+				}
+
+				if size > 0 && maxSize > 0 {
+					utilization := (float64(size) / float64(maxSize)) * 100.0
+					metrics = append(metrics, Metric{
+						Name:        "mongodb.replication.oplog_utilization_percent",
+						Value:       MetricValue{DoubleValue: &utilization},
+						Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}},
+						Timestamp:   timestamp,
+						Unit:        "percent",
+						Description: "Oplog utilization percentage",
+					})
+					log.Printf("DEBUG: MongoDB - Added oplog_utilization_percent metric: %.2f%%", utilization)
+					utilizationCalculated = true
+				}
+
+				if !utilizationCalculated {
+					log.Printf("ERROR: MongoDB - Could not calculate oplog utilization: size=%d, maxSize=%d", size, maxSize)
+				}
+			}
+		}
+
+		log.Printf("DEBUG: MongoDB - Total oplog metrics added: checking final metrics count")
 	}
 
 	return &MetricBatch{
