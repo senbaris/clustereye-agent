@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // MongoDBMetricsCollector collects time-series metrics for MongoDB
@@ -1768,6 +1769,10 @@ func (m *MongoDBMetricsCollector) CollectReplicationMetrics() (*MetricBatch, err
 			}
 		}
 
+		// Get oplog time window information (critical for replication safety)
+		log.Printf("DEBUG: MongoDB - Collecting oplog time window information")
+		m.collectOplogTimeWindow(client, &metrics, timestamp, []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "replica_set", Value: replicaSetName}})
+
 		log.Printf("DEBUG: MongoDB - Total oplog metrics added: checking final metrics count")
 	}
 
@@ -1836,6 +1841,154 @@ func (m *MongoDBMetricsCollector) getPrimaryOptimeDate(replSetStatus bson.M) (ti
 	}
 
 	return time.Time{}, false
+}
+
+// collectOplogTimeWindow collects oplog time window information (similar to rs.printReplicationInfo())
+func (m *MongoDBMetricsCollector) collectOplogTimeWindow(client *mongo.Client, metrics *[]Metric, timestamp int64, tags []MetricTag) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Access local.oplog.rs collection
+	localDB := client.Database("local")
+	oplogCollection := localDB.Collection("oplog.rs")
+
+	log.Printf("DEBUG: MongoDB - Getting oplog first and last entries for time window calculation")
+
+	// Get the first (oldest) entry in oplog
+	var firstEntry bson.M
+	firstCursor, err := oplogCollection.Find(ctx, bson.D{}, options.Find().SetSort(bson.D{{Key: "$natural", Value: 1}}).SetLimit(1))
+	if err != nil {
+		log.Printf("ERROR: MongoDB - Failed to get first oplog entry: %v", err)
+		return
+	}
+	defer firstCursor.Close(ctx)
+
+	var firstTime time.Time
+	var firstFound bool
+	if firstCursor.Next(ctx) {
+		if err := firstCursor.Decode(&firstEntry); err != nil {
+			log.Printf("ERROR: MongoDB - Failed to decode first oplog entry: %v", err)
+			return
+		}
+
+		// Get timestamp from 'ts' field (BSON timestamp)
+		if tsVal, exists := firstEntry["ts"]; exists {
+			if ts, ok := tsVal.(primitive.Timestamp); ok {
+				firstTime = time.Unix(int64(ts.T), 0)
+				firstFound = true
+				log.Printf("DEBUG: MongoDB - First oplog entry time: %v (timestamp: %d)", firstTime, ts.T)
+			} else {
+				log.Printf("ERROR: MongoDB - First oplog entry ts field has wrong type: %T", tsVal)
+			}
+		} else {
+			log.Printf("ERROR: MongoDB - First oplog entry has no ts field")
+		}
+	} else {
+		log.Printf("ERROR: MongoDB - No first oplog entry found")
+		return
+	}
+
+	// Get the last (newest) entry in oplog
+	var lastEntry bson.M
+	lastCursor, err := oplogCollection.Find(ctx, bson.D{}, options.Find().SetSort(bson.D{{Key: "$natural", Value: -1}}).SetLimit(1))
+	if err != nil {
+		log.Printf("ERROR: MongoDB - Failed to get last oplog entry: %v", err)
+		return
+	}
+	defer lastCursor.Close(ctx)
+
+	var lastTime time.Time
+	var lastFound bool
+	if lastCursor.Next(ctx) {
+		if err := lastCursor.Decode(&lastEntry); err != nil {
+			log.Printf("ERROR: MongoDB - Failed to decode last oplog entry: %v", err)
+			return
+		}
+
+		// Get timestamp from 'ts' field (BSON timestamp)
+		if tsVal, exists := lastEntry["ts"]; exists {
+			if ts, ok := tsVal.(primitive.Timestamp); ok {
+				lastTime = time.Unix(int64(ts.T), 0)
+				lastFound = true
+				log.Printf("DEBUG: MongoDB - Last oplog entry time: %v (timestamp: %d)", lastTime, ts.T)
+			} else {
+				log.Printf("ERROR: MongoDB - Last oplog entry ts field has wrong type: %T", tsVal)
+			}
+		} else {
+			log.Printf("ERROR: MongoDB - Last oplog entry has no ts field")
+		}
+	} else {
+		log.Printf("ERROR: MongoDB - No last oplog entry found")
+		return
+	}
+
+	// Calculate oplog time window if both timestamps are found
+	if firstFound && lastFound {
+		timeWindow := lastTime.Sub(firstTime)
+		timeWindowSeconds := timeWindow.Seconds()
+		timeWindowHours := timeWindow.Hours()
+
+		log.Printf("DEBUG: MongoDB - Oplog time window: %.2f seconds (%.2f hours)", timeWindowSeconds, timeWindowHours)
+
+		// Add oplog time window metrics
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.replication.oplog_time_window_seconds",
+			Value:       MetricValue{DoubleValue: &timeWindowSeconds},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "seconds",
+			Description: "Oplog time window from first to last entry in seconds",
+		})
+
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.replication.oplog_time_window_hours",
+			Value:       MetricValue{DoubleValue: &timeWindowHours},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "hours",
+			Description: "Oplog time window from first to last entry in hours",
+		})
+
+		// Add first and last oplog entry timestamps as Unix timestamps
+		firstTimeUnix := float64(firstTime.Unix())
+		lastTimeUnix := float64(lastTime.Unix())
+
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.replication.oplog_first_entry_timestamp",
+			Value:       MetricValue{DoubleValue: &firstTimeUnix},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "timestamp",
+			Description: "Unix timestamp of first oplog entry",
+		})
+
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.replication.oplog_last_entry_timestamp",
+			Value:       MetricValue{DoubleValue: &lastTimeUnix},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "timestamp",
+			Description: "Unix timestamp of last oplog entry",
+		})
+
+		log.Printf("DEBUG: MongoDB - Added oplog time window metrics: %.2f hours window", timeWindowHours)
+
+		// Calculate how much time would be safe for secondary downtime (typically 80% of window)
+		safeDowntimeHours := timeWindowHours * 0.8
+		*metrics = append(*metrics, Metric{
+			Name:        "mongodb.replication.oplog_safe_downtime_hours",
+			Value:       MetricValue{DoubleValue: &safeDowntimeHours},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "hours",
+			Description: "Safe secondary downtime hours (80% of oplog window)",
+		})
+
+		log.Printf("DEBUG: MongoDB - Safe secondary downtime: %.2f hours (80%% of %.2f hours window)",
+			safeDowntimeHours, timeWindowHours)
+	} else {
+		log.Printf("ERROR: MongoDB - Could not calculate oplog time window: firstFound=%v, lastFound=%v", firstFound, lastFound)
+	}
 }
 
 // getHostname returns the hostname for tagging
