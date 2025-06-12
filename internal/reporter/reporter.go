@@ -3996,6 +3996,10 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 
 		if newStatus == "SLAVE" || newStatus == "STANDBY" {
 			logger.LogMessage("Master->Slave dönüşüm başarıyla tamamlandı!")
+
+			// API'ye coordination completion feedback gönder
+			r.sendCoordinationCompletionFeedback(req.JobId, req.NodeHostname, req.NewMasterHost, logger)
+
 			return &ConvertPostgresToSlaveResponse{
 				JobId:  req.JobId,
 				Status: pb.JobStatus_JOB_STATUS_COMPLETED,
@@ -6140,6 +6144,25 @@ func (r *Reporter) sendViaCentralServer(oldMasterHost, newMasterHost, dataDir st
 
 	logger.LogMessage("Merkezi sunucu koordinasyonu tamamlandı (framework ready)")
 	return nil
+}
+
+// sendCoordinationCompletionFeedback API'ye coordination completion feedback gönderir
+func (r *Reporter) sendCoordinationCompletionFeedback(jobId, completedHost, newMasterHost string, logger *ProcessLogger) {
+	log.Printf("API'ye coordination completion feedback gönderiliyor: Job=%s, CompletedHost=%s, NewMaster=%s", jobId, completedHost, newMasterHost)
+
+	// ProcessLogger ile API'ye coordination completion metadata'sı gönder
+	logger.AddMetadata("coordination_completion", "true")
+	logger.AddMetadata("completed_host", completedHost)
+	logger.AddMetadata("new_master_host", newMasterHost)
+	logger.AddMetadata("completion_status", "success")
+	logger.AddMetadata("completion_timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+	logger.AddMetadata("action", "slave_conversion_completed")
+
+	// Completion mesajı gönder
+	completionMsg := fmt.Sprintf("COORDINATION_COMPLETION: Host (%s) başarıyla slave'e dönüştürüldü, yeni master: %s", completedHost, newMasterHost)
+	logger.LogMessage(completionMsg)
+
+	log.Printf("Coordination completion feedback ProcessLogger ile API'ye gönderildi")
 }
 
 // sendFailoverCoordinationToAPI API'ye failover koordinasyon talebi gönderir
