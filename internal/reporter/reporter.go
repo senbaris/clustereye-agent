@@ -4225,8 +4225,8 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// 3. Disk Alanı Kontrolü
 	logger.LogMessage("Disk alanı kontrol ediliyor...")
 	freeDisk, diskPercent := postgres.GetDiskUsage()
-	logger.LogMessage(fmt.Sprintf("Boş disk alanı: %d GB (%%%d kullanımda)", freeDisk, diskPercent))
-	logger.AddMetadata("free_disk_gb", fmt.Sprintf("%d", freeDisk))
+	logger.LogMessage(fmt.Sprintf("Disk durumu: %s GB boş alan, %%%d kullanımda", freeDisk, diskPercent))
+	logger.AddMetadata("free_disk_gb", fmt.Sprintf("%s", freeDisk))
 	logger.AddMetadata("disk_usage_percent", fmt.Sprintf("%d", diskPercent))
 
 	if diskPercent > 90 {
