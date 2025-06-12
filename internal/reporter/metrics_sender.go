@@ -33,9 +33,32 @@ func NewMetricsSender(cfg *config.AgentConfig, reporter *Reporter) *MetricsSende
 
 // InitMSSQLCollector initializes the MSSQL metrics collector
 func (ms *MetricsSender) InitMSSQLCollector() {
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("DEBUG: InitMSSQLCollector - PANIC RECOVERED: %v", r)
+		}
+	}()
+
+	log.Printf("DEBUG: InitMSSQLCollector - Starting initialization")
+
 	if ms.mssqlCollector == nil {
+		log.Printf("DEBUG: InitMSSQLCollector - Creating new MSSQL metrics collector")
+
+		if ms.cfg == nil {
+			log.Printf("DEBUG: InitMSSQLCollector - ERROR: Config is nil")
+			return
+		}
+
 		ms.mssqlCollector = mssql.NewMSSQLMetricsCollector(ms.cfg)
-		log.Printf("DEBUG: MSSQL metrics collector initialized")
+		if ms.mssqlCollector == nil {
+			log.Printf("DEBUG: InitMSSQLCollector - ERROR: Failed to create MSSQL metrics collector")
+			return
+		}
+
+		log.Printf("DEBUG: InitMSSQLCollector - MSSQL metrics collector created successfully")
+	} else {
+		log.Printf("DEBUG: InitMSSQLCollector - MSSQL metrics collector already exists")
 	}
 }
 
@@ -69,12 +92,34 @@ func (ms *MetricsSender) getAgentID() string {
 func (ms *MetricsSender) SendMSSQLMetrics(ctx context.Context) error {
 	log.Printf("DEBUG: SendMSSQLMetrics - Starting metrics collection and sending process")
 
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("DEBUG: SendMSSQLMetrics - PANIC RECOVERED: %v", r)
+		}
+	}()
+
+	// Check if collector is initialized
+	if ms.mssqlCollector == nil {
+		log.Printf("DEBUG: SendMSSQLMetrics - ERROR: mssqlCollector is nil, initializing...")
+		ms.InitMSSQLCollector()
+		if ms.mssqlCollector == nil {
+			log.Printf("DEBUG: SendMSSQLMetrics - ERROR: Failed to initialize mssqlCollector")
+			return fmt.Errorf("MSSQL collector is not initialized")
+		}
+		log.Printf("DEBUG: SendMSSQLMetrics - mssqlCollector initialized successfully")
+	}
+
+	log.Printf("DEBUG: SendMSSQLMetrics - Collector is ready, calling CollectAllMetrics...")
+
 	// Collect all MSSQL metrics
 	metricBatches, err := ms.mssqlCollector.CollectAllMetrics()
 	if err != nil {
 		log.Printf("DEBUG: SendMSSQLMetrics - Failed to collect metrics: %v", err)
 		return fmt.Errorf("failed to collect MSSQL metrics: %w", err)
 	}
+
+	log.Printf("DEBUG: SendMSSQLMetrics - CollectAllMetrics completed successfully")
 
 	log.Printf("DEBUG: SendMSSQLMetrics - Collected %d metric batches", len(metricBatches))
 

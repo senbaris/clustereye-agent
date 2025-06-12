@@ -1226,6 +1226,82 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
 
+				// PostgreSQL Master -> Slave dönüşüm komutu kontrolü
+				if strings.HasPrefix(query.Command, "convert_postgres_to_slave") {
+					log.Printf("PostgreSQL Master->Slave dönüşüm komutu tespit edildi: %s", query.Command)
+
+					// Komuttan parametreleri çıkar: convert_postgres_to_slave|new_master_host|new_master_port|data_dir|repl_user|repl_pass
+					parts := strings.Split(query.Command, "|")
+					if len(parts) >= 6 {
+						newMasterHost := parts[1]
+						newMasterPort, _ := strconv.Atoi(parts[2])
+						dataDirectory := parts[3]
+						replUser := parts[4]
+						replPass := parts[5]
+
+						// Hostname'i otomatik tespit et
+						hostname, _ := os.Hostname()
+						agentId := fmt.Sprintf("agent_%s", hostname)
+
+						// ConvertPostgresToSlaveRequest oluştur
+						convertReq := &ConvertPostgresToSlaveRequest{
+							JobId:               query.QueryId,
+							AgentId:             agentId,
+							NodeHostname:        hostname,
+							NewMasterHost:       newMasterHost,
+							NewMasterPort:       int32(newMasterPort),
+							DataDirectory:       dataDirectory,
+							ReplicationUser:     replUser,
+							ReplicationPassword: replPass,
+						}
+
+						log.Printf("Master->Slave dönüşüm işlemi başlatılıyor: %+v", convertReq)
+
+						// ConvertPostgresToSlave işlemini çalıştır
+						convertResp, err := r.ConvertPostgresToSlave(context.Background(), convertReq)
+						if err != nil {
+							log.Printf("Master->Slave dönüşüm işlemi başarısız: %v", err)
+							errorResult := map[string]interface{}{
+								"status":  "error",
+								"message": fmt.Sprintf("Master->Slave dönüşüm işlemi başarısız: %v", err),
+							}
+							sendQueryResult(r.stream, query.QueryId, errorResult)
+						} else {
+							// Sonucu gönder
+							var statusStr string
+							if convertResp.Status == pb.JobStatus_JOB_STATUS_COMPLETED {
+								statusStr = "success"
+							} else {
+								statusStr = "error"
+							}
+
+							result := map[string]interface{}{
+								"status":  statusStr,
+								"message": convertResp.Result,
+								"job_id":  convertResp.JobId,
+							}
+
+							if convertResp.ErrorMessage != "" {
+								result["error"] = convertResp.ErrorMessage
+							}
+
+							sendQueryResult(r.stream, query.QueryId, result)
+						}
+
+						isProcessingQuery = false
+						continue
+					} else {
+						// Eksik parametre
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz convert_postgres_to_slave komutu. Format: convert_postgres_to_slave|new_master_host|port|data_dir|repl_user|repl_pass",
+						}
+						sendQueryResult(r.stream, query.QueryId, errorResult)
+						isProcessingQuery = false
+						continue
+					}
+				}
+
 				// PostgreSQL promotion özel işleme:
 				// Format: postgres_promote|<data_directory>|<query_id>
 				if strings.HasPrefix(query.Command, "postgres_promote") {
@@ -3752,6 +3828,176 @@ func (r *Reporter) FreezeMongoSecondary(ctx context.Context, req *pb.MongoFreeze
 	}, nil
 }
 
+// ConvertPostgresToSlaveRequest temporary struct until protobuf is updated
+type ConvertPostgresToSlaveRequest struct {
+	JobId               string
+	AgentId             string
+	NodeHostname        string
+	NewMasterHost       string
+	NewMasterPort       int32
+	DataDirectory       string
+	ReplicationUser     string
+	ReplicationPassword string
+}
+
+// ConvertPostgresToSlaveResponse temporary struct until protobuf is updated
+type ConvertPostgresToSlaveResponse struct {
+	JobId        string
+	Status       pb.JobStatus
+	Result       string
+	ErrorMessage string
+}
+
+// ConvertPostgresToSlave PostgreSQL master node'unu slave'e dönüştürür
+func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostgresToSlaveRequest) (*ConvertPostgresToSlaveResponse, error) {
+	log.Printf("PostgreSQL Master->Slave dönüşüm işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, NewMasterHost: %s",
+		req.JobId, req.AgentId, req.NodeHostname, req.NewMasterHost)
+
+	// gRPC client nil check
+	if r.grpcClient == nil {
+		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
+		if err := r.reconnect(); err != nil {
+			return &ConvertPostgresToSlaveResponse{
+				JobId:        req.JobId,
+				Status:       pb.JobStatus_JOB_STATUS_FAILED,
+				ErrorMessage: fmt.Sprintf("gRPC bağlantısı kurulamadı: %v", err),
+			}, nil
+		}
+	}
+
+	// Log izleyici oluştur ve başlat
+	client := pb.NewAgentServiceClient(r.grpcClient)
+	logger := NewProcessLogger(client, req.AgentId, req.JobId, "postgresql_convert_slave")
+	logger.Start()
+
+	var loggerStopped bool = false
+	defer func() {
+		if !loggerStopped {
+			logger.Stop("completed")
+		}
+	}()
+
+	// İlk log mesajı
+	logger.LogMessage(fmt.Sprintf("PostgreSQL Master->Slave dönüşüm işlemi başlatılıyor. Yeni Master: %s:%d", req.NewMasterHost, req.NewMasterPort))
+
+	// Metadata ekle
+	logger.AddMetadata("hostname", req.NodeHostname)
+	logger.AddMetadata("new_master_host", req.NewMasterHost)
+	logger.AddMetadata("new_master_port", fmt.Sprintf("%d", req.NewMasterPort))
+
+	// Data Directory kontrolü
+	dataDir := req.DataDirectory
+	if dataDir == "" {
+		// Config'den veya varsayılan yoldan bul
+		var err error
+		dataDir, err = postgres.GetDataDirectory()
+		if err != nil {
+			dataDir = "/var/lib/postgresql/data" // varsayılan
+		}
+		logger.LogMessage(fmt.Sprintf("Data directory otomatik tespit edildi: %s", dataDir))
+	}
+
+	// Mevcut node durumunu kontrol et
+	currentStatus := postgres.GetNodeStatus()
+	logger.LogMessage(fmt.Sprintf("Mevcut node durumu: %s", currentStatus))
+
+	if currentStatus == "SLAVE" || currentStatus == "STANDBY" {
+		logger.LogMessage("Node zaten slave durumunda, işlem tamamlandı")
+		return &ConvertPostgresToSlaveResponse{
+			JobId:  req.JobId,
+			Status: pb.JobStatus_JOB_STATUS_COMPLETED,
+			Result: "Node zaten slave durumunda",
+		}, nil
+	}
+
+	// PostgreSQL'i durdurmadan önce son kontroller
+	logger.LogMessage("Master->Slave dönüşüm için ön kontroller yapılıyor...")
+
+	// Aktif bağlantıları kontrol et
+	activeConnections, err := r.checkActiveConnections()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Aktif bağlantı kontrolü başarısız: %v", err))
+	} else {
+		logger.LogMessage(fmt.Sprintf("Aktif bağlantı sayısı: %d", activeConnections))
+		if activeConnections > 0 {
+			logger.LogMessage("UYARI: Aktif bağlantılar var, kapatılacak")
+		}
+	}
+
+	// PostgreSQL'i graceful shutdown yap
+	logger.LogMessage("PostgreSQL graceful shutdown yapılıyor...")
+	err = r.stopPostgreSQLService()
+	if err != nil {
+		errMsg := fmt.Sprintf("PostgreSQL durdurma işlemi başarısız: %v", err)
+		logger.LogError(errMsg, err)
+		logger.Stop("failed")
+		loggerStopped = true
+		return &ConvertPostgresToSlaveResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Standby konfigürasyonu oluştur
+	logger.LogMessage("Standby konfigürasyonu oluşturuluyor...")
+	err = r.createStandbyConfiguration(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword)
+	if err != nil {
+		errMsg := fmt.Sprintf("Standby konfigürasyon oluşturma başarısız: %v", err)
+		logger.LogError(errMsg, err)
+		logger.Stop("failed")
+		loggerStopped = true
+		return &ConvertPostgresToSlaveResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// PostgreSQL'i standby modunda başlat
+	logger.LogMessage("PostgreSQL standby modunda başlatılıyor...")
+	err = r.startPostgreSQLService()
+	if err != nil {
+		errMsg := fmt.Sprintf("PostgreSQL standby modunda başlatma başarısız: %v", err)
+		logger.LogError(errMsg, err)
+		logger.Stop("failed")
+		loggerStopped = true
+		return &ConvertPostgresToSlaveResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// Standby durumunu doğrula
+	logger.LogMessage("Standby durumu doğrulanıyor...")
+	for i := 0; i < 30; i++ { // 30 saniye bekle
+		time.Sleep(1 * time.Second)
+		newStatus := postgres.GetNodeStatus()
+		logger.LogMessage(fmt.Sprintf("Node durumu kontrol ediliyor: %s", newStatus))
+
+		if newStatus == "SLAVE" || newStatus == "STANDBY" {
+			logger.LogMessage("Master->Slave dönüşüm başarıyla tamamlandı!")
+			return &ConvertPostgresToSlaveResponse{
+				JobId:  req.JobId,
+				Status: pb.JobStatus_JOB_STATUS_COMPLETED,
+				Result: fmt.Sprintf("Node başarıyla slave'e dönüştürüldü. Yeni master: %s:%d", req.NewMasterHost, req.NewMasterPort),
+			}, nil
+		}
+	}
+
+	errMsg := "PostgreSQL standby modunda başlatıldı ancak slave durumu doğrulanamadı"
+	logger.LogMessage(errMsg)
+	logger.Stop("failed")
+	loggerStopped = true
+
+	return &ConvertPostgresToSlaveResponse{
+		JobId:        req.JobId,
+		Status:       pb.JobStatus_JOB_STATUS_FAILED,
+		ErrorMessage: errMsg,
+	}, nil
+}
+
 // PromotePostgresToMaster PostgreSQL standby node'unu master'a yükseltir
 func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.PostgresPromoteMasterRequest) (*pb.PostgresPromoteMasterResponse, error) {
 	log.Printf("PostgreSQL Master Promotion işlemi başlatılıyor. JobID: %s, AgentID: %s, Hostname: %s, DataDirectory: %s",
@@ -3940,6 +4186,104 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 			Result:       fmt.Sprintf("Node zaten primary/master durumunda (%s)", nodeStatus),
 		}, nil
 	}
+
+	// Güvenli failover için ön kontroller
+	logger.LogMessage("Güvenli failover için ön kontroller yapılıyor...")
+
+	// 1. Replication Lag Kontrolü
+	replicationLag := postgres.GetReplicationLagSec()
+	logger.LogMessage(fmt.Sprintf("Mevcut replication lag: %.1f saniye", replicationLag))
+	logger.AddMetadata("replication_lag_seconds", fmt.Sprintf("%.1f", replicationLag))
+
+	maxAllowedLag := float64(30) // Maksimum 30 saniye lag kabul edilebilir
+	if replicationLag > maxAllowedLag {
+		errMsg := fmt.Sprintf("Replication lag çok yüksek (%.1f saniye > %.1f saniye). Güvenli promotion için lag düşürülmeli", replicationLag, maxAllowedLag)
+		logger.LogError(errMsg, nil)
+
+		// Logger'ı durdur
+		logger.Stop("failed")
+		loggerStopped = true
+
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// 2. WAL Durumu Kontrolü
+	logger.LogMessage("WAL durumu kontrol ediliyor...")
+	walStatus, err := r.checkWALStatus()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("WAL durumu kontrol edilemedi: %v", err))
+		// WAL kontrolü başarısız olsa da devam edebiliriz, sadece uyar
+	} else {
+		logger.LogMessage(fmt.Sprintf("WAL durumu: %s", walStatus))
+		logger.AddMetadata("wal_status", walStatus)
+	}
+
+	// 3. Disk Alanı Kontrolü
+	logger.LogMessage("Disk alanı kontrol ediliyor...")
+	freeDisk, diskPercent := postgres.GetDiskUsage()
+	logger.LogMessage(fmt.Sprintf("Boş disk alanı: %d GB (%%%d kullanımda)", freeDisk, diskPercent))
+	logger.AddMetadata("free_disk_gb", fmt.Sprintf("%d", freeDisk))
+	logger.AddMetadata("disk_usage_percent", fmt.Sprintf("%d", diskPercent))
+
+	if diskPercent > 90 {
+		errMsg := fmt.Sprintf("Disk alanı kritik seviyede (%%%d). Promotion için yeterli alan yok", diskPercent)
+		logger.LogError(errMsg, nil)
+
+		// Logger'ı durdur
+		logger.Stop("failed")
+		loggerStopped = true
+
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	// 4. Aktif Bağlantı Kontrolü
+	logger.LogMessage("Aktif bağlantılar kontrol ediliyor...")
+	activeConnections, err := r.checkActiveConnections()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Aktif bağlantı kontrolü başarısız: %v", err))
+	} else {
+		logger.LogMessage(fmt.Sprintf("Aktif bağlantı sayısı: %d", activeConnections))
+		logger.AddMetadata("active_connections", fmt.Sprintf("%d", activeConnections))
+
+		if activeConnections > 100 {
+			logger.LogMessage("UYARI: Yüksek sayıda aktif bağlantı var, promotion sırasında bağlantı kesintileri olabilir")
+		}
+	}
+
+	// 5. Uzun Süren İşlem Kontrolü
+	logger.LogMessage("Uzun süren işlemler kontrol ediliyor...")
+	longRunningQueries, err := r.checkLongRunningQueries()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Uzun süren işlem kontrolü başarısız: %v", err))
+	} else if len(longRunningQueries) > 0 {
+		logger.LogMessage(fmt.Sprintf("UYARI: %d adet uzun süren işlem bulundu:", len(longRunningQueries)))
+		for i, query := range longRunningQueries {
+			if i < 3 { // İlk 3 tanesini logla
+				logger.LogMessage(fmt.Sprintf("  - PID %s: %s (Süre: %s)", query["pid"], query["query"], query["duration"]))
+			}
+		}
+		logger.AddMetadata("long_running_queries_count", fmt.Sprintf("%d", len(longRunningQueries)))
+	}
+
+	// 6. Replication Timeline Kontrolü
+	logger.LogMessage("Replication timeline kontrol ediliyor...")
+	timeline, err := r.checkTimelineStatus()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Timeline kontrolü başarısız: %v", err))
+	} else {
+		logger.LogMessage(fmt.Sprintf("Mevcut timeline: %s", timeline))
+		logger.AddMetadata("current_timeline", timeline)
+	}
+
+	logger.LogMessage("Ön kontroller tamamlandı, promotion işlemi başlatılabilir")
 
 	// İki yöntem deneyeceğiz:
 	// 1. Promotion trigger file oluşturma (PostgreSQL 12+)
@@ -4207,6 +4551,25 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Promotion başarılı
 	successMsg := fmt.Sprintf("PostgreSQL node başarıyla master'a yükseltildi! Son durum: %s", finalStatus)
 	logger.LogMessage(successMsg)
+
+	// Promotion başarılı olduktan sonra API'ye koordinasyon talebi gönder
+	logger.LogMessage("PostgreSQL promotion başarılı, API'ye failover koordinasyon talebi gönderiliyor...")
+
+	// Eski master'ı cluster'da bul
+	oldMasterHost, err := r.findOldMasterInCluster(req.NodeHostname)
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Eski master bulunamadı: %v", err))
+		oldMasterHost = "" // Boş bırak, API cluster discovery yapabilir
+	}
+
+	// API'ye failover koordinasyon talebi gönder
+	err = r.sendFailoverCoordinationToAPI(oldMasterHost, req.NodeHostname, dataDir, logger)
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("UYARI: API'ye failover koordinasyon talebi gönderilemedi: %v", err))
+		// Bu bir uyarı, ana promotion işlemini başarısız sayma
+	} else {
+		logger.LogMessage("API'ye failover koordinasyon talebi başarıyla gönderildi!")
+	}
 
 	// Logger'ı başarılı olarak durdur
 	logger.Stop("completed")
@@ -5287,6 +5650,411 @@ func (r *Reporter) getWindowsUptime() int64 {
 	}
 
 	return 0
+}
+
+// checkWALStatus PostgreSQL WAL durumunu kontrol eder
+func (r *Reporter) checkWALStatus() (string, error) {
+	db, err := postgres.OpenDB()
+	if err != nil {
+		return "", fmt.Errorf("veritabanı bağlantısı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	var walStatus string
+	query := `
+		SELECT CASE 
+			WHEN pg_is_in_recovery() THEN 'STANDBY'
+			ELSE 'PRIMARY'
+		END as wal_status
+	`
+
+	err = db.QueryRow(query).Scan(&walStatus)
+	if err != nil {
+		return "", fmt.Errorf("WAL durumu sorgusu başarısız: %v", err)
+	}
+
+	return walStatus, nil
+}
+
+// checkActiveConnections aktif bağlantı sayısını döndürür
+func (r *Reporter) checkActiveConnections() (int, error) {
+	db, err := postgres.OpenDB()
+	if err != nil {
+		return 0, fmt.Errorf("veritabanı bağlantısı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	query := `
+		SELECT count(*) 
+		FROM pg_stat_activity 
+		WHERE state = 'active' 
+		AND backend_type = 'client backend'
+	`
+
+	err = db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("aktif bağlantı sorgusu başarısız: %v", err)
+	}
+
+	return count, nil
+}
+
+// checkLongRunningQueries uzun süren işlemleri döndürür
+func (r *Reporter) checkLongRunningQueries() ([]map[string]string, error) {
+	db, err := postgres.OpenDB()
+	if err != nil {
+		return nil, fmt.Errorf("veritabanı bağlantısı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	query := `
+		SELECT 
+			pid, 
+			query, 
+			now() - query_start as duration,
+			state
+		FROM pg_stat_activity 
+		WHERE state = 'active' 
+		AND backend_type = 'client backend'
+		AND now() - query_start > interval '5 minutes'
+		ORDER BY query_start
+		LIMIT 10
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("uzun süren işlem sorgusu başarısız: %v", err)
+	}
+	defer rows.Close()
+
+	var results []map[string]string
+	for rows.Next() {
+		var pid, query, duration, state string
+		if err := rows.Scan(&pid, &query, &duration, &state); err != nil {
+			continue
+		}
+
+		result := map[string]string{
+			"pid":      pid,
+			"query":    query,
+			"duration": duration,
+			"state":    state,
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+// checkTimelineStatus mevcut timeline'ı döndürür
+func (r *Reporter) checkTimelineStatus() (string, error) {
+	db, err := postgres.OpenDB()
+	if err != nil {
+		return "", fmt.Errorf("veritabanı bağlantısı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	var timeline string
+	var query string
+
+	// PostgreSQL sürümüne göre farklı sorgular kullan
+	query = `
+		SELECT CASE 
+			WHEN pg_is_in_recovery() THEN 
+				(SELECT timeline_id FROM pg_control_checkpoint())::text
+			ELSE 
+				pg_current_wal_lsn()::text
+		END as timeline_info
+	`
+
+	err = db.QueryRow(query).Scan(&timeline)
+	if err != nil {
+		// Fallback sorgu (eski PostgreSQL sürümleri için)
+		fallbackQuery := `
+			SELECT CASE 
+				WHEN pg_is_in_recovery() THEN 'standby_timeline'
+				ELSE 'primary_timeline'
+			END as timeline_info
+		`
+		err = db.QueryRow(fallbackQuery).Scan(&timeline)
+		if err != nil {
+			return "", fmt.Errorf("timeline sorgusu başarısız: %v", err)
+		}
+	}
+
+	return timeline, nil
+}
+
+// stopPostgreSQLService PostgreSQL servisini durdurur
+func (r *Reporter) stopPostgreSQLService() error {
+	log.Printf("PostgreSQL servisi durduruluyor...")
+
+	// Systemctl ile durdurma deneyi
+	cmd := exec.Command("systemctl", "stop", "postgresql")
+	if err := cmd.Run(); err == nil {
+		log.Printf("PostgreSQL servisi systemctl ile durduruldu")
+		return nil
+	}
+
+	// pg_ctl ile durdurma deneyi
+	dataDir, err := postgres.GetDataDirectory()
+	if err == nil {
+		pgCtlCmd := exec.Command("pg_ctl", "stop", "-D", dataDir, "-m", "fast")
+		if err := pgCtlCmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi pg_ctl ile durduruldu")
+			return nil
+		}
+	}
+
+	// Service komutu ile durdurma deneyi
+	serviceCmd := exec.Command("service", "postgresql", "stop")
+	if err := serviceCmd.Run(); err == nil {
+		log.Printf("PostgreSQL servisi service komutu ile durduruldu")
+		return nil
+	}
+
+	return fmt.Errorf("PostgreSQL servisi durdurulamadı")
+}
+
+// startPostgreSQLService PostgreSQL servisini başlatır
+func (r *Reporter) startPostgreSQLService() error {
+	log.Printf("PostgreSQL servisi başlatılıyor...")
+
+	// Systemctl ile başlatma deneyi
+	cmd := exec.Command("systemctl", "start", "postgresql")
+	if err := cmd.Run(); err == nil {
+		log.Printf("PostgreSQL servisi systemctl ile başlatıldı")
+		return nil
+	}
+
+	// pg_ctl ile başlatma deneyi
+	dataDir, err := postgres.GetDataDirectory()
+	if err == nil {
+		pgCtlCmd := exec.Command("pg_ctl", "start", "-D", dataDir)
+		if err := pgCtlCmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi pg_ctl ile başlatıldı")
+			return nil
+		}
+	}
+
+	// Service komutu ile başlatma deneyi
+	serviceCmd := exec.Command("service", "postgresql", "start")
+	if err := serviceCmd.Run(); err == nil {
+		log.Printf("PostgreSQL servisi service komutu ile başlatıldı")
+		return nil
+	}
+
+	return fmt.Errorf("PostgreSQL servisi başlatılamadı")
+}
+
+// createStandbyConfiguration standby konfigürasyon dosyalarını oluşturur
+func (r *Reporter) createStandbyConfiguration(dataDir, masterHost string, masterPort int, replUser, replPassword string) error {
+	log.Printf("Standby konfigürasyonu oluşturuluyor: %s -> %s:%d", dataDir, masterHost, masterPort)
+
+	// PostgreSQL major version'ı al
+	pgVersion := postgres.GetPGVersion()
+	majorVersion := strings.Split(pgVersion, ".")[0]
+	majorVersionInt, _ := strconv.Atoi(majorVersion)
+
+	// PostgreSQL 12+ için standby.signal dosyası
+	if majorVersionInt >= 12 {
+		// standby.signal dosyası oluştur
+		standbySignalPath := filepath.Join(dataDir, "standby.signal")
+		signalFile, err := os.Create(standbySignalPath)
+		if err != nil {
+			return fmt.Errorf("standby.signal dosyası oluşturulamadı: %v", err)
+		}
+		signalFile.Close()
+		log.Printf("standby.signal dosyası oluşturuldu: %s", standbySignalPath)
+
+		// postgresql.conf dosyasını güncelle
+		postgresqlConfPath := filepath.Join(dataDir, "postgresql.conf")
+		return r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
+
+	} else {
+		// PostgreSQL 11 ve öncesi için recovery.conf dosyası
+		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
+		return r.createRecoveryConf(recoveryConfPath, masterHost, masterPort, replUser, replPassword)
+	}
+}
+
+// updatePostgreSQLConf postgresql.conf dosyasını standby konfigürasyonu ile günceller
+func (r *Reporter) updatePostgreSQLConf(confPath, masterHost string, masterPort int, replUser, replPassword string) error {
+	log.Printf("postgresql.conf dosyası güncelleniyor: %s", confPath)
+
+	// Mevcut dosyayı oku
+	content, err := os.ReadFile(confPath)
+	if err != nil {
+		return fmt.Errorf("postgresql.conf okunamadı: %v", err)
+	}
+
+	// Primary connection info ekle
+	primaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
+		masterHost, masterPort, replUser, replPassword)
+
+	// Standby konfigürasyonu
+	standbyConfig := fmt.Sprintf(`
+# Standby configuration added by ClusterEye
+%s
+primary_slot_name = 'standby_slot'
+hot_standby = on
+`, primaryConnInfo)
+
+	// Dosyaya ekle
+	newContent := string(content) + "\n" + standbyConfig
+	err = os.WriteFile(confPath, []byte(newContent), 0600)
+	if err != nil {
+		return fmt.Errorf("postgresql.conf yazılamadı: %v", err)
+	}
+
+	log.Printf("postgresql.conf başarıyla güncellendi")
+	return nil
+}
+
+// createRecoveryConf recovery.conf dosyası oluşturur (PostgreSQL 11 ve öncesi)
+func (r *Reporter) createRecoveryConf(recoveryPath, masterHost string, masterPort int, replUser, replPassword string) error {
+	log.Printf("recovery.conf dosyası oluşturuluyor: %s", recoveryPath)
+
+	// Recovery.conf içeriği
+	recoveryContent := fmt.Sprintf(`# Recovery configuration created by ClusterEye
+standby_mode = 'on'
+primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'
+trigger_file = '%s/promote.trigger'
+hot_standby = on
+`,
+		masterHost, masterPort, replUser, replPassword, filepath.Dir(recoveryPath))
+
+	// Dosyayı oluştur
+	err := os.WriteFile(recoveryPath, []byte(recoveryContent), 0600)
+	if err != nil {
+		return fmt.Errorf("recovery.conf oluşturulamadı: %v", err)
+	}
+
+	log.Printf("recovery.conf başarıyla oluşturuldu")
+	return nil
+}
+
+// findOldMasterInCluster cluster'da eski master node'unu bulmaya çalışır
+func (r *Reporter) findOldMasterInCluster(currentNodeHostname string) (string, error) {
+	log.Printf("Cluster'da eski master aranıyor (mevcut node: %s)", currentNodeHostname)
+
+	// Bu fonksiyon gelecekte cluster discovery mekanizması ile geliştirilecek
+	// Şimdilik config'den veya environment'tan eski master bilgisini almaya çalışalım
+
+	// Config'den cluster node'larını alabilir veya
+	// Agent'lar arası iletişim kurarak diğer node'ları bulabiliriz
+
+	// Geçici çözüm: Environment variable'dan eski master'ı al
+	oldMaster := os.Getenv("OLD_MASTER_HOST")
+	if oldMaster != "" && oldMaster != currentNodeHostname {
+		log.Printf("Environment'tan eski master bulundu: %s", oldMaster)
+		return oldMaster, nil
+	}
+
+	// Config'den cluster bilgilerini almaya çalış
+	if r.cfg != nil && r.cfg.PostgreSQL.Cluster != "" {
+		// Cluster isminden node listesi çıkarmaya çalışabiliriz
+		// Bu kısım cluster yönetim sistemine göre değişecek
+		log.Printf("Cluster config: %s", r.cfg.PostgreSQL.Cluster)
+	}
+
+	return "", fmt.Errorf("eski master node'u bulunamadı")
+}
+
+// sendConvertToSlaveCommand eski master'a slave'e dönüşüm komutu gönderir
+func (r *Reporter) sendConvertToSlaveCommand(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
+	log.Printf("Eski master'a (%s) slave dönüşüm komutu gönderiliyor...", oldMasterHost)
+
+	// Yöntem 1: Central Server Coordination (Production Ready - Önerilen)
+	return r.sendViaCentralServer(oldMasterHost, newMasterHost, dataDir, logger)
+
+	// Yöntem 2: Direct gRPC Call (Alternative - Agent'lar arası direkt iletişim)
+	// return r.sendDirectGRPCCommand(oldMasterHost, newMasterHost, dataDir, logger)
+
+	// Yöntem 3: SSH/Remote Command (Legacy fallback)
+	// return r.sendViaSSH(oldMasterHost, newMasterHost, dataDir, logger)
+}
+
+// sendViaCentralServer merkezi sunucu üzerinden koordinasyon yapar
+func (r *Reporter) sendViaCentralServer(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
+	logger.LogMessage(fmt.Sprintf("Merkezi sunucu üzerinden slave dönüşüm koordinasyonu başlatılıyor: %s -> %s", oldMasterHost, newMasterHost))
+
+	// Central server'a eski master'ın slave'e dönüştürülmesi talebi gönder
+	if r.grpcClient == nil {
+		errMsg := "merkezi sunucuya gRPC bağlantısı yok"
+		logger.LogMessage(errMsg)
+		return fmt.Errorf(errMsg)
+	}
+
+	logger.LogMessage("Merkezi sunucuya failover koordinasyon talebi gönderiliyor...")
+
+	// Koordinasyon bilgilerini log mesajı olarak hazırla
+	coordinationMessage := fmt.Sprintf("FAILOVER_COORDINATION: OldMaster=%s, NewMaster=%s, DataDir=%s, User=%s",
+		oldMasterHost, newMasterHost, dataDir, r.cfg.PostgreSQL.User)
+
+	logger.LogMessage(coordinationMessage)
+
+	// Merkezi sunucuya koordinasyon talebini özel log mesajı olarak gönder
+	// Bu sayede merkezi sunucu bu mesajı alıp eski master agent'ına komut gönderebilir
+
+	// ProcessLogger'ın AddMetadata fonksiyonunu kullanarak koordinasyon bilgilerini ekle
+	logger.AddMetadata("failover_coordination", "true")
+	logger.AddMetadata("old_master_host", oldMasterHost)
+	logger.AddMetadata("new_master_host", newMasterHost)
+	logger.AddMetadata("data_directory", dataDir)
+	logger.AddMetadata("replication_user", r.cfg.PostgreSQL.User)
+	logger.AddMetadata("action", "convert_master_to_slave")
+	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+
+	// Koordinasyon talebi log mesajı gönder
+	logger.LogMessage("Merkezi koordinasyon talebi metadata ile gönderildi")
+
+	// Koordinasyon işleminin başlatılması için bekleme
+	logger.LogMessage("Merkezi sunucunun koordinasyon işlemini başlatması bekleniyor...")
+	time.Sleep(5 * time.Second)
+
+	// NOT: Production'da merkezi sunucu:
+	// 1. Bu log mesajını alacak ve metadata'dan koordinasyon bilgilerini çıkaracak
+	// 2. old_master_host'a gRPC call yapacak
+	// 3. Eski master agent'ına ConvertPostgresToSlave komutu gönderecek
+	// 4. Eski master agent PostgreSQL'i slave moduna geçirecek
+
+	logger.LogMessage("Merkezi sunucu koordinasyonu tamamlandı (framework ready)")
+	return nil
+}
+
+// sendFailoverCoordinationToAPI API'ye failover koordinasyon talebi gönderir
+func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
+	logger.LogMessage(fmt.Sprintf("API'ye failover koordinasyon talebi gönderiliyor: %s -> %s", oldMasterHost, newMasterHost))
+
+	// Mevcut API bağlantısını kullan
+	if r.grpcClient == nil {
+		return fmt.Errorf("API sunucusuna gRPC bağlantısı yok")
+	}
+
+	// API'ye failover koordinasyon mesajını ProcessLogger metadata ile gönder
+	// Bu sayede API'deki ProcessLoggerHandler bu mesajı alıp koordinasyon işlemini başlatacak
+	logger.AddMetadata("failover_coordination_request", "true")
+	logger.AddMetadata("old_master_host", oldMasterHost)
+	logger.AddMetadata("new_master_host", newMasterHost)
+	logger.AddMetadata("data_directory", dataDir)
+	logger.AddMetadata("replication_user", r.cfg.PostgreSQL.ReplicationUser)
+	logger.AddMetadata("replication_pass", r.cfg.PostgreSQL.ReplicationPass)
+	logger.AddMetadata("action", "convert_master_to_slave")
+	logger.AddMetadata("requested_by", "promotion_agent")
+	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+
+	// Koordinasyon talep mesajı gönder
+	coordinationMsg := fmt.Sprintf("FAILOVER_COORDINATION_REQUEST: Promotion tamamlandı, eski master (%s) slave'e dönüştürülmeli", oldMasterHost)
+	logger.LogMessage(coordinationMsg)
+
+	logger.LogMessage("Koordinasyon metadata'sı ProcessLogger ile API'ye gönderildi")
+
+	// Kısa bir bekleme - API'nin koordinasyon işlemini başlatması için
+	time.Sleep(2 * time.Second)
+
+	return nil
 }
 
 // sanitizeData recursively traverses a data structure and sanitizes problematic values

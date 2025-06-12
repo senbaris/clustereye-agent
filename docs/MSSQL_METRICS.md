@@ -67,6 +67,24 @@ The system consists of several components:
   - `mssql.database.data_size` - Database data file size (bytes)
   - `mssql.database.log_size` - Database log file size (bytes)
 
+- **Transaction Metrics**
+  - `mssql.transactions.per_sec` - Transactions per second (by database)
+  - `mssql.transactions.active_total` - Total number of active transactions
+  - `mssql.transactions.active_by_database` - Number of active transactions by database
+  - `mssql.transactions.long_running` - Number of long-running transactions (>30 seconds)
+  - `mssql.transactions.max_duration_seconds` - Maximum transaction duration in seconds
+  - `mssql.transactions.snapshot_active` - Number of active snapshot isolation transactions
+  - `mssql.transactions.nonsnapshot_version_active` - Number of active non-snapshot version transactions
+  - `mssql.transactions.update_snapshot_active` - Number of active update snapshot transactions
+  - `mssql.transactions.longest_running_time_seconds` - Longest transaction running time in seconds
+  - `mssql.transactions.update_conflict_ratio` - Update conflict ratio for snapshot isolation
+  - `mssql.transactions.version_cleanup_rate_kb_per_sec` - Version cleanup rate (KB/s)
+  - `mssql.transactions.version_generation_rate_kb_per_sec` - Version generation rate (KB/s)
+  - `mssql.transactions.version_store_size_kb` - Version store size (KB)
+  - `mssql.transactions.version_store_unit_count` - Version store unit count
+  - `mssql.transactions.tempdb_free_space_kb` - Free space in tempdb (KB)
+  - `mssql.transactions.query_executions` - Total query executions by database
+
 ## Metric Structure
 
 Each metric includes:
@@ -205,6 +223,18 @@ WHERE time >= now() - 1h GROUP BY "wait_type"
 -- Database growth
 SELECT last("value") FROM "mssql_database_data_size" 
 GROUP BY "database"
+
+-- Transaction throughput (TPS) by database
+SELECT mean("value") FROM "mssql_transactions_per_sec" 
+WHERE time >= now() - 1h GROUP BY time(5m), "database"
+
+-- Long-running transactions alert
+SELECT last("value") FROM "mssql_transactions_long_running" 
+WHERE time >= now() - 5m AND "value" > 0
+
+-- Active transactions by database
+SELECT last("value") FROM "mssql_transactions_active_by_database" 
+GROUP BY "database" ORDER BY "value" DESC
 ```
 
 ## Error Handling

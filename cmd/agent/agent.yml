@@ -9,6 +9,8 @@ postgresql:
   port: 5432
   cluster: postgresnew
   location: istanbul
+  replication_user: replicator
+  replication_pass: replica
 mongo:
   host: localhost
   user: admin

@@ -68,17 +68,8 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 	// Get system metrics from existing collector
 	systemMetrics := m.collector.BatchCollectSystemMetrics()
 
-	// Debug logging: Show all collected system metrics
-	log.Printf("DEBUG: CollectSystemMetrics - Raw system metrics collected: %d items", len(systemMetrics))
-	for key, value := range systemMetrics {
-		log.Printf("DEBUG: SystemMetric[%s] = %v (type: %T)", key, value, value)
-	}
-
-	// System metrics collected successfully
-
 	// CPU Metrics
 	if cpuUsage, ok := systemMetrics["cpu_usage"].(float64); ok {
-		log.Printf("DEBUG: Adding CPU usage metric: %.2f", cpuUsage)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.cpu_usage",
 			Value:       MetricValue{DoubleValue: &cpuUsage},
@@ -87,14 +78,10 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "percent",
 			Description: "CPU usage percentage",
 		})
-	} else {
-		log.Printf("DEBUG: CPU usage metric not found or wrong type in system metrics")
 	}
 
-	// Fix: Use cpu_count instead of cpu_cores (matches collector output)
 	if cpuCount, ok := systemMetrics["cpu_count"].(int32); ok {
 		cores := int64(cpuCount)
-		log.Printf("DEBUG: Adding CPU cores metric: %d", cores)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.cpu_cores",
 			Value:       MetricValue{IntValue: &cores},
@@ -103,13 +90,10 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "count",
 			Description: "Number of CPU cores",
 		})
-	} else {
-		log.Printf("DEBUG: CPU count metric not found or wrong type in system metrics")
 	}
 
 	// Memory Metrics
 	if memUsage, ok := systemMetrics["memory_usage"].(float64); ok {
-		log.Printf("DEBUG: Adding memory usage metric: %.2f", memUsage)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.memory_usage",
 			Value:       MetricValue{DoubleValue: &memUsage},
@@ -118,12 +102,9 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "percent",
 			Description: "Memory usage percentage",
 		})
-	} else {
-		log.Printf("DEBUG: Memory usage metric not found or wrong type in system metrics")
 	}
 
 	if totalMem, ok := systemMetrics["total_memory"].(int64); ok {
-		log.Printf("DEBUG: Adding total memory metric: %d bytes", totalMem)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.total_memory",
 			Value:       MetricValue{IntValue: &totalMem},
@@ -132,12 +113,9 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Total system memory",
 		})
-	} else {
-		log.Printf("DEBUG: Total memory metric not found or wrong type in system metrics")
 	}
 
 	if freeMem, ok := systemMetrics["free_memory"].(int64); ok {
-		log.Printf("DEBUG: Adding free memory metric: %d bytes", freeMem)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.free_memory",
 			Value:       MetricValue{IntValue: &freeMem},
@@ -146,13 +124,10 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Free system memory",
 		})
-	} else {
-		log.Printf("DEBUG: Free memory metric not found or wrong type in system metrics")
 	}
 
 	// Disk Metrics
 	if totalDisk, ok := systemMetrics["total_disk"].(int64); ok {
-		log.Printf("DEBUG: Adding total disk metric: %d bytes", totalDisk)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.total_disk",
 			Value:       MetricValue{IntValue: &totalDisk},
@@ -161,12 +136,9 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Total disk space",
 		})
-	} else {
-		log.Printf("DEBUG: Total disk metric not found or wrong type in system metrics")
 	}
 
 	if freeDisk, ok := systemMetrics["free_disk"].(int64); ok {
-		log.Printf("DEBUG: Adding free disk metric: %d bytes", freeDisk)
 		metrics = append(metrics, Metric{
 			Name:        "mssql.system.free_disk",
 			Value:       MetricValue{IntValue: &freeDisk},
@@ -175,8 +147,6 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 			Unit:        "bytes",
 			Description: "Free disk space",
 		})
-	} else {
-		log.Printf("DEBUG: Free disk metric not found or wrong type in system metrics")
 	}
 
 	// Response Time Metric
@@ -211,6 +181,13 @@ func (m *MSSQLMetricsCollector) CollectSystemMetrics() (*MetricBatch, error) {
 
 // CollectDatabaseMetrics collects database-specific metrics
 func (m *MSSQLMetricsCollector) CollectDatabaseMetrics() (*MetricBatch, error) {
+	// Add panic recovery for database metrics collection
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("DEBUG: CollectDatabaseMetrics - PANIC RECOVERED: %v", r)
+		}
+	}()
+
 	timestamp := time.Now().UnixNano()
 	var metrics []Metric
 
@@ -223,6 +200,7 @@ func (m *MSSQLMetricsCollector) CollectDatabaseMetrics() (*MetricBatch, error) {
 	// Collect various database metrics
 	m.collectConnectionMetrics(db, &metrics, timestamp)
 	m.collectPerformanceCounters(db, &metrics, timestamp)
+	m.collectTransactionMetrics(db, &metrics, timestamp)
 	m.collectBlockingQueries(db, &metrics, timestamp)
 	m.collectDeadlockMetrics(db, &metrics, timestamp)
 	m.collectWaitStats(db, &metrics, timestamp)
@@ -288,16 +266,18 @@ func (m *MSSQLMetricsCollector) collectConnectionMetrics(db *sql.DB, metrics *[]
 
 // collectPerformanceCounters collects SQL Server performance counters
 func (m *MSSQLMetricsCollector) collectPerformanceCounters(db *sql.DB, metrics *[]Metric, timestamp int64) {
+
 	query := `
 		SELECT 
 			counter_name,
 			cntr_value,
-			cntr_type
+			cntr_type,
+			object_name
 		FROM sys.dm_os_performance_counters 
-		WHERE object_name LIKE '%SQL Statistics%' 
-		   OR object_name LIKE '%Buffer Manager%'
-		   OR object_name LIKE '%Memory Manager%'
-		   OR object_name LIKE '%Locks%'
+		WHERE object_name LIKE '%:SQL Statistics%' 
+		   OR object_name LIKE '%:Buffer Manager%'
+		   OR object_name LIKE '%:Memory Manager%'
+		   OR object_name LIKE '%:Locks%'
 	`
 
 	rows, err := db.Query(query)
@@ -307,17 +287,23 @@ func (m *MSSQLMetricsCollector) collectPerformanceCounters(db *sql.DB, metrics *
 	}
 	defer rows.Close()
 
+	counterCount := 0
+	unmappedCount := 0
 	for rows.Next() {
-		var counterName string
+		var counterName, objectName string
 		var cntrValue, cntrType int64
 
-		if err := rows.Scan(&counterName, &cntrValue, &cntrType); err != nil {
+		if err := rows.Scan(&counterName, &cntrValue, &cntrType, &objectName); err != nil {
 			continue
 		}
+
+		// Trim whitespace from counter name (SQL Server adds trailing spaces)
+		counterName = strings.TrimSpace(counterName)
 
 		// Map counter names to metric names
 		metricName := m.mapCounterToMetric(counterName)
 		if metricName == "" {
+			unmappedCount++
 			continue
 		}
 
@@ -329,7 +315,196 @@ func (m *MSSQLMetricsCollector) collectPerformanceCounters(db *sql.DB, metrics *
 			Unit:        m.getCounterUnit(counterName),
 			Description: counterName,
 		})
+		counterCount++
 	}
+
+	log.Printf("DEBUG: collectPerformanceCounters - Collected %d performance counters, unmapped: %d", counterCount, unmappedCount)
+}
+
+// collectTransactionMetrics collects transaction-related metrics
+func (m *MSSQLMetricsCollector) collectTransactionMetrics(db *sql.DB, metrics *[]Metric, timestamp int64) {
+	// Add safety check to prevent crashes
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Transaction metrics collection panic recovered: %v", r)
+		}
+	}()
+
+	// Collect Transaction Performance Counters
+	if err := m.collectTransactionPerformanceCounters(db, metrics, timestamp); err != nil {
+		logger.Error("Failed to collect transaction performance counters: %v", err)
+	}
+}
+
+// collectTransactionPerformanceCounters collects transaction performance counters safely
+func (m *MSSQLMetricsCollector) collectTransactionPerformanceCounters(db *sql.DB, metrics *[]Metric, timestamp int64) error {
+	// Collect transaction counters with SQL Server 2016 specific patterns
+	transactionCountersQuery := `
+		SELECT 
+			counter_name,
+			cntr_value,
+			ISNULL(instance_name, '') as instance_name,
+			object_name
+		FROM sys.dm_os_performance_counters 
+		WHERE object_name LIKE '%:Transactions%'
+		   OR object_name LIKE '%:Databases%'
+		   OR object_name LIKE '%:Database Replica%'
+		   OR object_name LIKE '%XTP Transactions%'
+		   OR object_name LIKE '%XTP Transaction Log%'
+	`
+
+	rows, err := db.Query(transactionCountersQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query transaction performance counters: %w", err)
+	}
+	defer rows.Close()
+
+	counterCount := 0
+	unmappedCount := 0
+	for rows.Next() {
+		var counterName, instanceName, objectName string
+		var cntrValue int64
+
+		if err := rows.Scan(&counterName, &cntrValue, &instanceName, &objectName); err != nil {
+			continue
+		}
+
+		// Trim whitespace from counter name (SQL Server adds trailing spaces)
+		counterName = strings.TrimSpace(counterName)
+		instanceName = strings.TrimSpace(instanceName)
+
+		// Map transaction counter names to metric names
+		metricName := m.mapTransactionCounterToMetric(counterName)
+		if metricName == "" {
+			unmappedCount++
+			continue
+		}
+
+		tags := []MetricTag{{Key: "host", Value: m.getHostname()}}
+		if instanceName != "_Total" && instanceName != "" {
+			tags = append(tags, MetricTag{Key: "database", Value: instanceName})
+		}
+
+		*metrics = append(*metrics, Metric{
+			Name:        metricName,
+			Value:       MetricValue{IntValue: &cntrValue},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        m.getTransactionCounterUnit(counterName),
+			Description: counterName,
+		})
+		counterCount++
+	}
+
+	log.Printf("DEBUG: collectTransactionPerformanceCounters - Collected %d transaction counters, unmapped: %d", counterCount, unmappedCount)
+	return nil
+}
+
+// collectActiveTransactionsSafe safely collects information about currently active transactions
+func (m *MSSQLMetricsCollector) collectActiveTransactionsSafe(db *sql.DB, metrics *[]Metric, timestamp int64) error {
+	return m.collectActiveTransactions(db, metrics, timestamp)
+}
+
+// collectActiveTransactions collects information about currently active transactions
+func (m *MSSQLMetricsCollector) collectActiveTransactions(db *sql.DB, metrics *[]Metric, timestamp int64) error {
+	activeTransQuery := `
+		SELECT 
+			s.session_id,
+			s.login_name,
+			DB_NAME(s.database_id) as database_name,
+			t.transaction_id,
+			t.name as transaction_name,
+			t.transaction_begin_time,
+			DATEDIFF(second, t.transaction_begin_time, GETDATE()) as duration_seconds,
+			t.transaction_type,
+			t.transaction_state
+		FROM sys.dm_tran_active_transactions t
+		INNER JOIN sys.dm_tran_session_transactions st ON t.transaction_id = st.transaction_id
+		INNER JOIN sys.dm_exec_sessions s ON st.session_id = s.session_id
+		WHERE s.is_user_process = 1
+	`
+
+	rows, err := db.Query(activeTransQuery)
+	if err != nil {
+		return fmt.Errorf("failed to collect active transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var totalActiveTransactions int64 = 0
+	var longRunningTransactions int64 = 0
+	var maxTransactionDuration int64 = 0
+	databaseTransactionCounts := make(map[string]int64)
+
+	for rows.Next() {
+		var sessionID, transactionID, transactionType, transactionState int64
+		var loginName, databaseName, transactionName sql.NullString
+		var transactionBeginTime sql.NullTime
+		var durationSeconds int64
+
+		if err := rows.Scan(&sessionID, &loginName, &databaseName, &transactionID, &transactionName,
+			&transactionBeginTime, &durationSeconds, &transactionType, &transactionState); err != nil {
+			continue
+		}
+
+		totalActiveTransactions++
+
+		// Count long-running transactions (>30 seconds)
+		if durationSeconds > 30 {
+			longRunningTransactions++
+		}
+
+		// Track maximum transaction duration
+		if durationSeconds > maxTransactionDuration {
+			maxTransactionDuration = durationSeconds
+		}
+
+		// Count transactions per database
+		if databaseName.Valid {
+			databaseTransactionCounts[databaseName.String]++
+		}
+	}
+
+	// Add aggregate metrics
+	*metrics = append(*metrics,
+		Metric{
+			Name:        "mssql.transactions.active_total",
+			Value:       MetricValue{IntValue: &totalActiveTransactions},
+			Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}},
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Total number of active transactions",
+		},
+		Metric{
+			Name:        "mssql.transactions.long_running",
+			Value:       MetricValue{IntValue: &longRunningTransactions},
+			Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}},
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Number of long-running transactions (>30 seconds)",
+		},
+		Metric{
+			Name:        "mssql.transactions.max_duration_seconds",
+			Value:       MetricValue{IntValue: &maxTransactionDuration},
+			Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}},
+			Timestamp:   timestamp,
+			Unit:        "seconds",
+			Description: "Maximum transaction duration in seconds",
+		},
+	)
+
+	// Add per-database transaction counts
+	for dbName, count := range databaseTransactionCounts {
+		*metrics = append(*metrics, Metric{
+			Name:        "mssql.transactions.active_by_database",
+			Value:       MetricValue{IntValue: &count},
+			Tags:        []MetricTag{{Key: "host", Value: m.getHostname()}, {Key: "database", Value: dbName}},
+			Timestamp:   timestamp,
+			Unit:        "count",
+			Description: "Number of active transactions by database",
+		})
+	}
+
+	return nil
 }
 
 // collectBlockingQueries collects information about blocking queries
@@ -493,17 +668,17 @@ func (m *MSSQLMetricsCollector) collectDatabaseSizes(db *sql.DB, metrics *[]Metr
 // mapCounterToMetric maps SQL Server counter names to metric names
 func (m *MSSQLMetricsCollector) mapCounterToMetric(counterName string) string {
 	counterMap := map[string]string{
-		"Batch Requests/sec":        "mssql.performance.batch_requests_per_sec",
-		"SQL Compilations/sec":      "mssql.performance.compilations_per_sec",
-		"SQL Re-Compilations/sec":   "mssql.performance.recompilations_per_sec",
+		"Batch Requests/sec":        "mssql.performance.batch_requests_count",
+		"SQL Compilations/sec":      "mssql.performance.compilations_count",
+		"SQL Re-Compilations/sec":   "mssql.performance.recompilations_count",
 		"Buffer cache hit ratio":    "mssql.performance.buffer_cache_hit_ratio",
 		"Page life expectancy":      "mssql.performance.page_life_expectancy",
-		"Lazy writes/sec":           "mssql.performance.lazy_writes_per_sec",
-		"Page reads/sec":            "mssql.performance.page_reads_per_sec",
-		"Page writes/sec":           "mssql.performance.page_writes_per_sec",
-		"Lock Requests/sec":         "mssql.performance.lock_requests_per_sec",
-		"Lock Timeouts/sec":         "mssql.performance.lock_timeouts_per_sec",
-		"Lock Waits/sec":            "mssql.performance.lock_waits_per_sec",
+		"Lazy writes/sec":           "mssql.performance.lazy_writes_count",
+		"Page reads/sec":            "mssql.performance.page_reads_count",
+		"Page writes/sec":           "mssql.performance.page_writes_count",
+		"Lock Requests/sec":         "mssql.performance.lock_requests_count",
+		"Lock Timeouts/sec":         "mssql.performance.lock_timeouts_count",
+		"Lock Waits/sec":            "mssql.performance.lock_waits_count",
 		"Target Server Memory (KB)": "mssql.memory.target_server_memory",
 		"Total Server Memory (KB)":  "mssql.memory.total_server_memory",
 	}
@@ -511,10 +686,54 @@ func (m *MSSQLMetricsCollector) mapCounterToMetric(counterName string) string {
 	return counterMap[counterName]
 }
 
+// mapTransactionCounterToMetric maps SQL Server transaction counter names to metric names
+func (m *MSSQLMetricsCollector) mapTransactionCounterToMetric(counterName string) string {
+	counterMap := map[string]string{
+		// Core Transaction Metrics from MSSQL$ONLINE:Transactions
+		"Transactions":                     "mssql.transactions.active_total",
+		"Snapshot Transactions":            "mssql.transactions.snapshot_active",
+		"Update Snapshot Transactions":     "mssql.transactions.update_snapshot_active",
+		"NonSnapshot Version Transactions": "mssql.transactions.nonsnapshot_version_active",
+		"Longest Transaction Running Time": "mssql.transactions.longest_running_time_seconds",
+		"Update conflict ratio":            "mssql.transactions.update_conflict_ratio",
+		"Free Space in tempdb (KB)":        "mssql.transactions.tempdb_free_space_kb",
+		"Version Generation rate (KB/s)":   "mssql.transactions.version_generation_rate_kb_count",
+		"Version Cleanup rate (KB/s)":      "mssql.transactions.version_cleanup_rate_kb_count",
+		"Version Store Size (KB)":          "mssql.transactions.version_store_size_kb",
+		"Version Store unit count":         "mssql.transactions.version_store_unit_count",
+		"Version Store unit creation":      "mssql.transactions.version_store_unit_creation",
+		"Version Store unit truncation":    "mssql.transactions.version_store_unit_truncation",
+
+		// Database-Level Transaction Metrics from MSSQL$ONLINE:Databases
+		"Active Transactions":      "mssql.transactions.active_by_database",
+		"Transactions/sec":         "mssql.transactions.count",
+		"Tracked transactions/sec": "mssql.transactions.tracked_count",
+		"Write Transactions/sec":   "mssql.transactions.write_count",
+
+		// AlwaysOn/Replication Transaction Metrics from MSSQL$ONLINE:Database Replica
+		"Mirrored Write Transactions/sec": "mssql.transactions.mirrored_write_count",
+		"Transaction Delay":               "mssql.transactions.replication_delay",
+
+		// In-Memory OLTP Transaction Metrics from SQL Server 2016 XTP
+		"Transactions created/sec":            "mssql.transactions.xtp_created_count",
+		"Transactions aborted/sec":            "mssql.transactions.xtp_aborted_count",
+		"Transactions aborted by user/sec":    "mssql.transactions.xtp_aborted_by_user_count",
+		"Transaction validation failures/sec": "mssql.transactions.xtp_validation_failures_count",
+		"Read-only transactions prepared/sec": "mssql.transactions.xtp_readonly_prepared_count",
+		"Save points created/sec":             "mssql.transactions.xtp_savepoints_created_count",
+		"Save point rollbacks/sec":            "mssql.transactions.xtp_savepoint_rollbacks_count",
+		"Cascading aborts/sec":                "mssql.transactions.xtp_cascading_aborts_count",
+		"Commit dependencies taken/sec":       "mssql.transactions.xtp_commit_dependencies_count",
+	}
+
+	return counterMap[counterName]
+}
+
 // getCounterUnit returns the appropriate unit for a counter
 func (m *MSSQLMetricsCollector) getCounterUnit(counterName string) string {
+	// SQL Server /sec counters are cumulative, not rates - let monitoring system calculate rate
 	if strings.Contains(counterName, "/sec") {
-		return "per_second"
+		return "count" // Changed from "per_second" to "count"
 	}
 	if strings.Contains(counterName, "ratio") {
 		return "percent"
@@ -523,6 +742,24 @@ func (m *MSSQLMetricsCollector) getCounterUnit(counterName string) string {
 		return "kilobytes"
 	}
 	if strings.Contains(counterName, "expectancy") {
+		return "seconds"
+	}
+	return "count"
+}
+
+// getTransactionCounterUnit returns the appropriate unit for a transaction counter
+func (m *MSSQLMetricsCollector) getTransactionCounterUnit(counterName string) string {
+	// SQL Server /sec counters are cumulative, not rates - let monitoring system calculate rate
+	if strings.Contains(counterName, "/sec") || strings.Contains(counterName, "rate") {
+		return "count" // Changed from "per_second" to "count"
+	}
+	if strings.Contains(counterName, "ratio") {
+		return "percent"
+	}
+	if strings.Contains(counterName, "(KB)") || strings.Contains(counterName, "KB") {
+		return "kilobytes"
+	}
+	if strings.Contains(counterName, "Time") {
 		return "seconds"
 	}
 	return "count"
@@ -548,6 +785,13 @@ func (m *MSSQLMetricsCollector) getAgentID() string {
 
 // CollectAllMetrics collects both system and database metrics
 func (m *MSSQLMetricsCollector) CollectAllMetrics() ([]*MetricBatch, error) {
+	// Add panic recovery for the entire collection process
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("DEBUG: CollectAllMetrics - PANIC RECOVERED: %v", r)
+		}
+	}()
+
 	var batches []*MetricBatch
 
 	// Collect system metrics
@@ -565,6 +809,5 @@ func (m *MSSQLMetricsCollector) CollectAllMetrics() ([]*MetricBatch, error) {
 	} else {
 		batches = append(batches, dbBatch)
 	}
-
 	return batches, nil
 }
