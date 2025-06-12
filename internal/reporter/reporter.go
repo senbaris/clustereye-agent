@@ -5971,7 +5971,15 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 		log.Printf("standby.signal dosyası oluşturuldu: %s", standbySignalPath)
 
 		// postgresql.conf dosyasını güncelle
-		postgresqlConfPath := filepath.Join(dataDir, "postgresql.conf")
+		// Ubuntu'da postgresql.conf /etc/postgresql/VERSION/main/ dizininde
+		postgresqlConfPath := fmt.Sprintf("/etc/postgresql/%s/main/postgresql.conf", majorVersion)
+
+		// Fallback: Eğer /etc dizininde yoksa data directory'de dene
+		if _, err := os.Stat(postgresqlConfPath); os.IsNotExist(err) {
+			postgresqlConfPath = filepath.Join(dataDir, "postgresql.conf")
+			log.Printf("DEBUG: /etc postgresql.conf bulunamadı, data directory deneniyor: %s", postgresqlConfPath)
+		}
+
 		log.Printf("DEBUG: updatePostgreSQLConf çağrılıyor: %s", postgresqlConfPath)
 		err = r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
 		if err != nil {
