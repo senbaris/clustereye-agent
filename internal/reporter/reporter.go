@@ -5806,11 +5806,25 @@ func (r *Reporter) checkTimelineStatus() (string, error) {
 func (r *Reporter) stopPostgreSQLService() error {
 	log.Printf("PostgreSQL servisi durduruluyor...")
 
-	// Systemctl ile durdurma deneyi
-	cmd := exec.Command("systemctl", "stop", "postgresql")
-	if err := cmd.Run(); err == nil {
-		log.Printf("PostgreSQL servisi systemctl ile durduruldu")
-		return nil
+	// Cluster-aware servis adlarını dene
+	pgVersion := postgres.GetPGVersion()
+	majorVersion := strings.Split(pgVersion, ".")[0]
+
+	serviceNames := []string{
+		fmt.Sprintf("postgresql@%s-main", majorVersion), // Ubuntu cluster: postgresql@15-main
+		"postgresql", // Genel: postgresql
+		fmt.Sprintf("postgresql-%s", majorVersion), // RHEL/CentOS: postgresql-15
+		"postgresql.service",                       // Açık service adı
+	}
+
+	// Systemctl ile cluster-aware durdurma deneyi
+	for _, serviceName := range serviceNames {
+		cmd := exec.Command("systemctl", "stop", serviceName)
+		if err := cmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi systemctl ile durduruldu: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi systemctl ile durdurulamadı, sonraki deneniyor", serviceName)
 	}
 
 	// pg_ctl ile durdurma deneyi
@@ -5821,27 +5835,45 @@ func (r *Reporter) stopPostgreSQLService() error {
 			log.Printf("PostgreSQL servisi pg_ctl ile durduruldu")
 			return nil
 		}
+		log.Printf("DEBUG: pg_ctl ile durdurma başarısız")
 	}
 
 	// Service komutu ile durdurma deneyi
-	serviceCmd := exec.Command("service", "postgresql", "stop")
-	if err := serviceCmd.Run(); err == nil {
-		log.Printf("PostgreSQL servisi service komutu ile durduruldu")
-		return nil
+	for _, serviceName := range serviceNames {
+		serviceCmd := exec.Command("service", serviceName, "stop")
+		if err := serviceCmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi service komutu ile durduruldu: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi service komutu ile durdurulamadı", serviceName)
 	}
 
-	return fmt.Errorf("PostgreSQL servisi durdurulamadı")
+	return fmt.Errorf("PostgreSQL servisi durdurulamadı - tüm yöntemler başarısız")
 }
 
 // startPostgreSQLService PostgreSQL servisini başlatır
 func (r *Reporter) startPostgreSQLService() error {
 	log.Printf("PostgreSQL servisi başlatılıyor...")
 
-	// Systemctl ile başlatma deneyi
-	cmd := exec.Command("systemctl", "start", "postgresql")
-	if err := cmd.Run(); err == nil {
-		log.Printf("PostgreSQL servisi systemctl ile başlatıldı")
-		return nil
+	// Cluster-aware servis adlarını dene
+	pgVersion := postgres.GetPGVersion()
+	majorVersion := strings.Split(pgVersion, ".")[0]
+
+	serviceNames := []string{
+		fmt.Sprintf("postgresql@%s-main", majorVersion), // Ubuntu cluster: postgresql@15-main
+		"postgresql", // Genel: postgresql
+		fmt.Sprintf("postgresql-%s", majorVersion), // RHEL/CentOS: postgresql-15
+		"postgresql.service",                       // Açık service adı
+	}
+
+	// Systemctl ile cluster-aware başlatma deneyi
+	for _, serviceName := range serviceNames {
+		cmd := exec.Command("systemctl", "start", serviceName)
+		if err := cmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi systemctl ile başlatılamadı, sonraki deneniyor", serviceName)
 	}
 
 	// pg_ctl ile başlatma deneyi
@@ -5852,16 +5884,20 @@ func (r *Reporter) startPostgreSQLService() error {
 			log.Printf("PostgreSQL servisi pg_ctl ile başlatıldı")
 			return nil
 		}
+		log.Printf("DEBUG: pg_ctl ile başlatma başarısız")
 	}
 
 	// Service komutu ile başlatma deneyi
-	serviceCmd := exec.Command("service", "postgresql", "start")
-	if err := serviceCmd.Run(); err == nil {
-		log.Printf("PostgreSQL servisi service komutu ile başlatıldı")
-		return nil
+	for _, serviceName := range serviceNames {
+		serviceCmd := exec.Command("service", serviceName, "start")
+		if err := serviceCmd.Run(); err == nil {
+			log.Printf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi service komutu ile başlatılamadı", serviceName)
 	}
 
-	return fmt.Errorf("PostgreSQL servisi başlatılamadı")
+	return fmt.Errorf("PostgreSQL servisi başlatılamadı - tüm yöntemler başarısız")
 }
 
 // createStandbyConfiguration standby konfigürasyon dosyalarını oluşturur
