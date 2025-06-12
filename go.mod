@@ -7,7 +7,7 @@ require (
 	github.com/kardianos/service v1.2.2
 	github.com/lib/pq v1.10.9
 	github.com/microsoft/go-mssqldb v1.8.0
-	github.com/sefaphlvn/clustereye-test v1.0.70
+	github.com/sefaphlvn/clustereye-test v1.0.107
 	go.mongodb.org/mongo-driver v1.17.3
 	golang.org/x/sys v0.33.0
 	google.golang.org/grpc v1.72.0

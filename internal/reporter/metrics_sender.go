@@ -245,8 +245,8 @@ func (ms *MetricsSender) sendMetricBatch(ctx context.Context, batch *mssql.Metri
 	// Log any errors from server
 	if len(response.Errors) > 0 {
 		log.Printf("DEBUG: sendMetricBatch - Server returned %d errors:", len(response.Errors))
-		for i, errMsg := range response.Errors {
-			log.Printf("DEBUG: sendMetricBatch - Server error %d: %s", i+1, errMsg)
+		for _, errMsg := range response.Errors {
+			log.Printf("DEBUG: sendMetricBatch - Server error: %s", errMsg)
 			log.Printf("Server metric processing error: %s", errMsg)
 		}
 	} else {
@@ -284,16 +284,12 @@ func (ms *MetricsSender) convertMetricValue(value mssql.MetricValue) *pb.MetricV
 
 // SendPostgreSQLMetrics collects and sends PostgreSQL metrics
 func (ms *MetricsSender) SendPostgreSQLMetrics(ctx context.Context) error {
-	log.Printf("DEBUG: SendPostgreSQLMetrics - Starting metrics collection and sending process")
 
 	// Collect all PostgreSQL metrics
 	metricBatches, err := ms.postgresqlCollector.CollectAllMetrics()
 	if err != nil {
-		log.Printf("DEBUG: SendPostgreSQLMetrics - Failed to collect metrics: %v", err)
 		return fmt.Errorf("failed to collect PostgreSQL metrics: %w", err)
 	}
-
-	log.Printf("DEBUG: SendPostgreSQLMetrics - Collected %d metric batches", len(metricBatches))
 
 	// Send each batch
 	for i, batch := range metricBatches {
@@ -334,13 +330,11 @@ func (ms *MetricsSender) SendPostgreSQLMetrics(ctx context.Context) error {
 
 // sendPostgreSQLMetricBatch converts internal PostgreSQL metric batch to protobuf and sends it
 func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *postgres.MetricBatch) error {
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Starting to send batch: Type=%s, Metrics=%d", batch.MetricType, len(batch.Metrics))
 
 	// Convert internal metrics to protobuf
 	pbMetrics := make([]*pb.Metric, 0, len(batch.Metrics))
 
-	for i, metric := range batch.Metrics {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - Converting metric %d: %s", i+1, metric.Name)
+	for _, metric := range batch.Metrics {
 
 		pbMetric := &pb.Metric{
 			Name:        metric.Name,
@@ -364,8 +358,6 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 		pbMetrics = append(pbMetrics, pbMetric)
 	}
 
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Converted %d metrics to protobuf", len(pbMetrics))
-
 	// Create metric batch
 	pbBatch := &pb.MetricBatch{
 		AgentId:             batch.AgentID,
@@ -375,24 +367,17 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 		Metadata:            batch.Metadata,
 	}
 
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Created protobuf batch: AgentID=%s, Type=%s, Timestamp=%d, Metadata=%v",
-		pbBatch.AgentId, pbBatch.MetricType, pbBatch.CollectionTimestamp, pbBatch.Metadata)
-
 	// Create request
 	request := &pb.SendMetricsRequest{
 		Batch: pbBatch,
 	}
 
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Created gRPC request, preparing to send")
-
 	// Send metrics via gRPC
 	if ms.reporter.grpcClient == nil {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - ERROR: gRPC client not available")
 		return fmt.Errorf("gRPC client not available")
 	}
 
 	client := pb.NewAgentServiceClient(ms.reporter.grpcClient)
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Created gRPC client, sending request")
 
 	// Set timeout for the request
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -400,15 +385,10 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 
 	response, err := client.SendMetrics(ctx, request)
 	if err != nil {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - ERROR: gRPC SendMetrics call failed: %v", err)
 		return fmt.Errorf("failed to send PostgreSQL metrics: %w", err)
 	}
 
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Received response from server: Status=%s, Message=%s, ProcessedCount=%d",
-		response.Status, response.Message, response.ProcessedCount)
-
 	if response.Status != "success" {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - ERROR: Server returned non-success status: %s - %s", response.Status, response.Message)
 		return fmt.Errorf("server returned error: %s - %s", response.Status, response.Message)
 	}
 
@@ -416,16 +396,11 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 
 	// Log any errors from server
 	if len(response.Errors) > 0 {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - Server returned %d errors:", len(response.Errors))
-		for i, errMsg := range response.Errors {
-			log.Printf("DEBUG: sendPostgreSQLMetricBatch - Server error %d: %s", i+1, errMsg)
+		for _, errMsg := range response.Errors {
 			log.Printf("Server PostgreSQL metric processing error: %s", errMsg)
 		}
-	} else {
-		log.Printf("DEBUG: sendPostgreSQLMetricBatch - No errors from server")
 	}
 
-	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Successfully completed batch sending")
 	return nil
 }
 
@@ -621,8 +596,8 @@ func (ms *MetricsSender) sendMongoDBMetricBatch(ctx context.Context, batch *mong
 	// Convert internal metrics to protobuf
 	pbMetrics := make([]*pb.Metric, 0, len(batch.Metrics))
 
-	for i, metric := range batch.Metrics {
-		log.Printf("DEBUG: sendMongoDBMetricBatch - Converting metric %d: %s", i+1, metric.Name)
+	for _, metric := range batch.Metrics {
+		log.Printf("DEBUG: sendMongoDBMetricBatch - Converting metric: %s", metric.Name)
 
 		pbMetric := &pb.Metric{
 			Name:        metric.Name,
@@ -699,8 +674,8 @@ func (ms *MetricsSender) sendMongoDBMetricBatch(ctx context.Context, batch *mong
 	// Log any errors from server
 	if len(response.Errors) > 0 {
 		log.Printf("DEBUG: sendMongoDBMetricBatch - Server returned %d errors:", len(response.Errors))
-		for i, errMsg := range response.Errors {
-			log.Printf("DEBUG: sendMongoDBMetricBatch - Server error %d: %s", i+1, errMsg)
+		for _, errMsg := range response.Errors {
+			log.Printf("DEBUG: sendMongoDBMetricBatch - Server error: %s", errMsg)
 			log.Printf("Server MongoDB metric processing error: %s", errMsg)
 		}
 	} else {

@@ -4555,11 +4555,17 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Promotion başarılı olduktan sonra API'ye koordinasyon talebi gönder
 	logger.LogMessage("PostgreSQL promotion başarılı, API'ye failover koordinasyon talebi gönderiliyor...")
 
-	// Eski master'ı cluster'da bul
-	oldMasterHost, err := r.findOldMasterInCluster(req.NodeHostname)
-	if err != nil {
-		logger.LogMessage(fmt.Sprintf("Eski master bulunamadı: %v", err))
-		oldMasterHost = "" // Boş bırak, API cluster discovery yapabilir
+	// Eski master bilgisini request'ten al (API'den gelecek)
+	oldMasterHost := req.CurrentMasterHost
+	if oldMasterHost == "" {
+		logger.LogMessage("UYARI: Request'te current_master_host bilgisi yok")
+		// Fallback olarak config'den deneyebiliriz
+		if r.cfg != nil && r.cfg.PostgreSQL.Host != "" && r.cfg.PostgreSQL.Host != req.NodeHostname {
+			oldMasterHost = r.cfg.PostgreSQL.Host
+			logger.LogMessage(fmt.Sprintf("Fallback: Config'den eski master alındı: %s", oldMasterHost))
+		}
+	} else {
+		logger.LogMessage(fmt.Sprintf("Request'ten eski master alındı: %s", oldMasterHost))
 	}
 
 	// API'ye failover koordinasyon talebi gönder
@@ -6039,8 +6045,18 @@ func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, d
 	logger.AddMetadata("old_master_host", oldMasterHost)
 	logger.AddMetadata("new_master_host", newMasterHost)
 	logger.AddMetadata("data_directory", dataDir)
-	logger.AddMetadata("replication_user", r.cfg.PostgreSQL.ReplicationUser)
-	logger.AddMetadata("replication_pass", r.cfg.PostgreSQL.ReplicationPass)
+
+	// Replication kullanıcı bilgilerini config'den al
+	replUser := r.cfg.PostgreSQL.ReplicationUser
+	replPassword := r.cfg.PostgreSQL.ReplicationPass
+	replPort := r.cfg.PostgreSQL.Port
+	if replPort == "" {
+		replPort = "5432" // Varsayılan PostgreSQL portu
+	}
+
+	logger.AddMetadata("replication_user", replUser)
+	logger.AddMetadata("replication_password", replPassword)
+	logger.AddMetadata("replication_port", replPort)
 	logger.AddMetadata("action", "convert_master_to_slave")
 	logger.AddMetadata("requested_by", "promotion_agent")
 	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
