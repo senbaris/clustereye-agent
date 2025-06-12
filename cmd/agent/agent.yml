@@ -10,7 +10,7 @@ postgresql:
   cluster: postgresnew
   location: istanbul
   replication_user: replicator
-  replication_pass: replica
+  replication_password: replica
 mongo:
   host: localhost
   user: admin

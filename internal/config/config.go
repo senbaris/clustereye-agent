@@ -27,7 +27,7 @@ type AgentConfig struct {
 		Auth            bool   `yaml:"-"` // Auth, dolaylı olarak belirlenir
 		Location        string `yaml:"location"`
 		ReplicationUser string `yaml:"replication_user"`
-		ReplicationPass string `yaml:"replication_pass"`
+		ReplicationPass string `yaml:"replication_password"`
 	} `yaml:"postgresql"`
 
 	// MongoDB Bağlantı Bilgileri

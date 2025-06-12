@@ -1303,7 +1303,7 @@ func (r *Reporter) listenForCommands() {
 				}
 
 				// PostgreSQL promotion özel işleme:
-				// Format: postgres_promote|<data_directory>|<query_id>
+				// Format: postgres_promote|<data_directory>|<query_id>|<current_master_host>
 				if strings.HasPrefix(query.Command, "postgres_promote") {
 					log.Printf("PostgreSQL promotion komutu tespit edildi: %s", query.Command)
 
@@ -1319,7 +1319,14 @@ func (r *Reporter) listenForCommands() {
 							jobID = parts[2] // Özel job ID kullan
 						}
 
-						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s", dataDir, jobID)
+						// Extract current master host (dördüncü parametre, varsa)
+						currentMasterHost := ""
+						if len(parts) >= 4 && parts[3] != "" {
+							currentMasterHost = parts[3]
+							log.Printf("Current master host command'dan alındı: %s", currentMasterHost)
+						}
+
+						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s, CurrentMasterHost=%s", dataDir, jobID, currentMasterHost)
 
 						// Hostname'i al
 						hostname, _ := os.Hostname()
@@ -1327,10 +1334,11 @@ func (r *Reporter) listenForCommands() {
 
 						// RPC isteği oluştur
 						promoteReq := &pb.PostgresPromoteMasterRequest{
-							JobId:         jobID,
-							AgentId:       agentID,
-							NodeHostname:  hostname,
-							DataDirectory: dataDir,
+							JobId:             jobID,
+							AgentId:           agentID,
+							NodeHostname:      hostname,
+							DataDirectory:     dataDir,
+							CurrentMasterHost: currentMasterHost, // Current master host'u ekle
 						}
 
 						// PromotePostgresToMaster RPC'sini çağır
@@ -1372,7 +1380,7 @@ func (r *Reporter) listenForCommands() {
 						// Hemen başlatıldı bilgisi dön
 						initialResult := map[string]interface{}{
 							"status":  "accepted",
-							"message": fmt.Sprintf("PostgreSQL promotion işlemi başlatıldı (JobID: %s, DataDir: %s)", jobID, dataDir),
+							"message": fmt.Sprintf("PostgreSQL promotion işlemi başlatıldı (JobID: %s, DataDir: %s, CurrentMaster: %s)", jobID, dataDir, currentMasterHost),
 							"job_id":  jobID,
 						}
 						sendQueryResult(r.stream, query.QueryId, initialResult)
@@ -1383,7 +1391,7 @@ func (r *Reporter) listenForCommands() {
 						// Eksik parametre
 						errorResult := map[string]interface{}{
 							"status":  "error",
-							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]",
+							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]|[current_master_host]",
 						}
 						sendQueryResult(r.stream, query.QueryId, errorResult)
 						isProcessingQuery = false
@@ -4558,11 +4566,13 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Eski master bilgisini request'ten al (API'den gelecek)
 	oldMasterHost := req.CurrentMasterHost
 	if oldMasterHost == "" {
-		logger.LogMessage("UYARI: Request'te current_master_host bilgisi yok")
+		logger.LogMessage("UYARI: Request'te current_master_host bilgisi yok - postgres_promote komutu current master host parametresi olmadan gönderildi")
 		// Fallback olarak config'den deneyebiliriz
 		if r.cfg != nil && r.cfg.PostgreSQL.Host != "" && r.cfg.PostgreSQL.Host != req.NodeHostname {
 			oldMasterHost = r.cfg.PostgreSQL.Host
-			logger.LogMessage(fmt.Sprintf("Fallback: Config'den eski master alındı: %s", oldMasterHost))
+			logger.LogMessage(fmt.Sprintf("Fallback: Config'den eski master alındı: %s (Config.PostgreSQL.Host)", oldMasterHost))
+		} else {
+			logger.LogMessage("HATA: Config'de de PostgreSQL.Host bulunamadı veya current node ile aynı")
 		}
 	} else {
 		logger.LogMessage(fmt.Sprintf("Request'ten eski master alındı: %s", oldMasterHost))
@@ -6053,6 +6063,19 @@ func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, d
 	if replPort == "" {
 		replPort = "5432" // Varsayılan PostgreSQL portu
 	}
+
+	// Replication credentials kontrolü ve logla
+	if replUser == "" {
+		logger.LogMessage("UYARI: Config'de ReplicationUser boş, normal User kullanılacak")
+		replUser = r.cfg.PostgreSQL.ReplicationUser
+	}
+	if replPassword == "" {
+		logger.LogMessage("UYARI: Config'de ReplicationPassword boş, normal Pass kullanılacak")
+		replPassword = r.cfg.PostgreSQL.ReplicationPass
+	}
+
+	logger.LogMessage(fmt.Sprintf("Replication bilgileri: user=%s, pass_empty=%t, port=%s",
+		replUser, replPassword == "", replPort))
 
 	logger.AddMetadata("replication_user", replUser)
 	logger.AddMetadata("replication_password", replPassword)

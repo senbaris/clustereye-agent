@@ -128,25 +128,6 @@ func (ms *MetricsSender) SendMSSQLMetrics(ctx context.Context) error {
 		log.Printf("DEBUG: SendMSSQLMetrics - Processing batch %d: Type=%s, AgentID=%s, Metrics=%d",
 			i+1, batch.MetricType, batch.AgentID, len(batch.Metrics))
 
-		// Debug log each metric in the batch
-		for j, metric := range batch.Metrics {
-			log.Printf("DEBUG: Batch[%d] Metric[%d]: Name=%s, Unit=%s, Timestamp=%d",
-				i+1, j+1, metric.Name, metric.Unit, metric.Timestamp)
-
-			// Log metric value based on type
-			if metric.Value.DoubleValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %.2f (double)", i+1, j+1, *metric.Value.DoubleValue)
-			} else if metric.Value.IntValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %d (int)", i+1, j+1, *metric.Value.IntValue)
-			} else if metric.Value.StringValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %s (string)", i+1, j+1, *metric.Value.StringValue)
-			} else if metric.Value.BoolValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %t (bool)", i+1, j+1, *metric.Value.BoolValue)
-			} else {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: null or unknown type", i+1, j+1)
-			}
-		}
-
 		if err := ms.sendMetricBatch(ctx, batch); err != nil {
 			log.Printf("DEBUG: SendMSSQLMetrics - Failed to send batch %d (%s): %v", i+1, batch.MetricType, err)
 			log.Printf("Failed to send metric batch %s: %v", batch.MetricType, err)
@@ -295,25 +276,6 @@ func (ms *MetricsSender) SendPostgreSQLMetrics(ctx context.Context) error {
 	for i, batch := range metricBatches {
 		log.Printf("DEBUG: SendPostgreSQLMetrics - Processing batch %d: Type=%s, AgentID=%s, Metrics=%d",
 			i+1, batch.MetricType, batch.AgentID, len(batch.Metrics))
-
-		// Debug log each metric in the batch
-		for j, metric := range batch.Metrics {
-			log.Printf("DEBUG: Batch[%d] Metric[%d]: Name=%s, Unit=%s, Timestamp=%d",
-				i+1, j+1, metric.Name, metric.Unit, metric.Timestamp)
-
-			// Log metric value based on type
-			if metric.Value.DoubleValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %.2f (double)", i+1, j+1, *metric.Value.DoubleValue)
-			} else if metric.Value.IntValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %d (int)", i+1, j+1, *metric.Value.IntValue)
-			} else if metric.Value.StringValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %s (string)", i+1, j+1, *metric.Value.StringValue)
-			} else if metric.Value.BoolValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %t (bool)", i+1, j+1, *metric.Value.BoolValue)
-			} else {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: null or unknown type", i+1, j+1)
-			}
-		}
 
 		if err := ms.sendPostgreSQLMetricBatch(ctx, batch); err != nil {
 			log.Printf("DEBUG: SendPostgreSQLMetrics - Failed to send batch %d (%s): %v", i+1, batch.MetricType, err)
@@ -556,25 +518,6 @@ func (ms *MetricsSender) SendMongoDBMetrics(ctx context.Context) error {
 	for i, batch := range metricBatches {
 		log.Printf("DEBUG: SendMongoDBMetrics - Processing batch %d: Type=%s, AgentID=%s, Metrics=%d",
 			i+1, batch.MetricType, batch.AgentID, len(batch.Metrics))
-
-		// Debug log each metric in the batch
-		for j, metric := range batch.Metrics {
-			log.Printf("DEBUG: Batch[%d] Metric[%d]: Name=%s, Unit=%s, Timestamp=%d",
-				i+1, j+1, metric.Name, metric.Unit, metric.Timestamp)
-
-			// Log metric value based on type
-			if metric.Value.DoubleValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %.2f (double)", i+1, j+1, *metric.Value.DoubleValue)
-			} else if metric.Value.IntValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %d (int)", i+1, j+1, *metric.Value.IntValue)
-			} else if metric.Value.StringValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %s (string)", i+1, j+1, *metric.Value.StringValue)
-			} else if metric.Value.BoolValue != nil {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: %t (bool)", i+1, j+1, *metric.Value.BoolValue)
-			} else {
-				log.Printf("DEBUG: Batch[%d] Metric[%d] Value: null or unknown type", i+1, j+1)
-			}
-		}
 
 		if err := ms.sendMongoDBMetricBatch(ctx, batch); err != nil {
 			log.Printf("DEBUG: SendMongoDBMetrics - Failed to send batch %d (%s): %v", i+1, batch.MetricType, err)
