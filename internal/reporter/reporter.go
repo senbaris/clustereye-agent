@@ -3953,10 +3953,12 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 
 	// Standby konfigürasyonu oluştur
 	logger.LogMessage("Standby konfigürasyonu oluşturuluyor...")
+	log.Printf("DEBUG: createStandbyConfigurationWithVersion çağrılıyor (version: %s)", pgVersion)
 	err = r.createStandbyConfigurationWithVersion(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword, pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("Standby konfigürasyon oluşturma başarısız: %v", err)
 		logger.LogError(errMsg, err)
+		log.Printf("ERROR: Standby konfigürasyon hatası: %v", err)
 		logger.Stop("failed")
 		loggerStopped = true
 		return &ConvertPostgresToSlaveResponse{
@@ -3965,6 +3967,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 			ErrorMessage: errMsg,
 		}, nil
 	}
+	log.Printf("DEBUG: Standby konfigürasyonu başarıyla oluşturuldu")
 
 	// PostgreSQL'i standby modunda başlat
 	logger.LogMessage("PostgreSQL standby modunda başlatılıyor...")
@@ -5969,7 +5972,14 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 
 		// postgresql.conf dosyasını güncelle
 		postgresqlConfPath := filepath.Join(dataDir, "postgresql.conf")
-		return r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
+		log.Printf("DEBUG: updatePostgreSQLConf çağrılıyor: %s", postgresqlConfPath)
+		err = r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
+		if err != nil {
+			log.Printf("ERROR: postgresql.conf güncelleme hatası: %v", err)
+			return err
+		}
+		log.Printf("DEBUG: postgresql.conf başarıyla güncellendi")
+		return nil
 
 	} else {
 		log.Printf("DEBUG: PostgreSQL %d < 12, recovery.conf yöntemi kullanılacak", majorVersionInt)
