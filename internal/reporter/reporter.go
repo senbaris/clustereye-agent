@@ -5868,13 +5868,37 @@ func (r *Reporter) startPostgreSQLService() error {
 func (r *Reporter) createStandbyConfiguration(dataDir, masterHost string, masterPort int, replUser, replPassword string) error {
 	log.Printf("Standby konfigürasyonu oluşturuluyor: %s -> %s:%d", dataDir, masterHost, masterPort)
 
-	// PostgreSQL major version'ı al
+	// PostgreSQL major version'ı al ve debug et
 	pgVersion := postgres.GetPGVersion()
+	log.Printf("DEBUG: Alınan PostgreSQL version: '%s'", pgVersion)
+
 	majorVersion := strings.Split(pgVersion, ".")[0]
-	majorVersionInt, _ := strconv.Atoi(majorVersion)
+	majorVersionInt, parseErr := strconv.Atoi(majorVersion)
+
+	log.Printf("DEBUG: Major version string: '%s', parsed int: %d, parse error: %v", majorVersion, majorVersionInt, parseErr)
+
+	// Parse error varsa fallback olarak 15 kullan (güvenli)
+	if parseErr != nil {
+		log.Printf("WARNING: Version parse hatası, PostgreSQL 15+ olarak varsayılıyor")
+		majorVersionInt = 15
+	}
 
 	// PostgreSQL 12+ için standby.signal dosyası
 	if majorVersionInt >= 12 {
+		log.Printf("DEBUG: PostgreSQL %d >= 12, standby.signal yöntemi kullanılacak", majorVersionInt)
+
+		// Eski recovery.conf dosyasını kaldır (PostgreSQL 12+ için desteklenmiyor)
+		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
+		if _, err := os.Stat(recoveryConfPath); err == nil {
+			log.Printf("WARNING: Eski recovery.conf dosyası bulundu, kaldırılıyor: %s", recoveryConfPath)
+			if removeErr := os.Remove(recoveryConfPath); removeErr != nil {
+				log.Printf("ERROR: recovery.conf kaldırılamadı: %v", removeErr)
+				return fmt.Errorf("eski recovery.conf dosyası kaldırılamadı: %v", removeErr)
+			} else {
+				log.Printf("SUCCESS: Eski recovery.conf dosyası başarıyla kaldırıldı")
+			}
+		}
+
 		// standby.signal dosyası oluştur
 		standbySignalPath := filepath.Join(dataDir, "standby.signal")
 		signalFile, err := os.Create(standbySignalPath)
@@ -5889,6 +5913,7 @@ func (r *Reporter) createStandbyConfiguration(dataDir, masterHost string, master
 		return r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
 
 	} else {
+		log.Printf("DEBUG: PostgreSQL %d < 12, recovery.conf yöntemi kullanılacak", majorVersionInt)
 		// PostgreSQL 11 ve öncesi için recovery.conf dosyası
 		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
 		return r.createRecoveryConf(recoveryConfPath, masterHost, masterPort, replUser, replPassword)
