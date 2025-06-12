@@ -3968,10 +3968,12 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 
 	// PostgreSQL'i standby modunda başlat
 	logger.LogMessage("PostgreSQL standby modunda başlatılıyor...")
+	log.Printf("DEBUG: startPostgreSQLServiceWithVersion çağrılıyor (version: %s)", pgVersion)
 	err = r.startPostgreSQLServiceWithVersion(pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("PostgreSQL standby modunda başlatma başarısız: %v", err)
 		logger.LogError(errMsg, err)
+		log.Printf("ERROR: PostgreSQL başlatma hatası: %v", err)
 		logger.Stop("failed")
 		loggerStopped = true
 		return &ConvertPostgresToSlaveResponse{
@@ -3980,6 +3982,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 			ErrorMessage: errMsg,
 		}, nil
 	}
+	log.Printf("DEBUG: PostgreSQL başarıyla başlatıldı, slave durumu kontrol edilecek")
 
 	// Standby durumunu doğrula
 	logger.LogMessage("Standby durumu doğrulanıyor...")
@@ -5808,51 +5811,8 @@ func (r *Reporter) checkTimelineStatus() (string, error) {
 
 // stopPostgreSQLService PostgreSQL servisini durdurur
 func (r *Reporter) stopPostgreSQLService() error {
-	log.Printf("PostgreSQL servisi durduruluyor...")
-
-	// Cluster-aware servis adlarını dene
 	pgVersion := postgres.GetPGVersion()
-	majorVersion := strings.Split(pgVersion, ".")[0]
-
-	serviceNames := []string{
-		fmt.Sprintf("postgresql@%s-main", majorVersion), // Ubuntu cluster: postgresql@15-main
-		"postgresql", // Genel: postgresql
-		fmt.Sprintf("postgresql-%s", majorVersion), // RHEL/CentOS: postgresql-15
-		"postgresql.service",                       // Açık service adı
-	}
-
-	// Systemctl ile cluster-aware durdurma deneyi
-	for _, serviceName := range serviceNames {
-		cmd := exec.Command("systemctl", "stop", serviceName)
-		if err := cmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi systemctl ile durduruldu: %s", serviceName)
-			return nil
-		}
-		log.Printf("DEBUG: %s servisi systemctl ile durdurulamadı, sonraki deneniyor", serviceName)
-	}
-
-	// pg_ctl ile durdurma deneyi
-	dataDir, err := postgres.GetDataDirectory()
-	if err == nil {
-		pgCtlCmd := exec.Command("pg_ctl", "stop", "-D", dataDir, "-m", "fast")
-		if err := pgCtlCmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi pg_ctl ile durduruldu")
-			return nil
-		}
-		log.Printf("DEBUG: pg_ctl ile durdurma başarısız")
-	}
-
-	// Service komutu ile durdurma deneyi
-	for _, serviceName := range serviceNames {
-		serviceCmd := exec.Command("service", serviceName, "stop")
-		if err := serviceCmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi service komutu ile durduruldu: %s", serviceName)
-			return nil
-		}
-		log.Printf("DEBUG: %s servisi service komutu ile durdurulamadı", serviceName)
-	}
-
-	return fmt.Errorf("PostgreSQL servisi durdurulamadı - tüm yöntemler başarısız")
+	return r.stopPostgreSQLServiceWithVersion(pgVersion)
 }
 
 // stopPostgreSQLServiceWithVersion PostgreSQL servisini durdurur (version cached)
@@ -5905,51 +5865,8 @@ func (r *Reporter) stopPostgreSQLServiceWithVersion(pgVersion string) error {
 
 // startPostgreSQLService PostgreSQL servisini başlatır
 func (r *Reporter) startPostgreSQLService() error {
-	log.Printf("PostgreSQL servisi başlatılıyor...")
-
-	// Cluster-aware servis adlarını dene
 	pgVersion := postgres.GetPGVersion()
-	majorVersion := strings.Split(pgVersion, ".")[0]
-
-	serviceNames := []string{
-		fmt.Sprintf("postgresql@%s-main", majorVersion), // Ubuntu cluster: postgresql@15-main
-		"postgresql", // Genel: postgresql
-		fmt.Sprintf("postgresql-%s", majorVersion), // RHEL/CentOS: postgresql-15
-		"postgresql.service",                       // Açık service adı
-	}
-
-	// Systemctl ile cluster-aware başlatma deneyi
-	for _, serviceName := range serviceNames {
-		cmd := exec.Command("systemctl", "start", serviceName)
-		if err := cmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName)
-			return nil
-		}
-		log.Printf("DEBUG: %s servisi systemctl ile başlatılamadı, sonraki deneniyor", serviceName)
-	}
-
-	// pg_ctl ile başlatma deneyi
-	dataDir, err := postgres.GetDataDirectory()
-	if err == nil {
-		pgCtlCmd := exec.Command("pg_ctl", "start", "-D", dataDir)
-		if err := pgCtlCmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi pg_ctl ile başlatıldı")
-			return nil
-		}
-		log.Printf("DEBUG: pg_ctl ile başlatma başarısız")
-	}
-
-	// Service komutu ile başlatma deneyi
-	for _, serviceName := range serviceNames {
-		serviceCmd := exec.Command("service", serviceName, "start")
-		if err := serviceCmd.Run(); err == nil {
-			log.Printf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName)
-			return nil
-		}
-		log.Printf("DEBUG: %s servisi service komutu ile başlatılamadı", serviceName)
-	}
-
-	return fmt.Errorf("PostgreSQL servisi başlatılamadı - tüm yöntemler başarısız")
+	return r.startPostgreSQLServiceWithVersion(pgVersion)
 }
 
 // startPostgreSQLServiceWithVersion PostgreSQL servisini başlatır (version cached)
@@ -6002,58 +5919,9 @@ func (r *Reporter) startPostgreSQLServiceWithVersion(pgVersion string) error {
 
 // createStandbyConfiguration standby konfigürasyon dosyalarını oluşturur
 func (r *Reporter) createStandbyConfiguration(dataDir, masterHost string, masterPort int, replUser, replPassword string) error {
-	log.Printf("Standby konfigürasyonu oluşturuluyor: %s -> %s:%d", dataDir, masterHost, masterPort)
-
-	// PostgreSQL major version'ı al ve debug et
+	// Default olarak GetPGVersion kullan (backward compatibility)
 	pgVersion := postgres.GetPGVersion()
-	log.Printf("DEBUG: Alınan PostgreSQL version: '%s'", pgVersion)
-
-	majorVersion := strings.Split(pgVersion, ".")[0]
-	majorVersionInt, parseErr := strconv.Atoi(majorVersion)
-
-	log.Printf("DEBUG: Major version string: '%s', parsed int: %d, parse error: %v", majorVersion, majorVersionInt, parseErr)
-
-	// Parse error varsa fallback olarak 15 kullan (güvenli)
-	if parseErr != nil {
-		log.Printf("WARNING: Version parse hatası, PostgreSQL 15+ olarak varsayılıyor")
-		majorVersionInt = 15
-	}
-
-	// PostgreSQL 12+ için standby.signal dosyası
-	if majorVersionInt >= 12 {
-		log.Printf("DEBUG: PostgreSQL %d >= 12, standby.signal yöntemi kullanılacak", majorVersionInt)
-
-		// Eski recovery.conf dosyasını kaldır (PostgreSQL 12+ için desteklenmiyor)
-		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
-		if _, err := os.Stat(recoveryConfPath); err == nil {
-			log.Printf("WARNING: Eski recovery.conf dosyası bulundu, kaldırılıyor: %s", recoveryConfPath)
-			if removeErr := os.Remove(recoveryConfPath); removeErr != nil {
-				log.Printf("ERROR: recovery.conf kaldırılamadı: %v", removeErr)
-				return fmt.Errorf("eski recovery.conf dosyası kaldırılamadı: %v", removeErr)
-			} else {
-				log.Printf("SUCCESS: Eski recovery.conf dosyası başarıyla kaldırıldı")
-			}
-		}
-
-		// standby.signal dosyası oluştur
-		standbySignalPath := filepath.Join(dataDir, "standby.signal")
-		signalFile, err := os.Create(standbySignalPath)
-		if err != nil {
-			return fmt.Errorf("standby.signal dosyası oluşturulamadı: %v", err)
-		}
-		signalFile.Close()
-		log.Printf("standby.signal dosyası oluşturuldu: %s", standbySignalPath)
-
-		// postgresql.conf dosyasını güncelle
-		postgresqlConfPath := filepath.Join(dataDir, "postgresql.conf")
-		return r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
-
-	} else {
-		log.Printf("DEBUG: PostgreSQL %d < 12, recovery.conf yöntemi kullanılacak", majorVersionInt)
-		// PostgreSQL 11 ve öncesi için recovery.conf dosyası
-		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
-		return r.createRecoveryConf(recoveryConfPath, masterHost, masterPort, replUser, replPassword)
-	}
+	return r.createStandbyConfigurationWithVersion(dataDir, masterHost, masterPort, replUser, replPassword, pgVersion)
 }
 
 // createStandbyConfigurationWithVersion standby konfigürasyon dosyalarını oluşturur (version cached)
