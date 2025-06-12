@@ -6011,14 +6011,19 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 		signalFile.Close()
 		log.Printf("standby.signal dosyası oluşturuldu: %s", standbySignalPath)
 
-		// postgresql.conf dosyasını güncelle
-		// Ubuntu'da postgresql.conf /etc/postgresql/VERSION/main/ dizininde
-		postgresqlConfPath := fmt.Sprintf("/etc/postgresql/%s/main/postgresql.conf", majorVersion)
+		// postgresql.conf dosyasını dinamik olarak bul
+		postgresqlConfPath, err := r.findPostgreSQLConfigFile()
+		if err != nil {
+			log.Printf("DEBUG: Dinamik config dosyası bulunamadı: %v, fallback yöntemler deneniyor", err)
 
-		// Fallback: Eğer /etc dizininde yoksa data directory'de dene
-		if _, err := os.Stat(postgresqlConfPath); os.IsNotExist(err) {
-			postgresqlConfPath = filepath.Join(dataDir, "postgresql.conf")
-			log.Printf("DEBUG: /etc postgresql.conf bulunamadı, data directory deneniyor: %s", postgresqlConfPath)
+			// Fallback 1: Standart Ubuntu yolu
+			postgresqlConfPath = fmt.Sprintf("/etc/postgresql/%s/main/postgresql.conf", majorVersion)
+
+			// Fallback 2: Data directory'de ara
+			if _, err := os.Stat(postgresqlConfPath); os.IsNotExist(err) {
+				postgresqlConfPath = filepath.Join(dataDir, "postgresql.conf")
+				log.Printf("DEBUG: /etc postgresql.conf bulunamadı, data directory deneniyor: %s", postgresqlConfPath)
+			}
 		}
 
 		log.Printf("DEBUG: updatePostgreSQLConf çağrılıyor: %s", postgresqlConfPath)
@@ -6071,6 +6076,60 @@ hot_standby = on
 	return nil
 }
 
+// findPostgreSQLConfigFile PostgreSQL config dosyasını dinamik olarak bulur
+func (r *Reporter) findPostgreSQLConfigFile() (string, error) {
+	log.Printf("DEBUG: PostgreSQL config dosyası dinamik olarak aranıyor...")
+
+	// Yöntem 1: Eğer PostgreSQL çalışıyorsa, SQL komutu ile config dosyasını bul
+	db, err := postgres.OpenDB()
+	if err == nil {
+		defer db.Close()
+
+		// PostgreSQL'den config dosyası yolunu al
+		var configFile string
+		err = db.QueryRow("SHOW config_file").Scan(&configFile)
+		if err == nil && configFile != "" {
+			// Dosyanın varlığını kontrol et
+			if _, err := os.Stat(configFile); err == nil {
+				log.Printf("DEBUG: PostgreSQL SQL'den config dosyası bulundu: %s", configFile)
+				return configFile, nil
+			}
+		}
+		log.Printf("DEBUG: PostgreSQL SQL'den config dosyası bulunamadı: %v", err)
+	}
+
+	// Yöntem 2: postgres paketi FindPostgresConfigFile fonksiyonunu kullan
+	configFile, err := postgres.FindPostgresConfigFile()
+	if err == nil && configFile != "" {
+		log.Printf("DEBUG: Postgres package'dan config dosyası bulundu: %s", configFile)
+		return configFile, nil
+	}
+	log.Printf("DEBUG: Postgres package'dan config dosyası bulunamadı: %v", err)
+
+	// Yöntem 3: PostgreSQL process'lerini kontrol et
+	cmd := exec.Command("ps", "aux")
+	output, err := cmd.Output()
+	if err == nil {
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "postgres") && strings.Contains(line, "-c config_file=") {
+				// -c config_file=/path/to/postgresql.conf pattern'ini ara
+				pattern := regexp.MustCompile(`-c\s+config_file=([^\s]+)`)
+				matches := pattern.FindStringSubmatch(line)
+				if len(matches) > 1 {
+					configFile := matches[1]
+					if _, err := os.Stat(configFile); err == nil {
+						log.Printf("DEBUG: Process'lerden config dosyası bulundu: %s", configFile)
+						return configFile, nil
+					}
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("PostgreSQL config dosyası dinamik olarak bulunamadı")
+}
+
 // createRecoveryConf recovery.conf dosyası oluşturur (PostgreSQL 11 ve öncesi)
 func (r *Reporter) createRecoveryConf(recoveryPath, masterHost string, masterPort int, replUser, replPassword string) error {
 	log.Printf("recovery.conf dosyası oluşturuluyor: %s", recoveryPath)
@@ -6091,95 +6150,6 @@ hot_standby = on
 	}
 
 	log.Printf("recovery.conf başarıyla oluşturuldu")
-	return nil
-}
-
-// findOldMasterInCluster cluster'da eski master node'unu bulmaya çalışır
-func (r *Reporter) findOldMasterInCluster(currentNodeHostname string) (string, error) {
-	log.Printf("Cluster'da eski master aranıyor (mevcut node: %s)", currentNodeHostname)
-
-	// Bu fonksiyon gelecekte cluster discovery mekanizması ile geliştirilecek
-	// Şimdilik config'den veya environment'tan eski master bilgisini almaya çalışalım
-
-	// Config'den cluster node'larını alabilir veya
-	// Agent'lar arası iletişim kurarak diğer node'ları bulabiliriz
-
-	// Geçici çözüm: Environment variable'dan eski master'ı al
-	oldMaster := os.Getenv("OLD_MASTER_HOST")
-	if oldMaster != "" && oldMaster != currentNodeHostname {
-		log.Printf("Environment'tan eski master bulundu: %s", oldMaster)
-		return oldMaster, nil
-	}
-
-	// Config'den cluster bilgilerini almaya çalış
-	if r.cfg != nil && r.cfg.PostgreSQL.Cluster != "" {
-		// Cluster isminden node listesi çıkarmaya çalışabiliriz
-		// Bu kısım cluster yönetim sistemine göre değişecek
-		log.Printf("Cluster config: %s", r.cfg.PostgreSQL.Cluster)
-	}
-
-	return "", fmt.Errorf("eski master node'u bulunamadı")
-}
-
-// sendConvertToSlaveCommand eski master'a slave'e dönüşüm komutu gönderir
-func (r *Reporter) sendConvertToSlaveCommand(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
-	log.Printf("Eski master'a (%s) slave dönüşüm komutu gönderiliyor...", oldMasterHost)
-
-	// Yöntem 1: Central Server Coordination (Production Ready - Önerilen)
-	return r.sendViaCentralServer(oldMasterHost, newMasterHost, dataDir, logger)
-
-	// Yöntem 2: Direct gRPC Call (Alternative - Agent'lar arası direkt iletişim)
-	// return r.sendDirectGRPCCommand(oldMasterHost, newMasterHost, dataDir, logger)
-
-	// Yöntem 3: SSH/Remote Command (Legacy fallback)
-	// return r.sendViaSSH(oldMasterHost, newMasterHost, dataDir, logger)
-}
-
-// sendViaCentralServer merkezi sunucu üzerinden koordinasyon yapar
-func (r *Reporter) sendViaCentralServer(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
-	logger.LogMessage(fmt.Sprintf("Merkezi sunucu üzerinden slave dönüşüm koordinasyonu başlatılıyor: %s -> %s", oldMasterHost, newMasterHost))
-
-	// Central server'a eski master'ın slave'e dönüştürülmesi talebi gönder
-	if r.grpcClient == nil {
-		errMsg := "merkezi sunucuya gRPC bağlantısı yok"
-		logger.LogMessage(errMsg)
-		return fmt.Errorf(errMsg)
-	}
-
-	logger.LogMessage("Merkezi sunucuya failover koordinasyon talebi gönderiliyor...")
-
-	// Koordinasyon bilgilerini log mesajı olarak hazırla
-	coordinationMessage := fmt.Sprintf("FAILOVER_COORDINATION: OldMaster=%s, NewMaster=%s, DataDir=%s, User=%s",
-		oldMasterHost, newMasterHost, dataDir, r.cfg.PostgreSQL.User)
-
-	logger.LogMessage(coordinationMessage)
-
-	// Merkezi sunucuya koordinasyon talebini özel log mesajı olarak gönder
-	// Bu sayede merkezi sunucu bu mesajı alıp eski master agent'ına komut gönderebilir
-
-	// ProcessLogger'ın AddMetadata fonksiyonunu kullanarak koordinasyon bilgilerini ekle
-	logger.AddMetadata("failover_coordination", "true")
-	logger.AddMetadata("old_master_host", oldMasterHost)
-	logger.AddMetadata("new_master_host", newMasterHost)
-	logger.AddMetadata("data_directory", dataDir)
-	logger.AddMetadata("replication_user", r.cfg.PostgreSQL.User)
-	logger.AddMetadata("action", "convert_master_to_slave")
-	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
-
-	// Koordinasyon talebi log mesajı gönder
-	logger.LogMessage("Merkezi koordinasyon talebi metadata ile gönderildi")
-
-	// Koordinasyon işleminin başlatılması için bekleme
-	logger.LogMessage("Merkezi sunucunun koordinasyon işlemini başlatması bekleniyor...")
-	time.Sleep(5 * time.Second)
-
-	// NOT: Production'da merkezi sunucu:
-	// 1. Bu log mesajını alacak ve metadata'dan koordinasyon bilgilerini çıkaracak
-	// 2. old_master_host'a gRPC call yapacak
-	// 3. Eski master agent'ına ConvertPostgresToSlave komutu gönderecek
-	// 4. Eski master agent PostgreSQL'i slave moduna geçirecek
-
-	logger.LogMessage("Merkezi sunucu koordinasyonu tamamlandı (framework ready)")
 	return nil
 }
 
