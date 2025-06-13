@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -4249,7 +4250,32 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	// Güvenli failover için ön kontroller
 	logger.LogMessage("Güvenli failover için ön kontroller yapılıyor...")
 
-	// 1. Replication Lag Kontrolü
+	// 1. Replication Slot Kontrolü - Slot varsa promotion yapılmamalı
+	logger.LogMessage("Replication slot'ları kontrol ediliyor...")
+	replicationSlots, err := r.checkReplicationSlots()
+	if err != nil {
+		logger.LogMessage(fmt.Sprintf("Replication slot kontrolü başarısız: %v", err))
+		// Slot kontrolü başarısız olsa da devam edebiliriz, sadece uyar
+	} else if len(replicationSlots) > 0 {
+		errMsg := fmt.Sprintf("Aktif replication slot'ları bulundu: %v. Slot tabanlı replication için promotion güvenli değil, önce slot'ları kaldırın", replicationSlots)
+		logger.LogError(errMsg, nil)
+		logger.AddMetadata("replication_slots", strings.Join(replicationSlots, ","))
+
+		// Logger'ı durdur
+		logger.Stop("failed")
+		loggerStopped = true
+
+		return &pb.PostgresPromoteMasterResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	} else {
+		logger.LogMessage("Replication slot kontrolü: Aktif slot bulunamadı, streaming replication için güvenli")
+		logger.AddMetadata("replication_slots", "none")
+	}
+
+	// 2. Replication Lag Kontrolü
 	replicationLag := postgres.GetReplicationLagSec()
 	logger.LogMessage(fmt.Sprintf("Mevcut replication lag: %.1f saniye", replicationLag))
 	logger.AddMetadata("replication_lag_seconds", fmt.Sprintf("%.1f", replicationLag))
@@ -4270,7 +4296,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		}, nil
 	}
 
-	// 2. WAL Durumu Kontrolü
+	// 3. WAL Durumu Kontrolü
 	logger.LogMessage("WAL durumu kontrol ediliyor...")
 	walStatus, err := r.checkWALStatus()
 	if err != nil {
@@ -4281,7 +4307,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		logger.AddMetadata("wal_status", walStatus)
 	}
 
-	// 3. Disk Alanı Kontrolü
+	// 4. Disk Alanı Kontrolü
 	logger.LogMessage("Disk alanı kontrol ediliyor...")
 	freeDisk, diskPercent := postgres.GetDiskUsage()
 	logger.LogMessage(fmt.Sprintf("Disk durumu: %s GB boş alan, %%%d kullanımda", freeDisk, diskPercent))
@@ -4303,7 +4329,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		}, nil
 	}
 
-	// 4. Aktif Bağlantı Kontrolü
+	// 5. Aktif Bağlantı Kontrolü
 	logger.LogMessage("Aktif bağlantılar kontrol ediliyor...")
 	activeConnections, err := r.checkActiveConnections()
 	if err != nil {
@@ -4317,7 +4343,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		}
 	}
 
-	// 5. Uzun Süren İşlem Kontrolü
+	// 6. Uzun Süren İşlem Kontrolü
 	logger.LogMessage("Uzun süren işlemler kontrol ediliyor...")
 	longRunningQueries, err := r.checkLongRunningQueries()
 	if err != nil {
@@ -4332,7 +4358,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		logger.AddMetadata("long_running_queries_count", fmt.Sprintf("%d", len(longRunningQueries)))
 	}
 
-	// 6. Replication Timeline Kontrolü
+	// 7. Replication Timeline Kontrolü
 	logger.LogMessage("Replication timeline kontrol ediliyor...")
 	timeline, err := r.checkTimelineStatus()
 	if err != nil {
@@ -5970,7 +5996,9 @@ func (r *Reporter) createStandbyConfiguration(dataDir, masterHost string, master
 
 // createStandbyConfigurationWithVersion standby konfigürasyon dosyalarını oluşturur (version cached)
 func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost string, masterPort int, replUser, replPassword, pgVersion string) error {
-	log.Printf("Standby konfigürasyonu oluşturuluyor: %s -> %s:%d (cached version: %s)", dataDir, masterHost, masterPort, pgVersion)
+	// Hostname'i IP adresine çevir
+	masterIP := r.resolveHostnameToIP(masterHost)
+	log.Printf("Standby konfigürasyonu oluşturuluyor: %s -> %s:%d (IP: %s, cached version: %s)", dataDir, masterHost, masterPort, masterIP, pgVersion)
 
 	// PostgreSQL major version'ı al ve debug et
 	log.Printf("DEBUG: Cached PostgreSQL version: '%s'", pgVersion)
@@ -6027,7 +6055,7 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 		}
 
 		log.Printf("DEBUG: updatePostgreSQLConf çağrılıyor: %s", postgresqlConfPath)
-		err = r.updatePostgreSQLConf(postgresqlConfPath, masterHost, masterPort, replUser, replPassword)
+		err = r.updatePostgreSQLConf(postgresqlConfPath, masterIP, masterPort, replUser, replPassword)
 		if err != nil {
 			log.Printf("ERROR: postgresql.conf güncelleme hatası: %v", err)
 			return err
@@ -6039,7 +6067,7 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 		log.Printf("DEBUG: PostgreSQL %d < 12, recovery.conf yöntemi kullanılacak", majorVersionInt)
 		// PostgreSQL 11 ve öncesi için recovery.conf dosyası
 		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
-		return r.createRecoveryConf(recoveryConfPath, masterHost, masterPort, replUser, replPassword)
+		return r.createRecoveryConf(recoveryConfPath, masterIP, masterPort, replUser, replPassword)
 	}
 }
 
@@ -6053,26 +6081,53 @@ func (r *Reporter) updatePostgreSQLConf(confPath, masterHost string, masterPort 
 		return fmt.Errorf("postgresql.conf okunamadı: %v", err)
 	}
 
-	// Primary connection info ekle
-	primaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
-		masterHost, masterPort, replUser, replPassword)
+	lines := strings.Split(string(content), "\n")
+	var newLines []string
+	primaryConnInfoUpdated := false
 
-	// Standby konfigürasyonu
-	standbyConfig := fmt.Sprintf(`
-# Standby configuration added by ClusterEye
-%s
-primary_slot_name = 'standby_slot'
-hot_standby = on
-`, primaryConnInfo)
+	// Mevcut primary_conninfo satırlarını bul ve değiştir
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
 
-	// Dosyaya ekle
-	newContent := string(content) + "\n" + standbyConfig
+		// Mevcut primary_conninfo satırını değiştir
+		if strings.HasPrefix(trimmedLine, "primary_conninfo") && !strings.HasPrefix(trimmedLine, "#") {
+			// IP adresi kullanarak yeni primary_conninfo oluştur
+			newPrimaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
+				masterHost, masterPort, replUser, replPassword)
+			newLines = append(newLines, newPrimaryConnInfo)
+			primaryConnInfoUpdated = true
+			log.Printf("Mevcut primary_conninfo güncellendi: %s", newPrimaryConnInfo)
+		} else if strings.HasPrefix(trimmedLine, "primary_slot_name") && !strings.HasPrefix(trimmedLine, "#") {
+			// Replication slot konfigürasyonunu kaldır (streaming replication için gerekli değil)
+			log.Printf("primary_slot_name satırı kaldırıldı (streaming replication için gerekli değil)")
+			continue
+		} else if strings.HasPrefix(trimmedLine, "hot_standby") && !strings.HasPrefix(trimmedLine, "#") {
+			// hot_standby satırını kaldır (zaten varsayılan olarak açık)
+			log.Printf("hot_standby satırı kaldırıldı (varsayılan olarak açık)")
+			continue
+		} else {
+			newLines = append(newLines, line)
+		}
+	}
+
+	// Eğer primary_conninfo bulunamadıysa, dosyanın sonuna ekle
+	if !primaryConnInfoUpdated {
+		log.Printf("Mevcut primary_conninfo bulunamadı, yeni satır ekleniyor")
+		newLines = append(newLines, "")
+		newLines = append(newLines, "# Standby configuration added by ClusterEye")
+		newPrimaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
+			masterHost, masterPort, replUser, replPassword)
+		newLines = append(newLines, newPrimaryConnInfo)
+	}
+
+	// Dosyayı yeniden yaz
+	newContent := strings.Join(newLines, "\n")
 	err = os.WriteFile(confPath, []byte(newContent), 0600)
 	if err != nil {
 		return fmt.Errorf("postgresql.conf yazılamadı: %v", err)
 	}
 
-	log.Printf("postgresql.conf başarıyla güncellendi")
+	log.Printf("postgresql.conf başarıyla güncellendi (IP tabanlı streaming replication)")
 	return nil
 }
 
@@ -6134,12 +6189,11 @@ func (r *Reporter) findPostgreSQLConfigFile() (string, error) {
 func (r *Reporter) createRecoveryConf(recoveryPath, masterHost string, masterPort int, replUser, replPassword string) error {
 	log.Printf("recovery.conf dosyası oluşturuluyor: %s", recoveryPath)
 
-	// Recovery.conf içeriği
+	// Recovery.conf içeriği - IP adresi kullan ve gereksiz ayarları kaldır
 	recoveryContent := fmt.Sprintf(`# Recovery configuration created by ClusterEye
 standby_mode = 'on'
 primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'
 trigger_file = '%s/promote.trigger'
-hot_standby = on
 `,
 		masterHost, masterPort, replUser, replPassword, filepath.Dir(recoveryPath))
 
@@ -6149,8 +6203,68 @@ hot_standby = on
 		return fmt.Errorf("recovery.conf oluşturulamadı: %v", err)
 	}
 
-	log.Printf("recovery.conf başarıyla oluşturuldu")
+	log.Printf("recovery.conf başarıyla oluşturuldu (streaming replication için)")
 	return nil
+}
+
+// checkReplicationSlots replication slot'larının varlığını kontrol eder
+func (r *Reporter) checkReplicationSlots() ([]string, error) {
+	db, err := postgres.OpenDB()
+	if err != nil {
+		return nil, fmt.Errorf("veritabanı bağlantısı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	query := `SELECT slot_name FROM pg_replication_slots WHERE active = true`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("replication slot sorgusu başarısız: %v", err)
+	}
+	defer rows.Close()
+
+	var slots []string
+	for rows.Next() {
+		var slotName string
+		if err := rows.Scan(&slotName); err != nil {
+			continue
+		}
+		slots = append(slots, slotName)
+	}
+
+	return slots, nil
+}
+
+// resolveHostnameToIP hostname'i IP adresine çevirir
+func (r *Reporter) resolveHostnameToIP(hostname string) string {
+	// Eğer zaten IP adresi ise, olduğu gibi döndür
+	if net.ParseIP(hostname) != nil {
+		log.Printf("Hostname zaten IP adresi: %s", hostname)
+		return hostname
+	}
+
+	// Hostname'i IP'ye çevir
+	ips, err := net.LookupIP(hostname)
+	if err != nil {
+		log.Printf("Hostname çözümlenemedi (%s), hostname olarak kullanılacak: %v", hostname, err)
+		return hostname
+	}
+
+	// İlk IPv4 adresini kullan
+	for _, ip := range ips {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			log.Printf("Hostname çözümlendi: %s -> %s", hostname, ipv4.String())
+			return ipv4.String()
+		}
+	}
+
+	// IPv4 bulunamadıysa, ilk IP'yi kullan
+	if len(ips) > 0 {
+		log.Printf("IPv4 bulunamadı, ilk IP kullanılıyor: %s -> %s", hostname, ips[0].String())
+		return ips[0].String()
+	}
+
+	log.Printf("IP çözümlenemedi, hostname olarak kullanılacak: %s", hostname)
+	return hostname
 }
 
 // sendCoordinationCompletionFeedback API'ye coordination completion feedback gönderir
