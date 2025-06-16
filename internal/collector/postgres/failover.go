@@ -79,27 +79,140 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIP(dataDir, masterIP stri
 func (fm *PostgreSQLFailoverManager) StopPostgreSQLService(pgVersion string) error {
 	log.Printf("PostgreSQL servisi durduruluyor (version: %s)", pgVersion)
 
-	// pg_ctl ile durdur
-	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
-	if pgCtlCmd == "" {
-		return fmt.Errorf("pg_ctl komutu bulunamadı")
+	// PostgreSQL version'ını parse et
+	majorVersionInt, err := fm.parsePGVersion(pgVersion)
+	if err != nil {
+		log.Printf("PostgreSQL version parse edilemedi: %v, varsayılan 15 kullanılacak", err)
+		majorVersionInt = 15
 	}
 
-	// Önce graceful shutdown dene
-	cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "stop", "-m", "fast")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Graceful shutdown başarısız: %v - Çıktı: %s", err, string(output))
+	// Cluster-aware servis adlarını dene
+	serviceNames := []string{
+		fmt.Sprintf("postgresql@%d-main", majorVersionInt), // Ubuntu cluster: postgresql@15-main
+		"postgresql", // Genel: postgresql
+		fmt.Sprintf("postgresql-%d", majorVersionInt), // RHEL/CentOS: postgresql-15
+		"postgresql.service",                          // Açık service adı
+	}
+
+	// Systemctl ile cluster-aware durdurma deneyi
+	for _, serviceName := range serviceNames {
+		log.Printf("Systemctl ile PostgreSQL durduruluyor: %s", serviceName)
+		cmd := exec.Command("systemctl", "stop", serviceName)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi systemctl ile durduruldu: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi systemctl ile durdurulamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	// pg_ctl ile durdurma deneyi
+	log.Printf("Systemctl başarısız, pg_ctl ile deneniyor...")
+	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
+	if pgCtlCmd != "" {
+		// Önce graceful shutdown dene
+		cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "stop", "-m", "fast")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi pg_ctl ile durduruldu (fast mode)")
+			return nil
+		}
+		log.Printf("pg_ctl fast shutdown başarısız: %v - Çıktı: %s", err, string(output))
+
 		// Force shutdown dene
 		cmd = exec.Command("sudo", "-u", "postgres", pgCtlCmd, "stop", "-m", "immediate")
 		output, err = cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("PostgreSQL durdurulamadı: %v - Çıktı: %s", err, string(output))
+		if err == nil {
+			log.Printf("PostgreSQL servisi pg_ctl ile durduruldu (immediate mode)")
+			return nil
 		}
+		log.Printf("pg_ctl immediate shutdown başarısız: %v - Çıktı: %s", err, string(output))
+	} else {
+		log.Printf("pg_ctl komutu bulunamadı")
 	}
 
-	log.Printf("PostgreSQL başarıyla durduruldu")
-	return nil
+	// Service komutu ile durdurma deneyi (eski sistemler için)
+	for _, serviceName := range serviceNames {
+		log.Printf("Service komutu ile PostgreSQL durduruluyor: %s", serviceName)
+		serviceCmd := exec.Command("service", serviceName, "stop")
+		output, err := serviceCmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi service komutu ile durduruldu: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi service komutu ile durdurulamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	return fmt.Errorf("PostgreSQL servisi durdurulamadı - tüm yöntemler başarısız (systemctl, pg_ctl, service)")
+}
+
+// StartPostgreSQLService PostgreSQL servisini başlatır
+func (fm *PostgreSQLFailoverManager) StartPostgreSQLService(pgVersion string) error {
+	log.Printf("PostgreSQL servisi başlatılıyor (version: %s)", pgVersion)
+
+	// PostgreSQL version'ını parse et
+	majorVersionInt, err := fm.parsePGVersion(pgVersion)
+	if err != nil {
+		log.Printf("PostgreSQL version parse edilemedi: %v, varsayılan 15 kullanılacak", err)
+		majorVersionInt = 15
+	}
+
+	// Cluster-aware servis adlarını dene
+	serviceNames := []string{
+		fmt.Sprintf("postgresql@%d-main", majorVersionInt), // Ubuntu cluster: postgresql@15-main
+		"postgresql", // Genel: postgresql
+		fmt.Sprintf("postgresql-%d", majorVersionInt), // RHEL/CentOS: postgresql-15
+		"postgresql.service",                          // Açık service adı
+	}
+
+	// Systemctl ile cluster-aware başlatma deneyi
+	for _, serviceName := range serviceNames {
+		log.Printf("Systemctl ile PostgreSQL başlatılıyor: %s", serviceName)
+		cmd := exec.Command("systemctl", "start", serviceName)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi systemctl ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	// pg_ctl ile başlatma deneyi
+	log.Printf("Systemctl başarısız, pg_ctl ile deneniyor...")
+	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
+	if pgCtlCmd != "" {
+		// Data directory'yi bul
+		dataDir, err := GetDataDirectory()
+		if err != nil {
+			log.Printf("Data directory bulunamadı: %v", err)
+			dataDir = "/var/lib/postgresql/data" // Fallback
+		}
+
+		// pg_ctl ile başlat
+		cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "start", "-D", dataDir)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi pg_ctl ile başlatıldı: %s", string(output))
+			return nil
+		}
+		log.Printf("pg_ctl ile başlatma başarısız: %v - Çıktı: %s", err, string(output))
+	} else {
+		log.Printf("pg_ctl komutu bulunamadı")
+	}
+
+	// Service komutu ile başlatma deneyi (eski sistemler için)
+	for _, serviceName := range serviceNames {
+		log.Printf("Service komutu ile PostgreSQL başlatılıyor: %s", serviceName)
+		serviceCmd := exec.Command("service", serviceName, "start")
+		output, err := serviceCmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi service komutu ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	return fmt.Errorf("PostgreSQL servisi başlatılamadı - tüm yöntemler başarısız (systemctl, pg_ctl, service)")
 }
 
 // PromoteToMaster standby node'unu master'a yükseltir
@@ -349,20 +462,62 @@ trigger_file = '%s/promote.trigger'
 func (fm *PostgreSQLFailoverManager) startPostgreSQLAsStandby(dataDir, pgVersion string) error {
 	log.Printf("PostgreSQL standby modunda başlatılıyor: %s", dataDir)
 
-	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
-	if pgCtlCmd == "" {
-		return fmt.Errorf("pg_ctl komutu bulunamadı")
-	}
-
-	// pg_ctl ile başlat
-	cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "start", "-D", dataDir)
-	output, err := cmd.CombinedOutput()
+	// PostgreSQL version'ını parse et
+	majorVersionInt, err := fm.parsePGVersion(pgVersion)
 	if err != nil {
-		return fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v - Çıktı: %s", err, string(output))
+		log.Printf("PostgreSQL version parse edilemedi: %v, varsayılan 15 kullanılacak", err)
+		majorVersionInt = 15
 	}
 
-	log.Printf("PostgreSQL standby modunda başarıyla başlatıldı: %s", string(output))
-	return nil
+	// Cluster-aware servis adlarını dene
+	serviceNames := []string{
+		fmt.Sprintf("postgresql@%d-main", majorVersionInt), // Ubuntu cluster: postgresql@15-main
+		"postgresql", // Genel: postgresql
+		fmt.Sprintf("postgresql-%d", majorVersionInt), // RHEL/CentOS: postgresql-15
+		"postgresql.service",                          // Açık service adı
+	}
+
+	// Systemctl ile cluster-aware başlatma deneyi
+	for _, serviceName := range serviceNames {
+		log.Printf("Systemctl ile PostgreSQL başlatılmaya çalışılıyor: %s", serviceName)
+		cmd := exec.Command("systemctl", "start", serviceName)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi systemctl ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	// Systemctl başarısız olduysa pg_ctl ile dene
+	log.Printf("Systemctl başarısız, pg_ctl ile deneniyor...")
+	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
+	if pgCtlCmd != "" {
+		// pg_ctl ile başlat
+		cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "start", "-D", dataDir)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL standby modunda pg_ctl ile başarıyla başlatıldı: %s", string(output))
+			return nil
+		}
+		log.Printf("pg_ctl ile başlatma başarısız: %v - Çıktı: %s", err, string(output))
+	} else {
+		log.Printf("pg_ctl komutu bulunamadı")
+	}
+
+	// Service komutu ile başlatma deneyi (eski sistemler için)
+	for _, serviceName := range serviceNames {
+		log.Printf("Service komutu ile PostgreSQL başlatılıyor: %s", serviceName)
+		serviceCmd := exec.Command("service", serviceName, "start")
+		output, err := serviceCmd.CombinedOutput()
+		if err == nil {
+			log.Printf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName)
+			return nil
+		}
+		log.Printf("DEBUG: %s servisi service komutu ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+	}
+
+	return fmt.Errorf("PostgreSQL standby modunda başlatılamadı - tüm yöntemler başarısız (systemctl, pg_ctl, service)")
 }
 
 // findPgCtlCommand pg_ctl komutunu bulur

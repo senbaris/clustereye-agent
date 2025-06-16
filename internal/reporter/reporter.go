@@ -1281,11 +1281,19 @@ func (r *Reporter) listenForCommands() {
 					// Komuttan parametreleri çıkar: convert_postgres_to_slave|new_master_host|new_master_ip|new_master_port|data_dir|coordination_job_id|old_master_host
 					// ✅ YENİ: repl_user ve repl_pass artık config'den okunuyor
 					parts := strings.Split(query.Command, "|")
+					log.Printf("DEBUG: convert_postgres_to_slave komutu parse edildi, %d parametre var:", len(parts))
+					for i, part := range parts {
+						log.Printf("DEBUG: parts[%d] = '%s'", i, part)
+					}
+
 					if len(parts) >= 5 {
 						newMasterHost := parts[1]
 						newMasterIP := parts[2] // ✅ YENİ: Master IP adresi
 						newMasterPort, _ := strconv.Atoi(parts[3])
 						dataDirectory := parts[4]
+
+						log.Printf("DEBUG: Parsed values - newMasterHost='%s', newMasterIP='%s', port=%d, dataDir='%s'",
+							newMasterHost, newMasterIP, newMasterPort, dataDirectory)
 
 						// Replication credentials'ı config'den al
 						replUser := r.cfg.PostgreSQL.ReplicationUser
@@ -4133,6 +4141,21 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 		logger.LogMessage(fmt.Sprintf("NewMasterIP doğru IP formatında: %s", actualMasterIP))
 	}
 
+	// ✅ YENİ: Eğer hala IP adresi değilse (DNS çözümlemesi başarısız), hata ver
+	if net.ParseIP(actualMasterIP) == nil {
+		errMsg := fmt.Sprintf("Master IP adresi çözümlenemedi: %s -> %s. DNS çözümlemesi başarısız, pg_basebackup çalışmayacak", req.NewMasterIP, actualMasterIP)
+		logger.LogError(errMsg, nil)
+		logger.Stop("failed")
+		loggerStopped = true
+		return &ConvertPostgresToSlaveResponse{
+			JobId:        req.JobId,
+			Status:       pb.JobStatus_JOB_STATUS_FAILED,
+			ErrorMessage: errMsg,
+		}, nil
+	}
+
+	logger.LogMessage(fmt.Sprintf("Final master IP adresi: %s", actualMasterIP))
+
 	err = failoverManager.ConvertToSlaveWithIP(dataDir, actualMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
@@ -6405,8 +6428,8 @@ func (r *Reporter) resolveHostnameToIP(hostname string) string {
 	// Hostname'i IP'ye çevir
 	ips, err := net.LookupIP(hostname)
 	if err != nil {
-		log.Printf("Hostname çözümlenemedi (%s), hostname olarak kullanılacak: %v", hostname, err)
-		return hostname
+		log.Printf("HATA: Hostname çözümlenemedi (%s): %v. pg_basebackup başarısız olacak", hostname, err)
+		return hostname // Hala hostname döndürüyoruz ama bu sorunlu olacak
 	}
 
 	// İlk IPv4 adresini kullan
@@ -6423,8 +6446,8 @@ func (r *Reporter) resolveHostnameToIP(hostname string) string {
 		return ips[0].String()
 	}
 
-	log.Printf("IP çözümlenemedi, hostname olarak kullanılacak: %s", hostname)
-	return hostname
+	log.Printf("HATA: IP çözümlenemedi (%s). pg_basebackup başarısız olacak", hostname)
+	return hostname // Hala hostname döndürüyoruz ama bu sorunlu olacak
 }
 
 // sendCoordinationCompletionFeedback API'ye coordination completion feedback gönderir
