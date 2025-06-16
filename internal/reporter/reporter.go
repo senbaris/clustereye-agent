@@ -1389,52 +1389,56 @@ func (r *Reporter) listenForCommands() {
 				}
 
 				// PostgreSQL promotion özel işleme:
-				// Yeni format: postgres_promote|data_dir|process_id|old_master_host|old_master_ip|slave_count|slaves_info
-				// Eski format: postgres_promote|<data_directory>|<query_id>|<current_master_host>
+				// ✅ YENİ FORMAT: postgres_promote|data_dir|process_id|new_master_host|old_master_host|old_master_ip|slave_count|slaves_info
 				if strings.HasPrefix(query.Command, "postgres_promote") {
 					log.Printf("PostgreSQL promotion komutu tespit edildi: %s", query.Command)
 
 					// Komuttan parametreleri çıkar
 					parts := strings.Split(query.Command, "|")
-					if len(parts) >= 2 {
+					if len(parts) >= 4 {
 						// Extract data directory (ikinci parametre)
 						dataDir := parts[1]
 
-						// Extract job ID (üçüncü parametre, varsa)
-						jobID := query.QueryId // Varsayılan olarak mevcut sorgu ID'sini kullan
-						if len(parts) >= 3 && parts[2] != "" {
-							jobID = parts[2] // Özel job ID kullan
+						// Extract process ID (üçüncü parametre)
+						processId := parts[2]
+						jobID := processId
+						if jobID == "" {
+							jobID = query.QueryId // Fallback
 						}
 
-						// Extract current master host (dördüncü parametre, varsa)
-						currentMasterHost := ""
-						if len(parts) >= 4 && parts[3] != "" {
-							currentMasterHost = parts[3]
-							log.Printf("Current master host command'dan alındı: %s", currentMasterHost)
-						}
+						// Extract new master host (dördüncü parametre) - bu node promote edilecek
+						newMasterHost := parts[3]
+						log.Printf("New master host (bu node): %s", newMasterHost)
 
-						// Extract current master IP (beşinci parametre, varsa) - YENİ
-						currentMasterIP := ""
+						// Extract old master host (beşinci parametre, varsa)
+						oldMasterHost := ""
 						if len(parts) >= 5 && parts[4] != "" {
-							currentMasterIP = parts[4]
-							log.Printf("Current master IP command'dan alındı: %s", currentMasterIP)
+							oldMasterHost = parts[4]
+							log.Printf("Old master host: %s", oldMasterHost)
 						}
 
-						// Extract slave count (altıncı parametre, varsa) - YENİ
-						slaveCount := 0
+						// Extract old master IP (altıncı parametre, varsa) - YENİ
+						oldMasterIP := ""
 						if len(parts) >= 6 && parts[5] != "" {
-							if count, err := strconv.Atoi(parts[5]); err == nil {
+							oldMasterIP = parts[5]
+							log.Printf("Old master IP: %s", oldMasterIP)
+						}
+
+						// Extract slave count (yedinci parametre, varsa) - YENİ
+						slaveCount := 0
+						if len(parts) >= 7 && parts[6] != "" {
+							if count, err := strconv.Atoi(parts[6]); err == nil {
 								slaveCount = count
-								log.Printf("Slave count command'dan alındı: %d", slaveCount)
+								log.Printf("Slave count: %d", slaveCount)
 							}
 						}
 
-						// Extract slaves info (yedinci parametre, varsa) - YENİ
-						// Format: slave1:192.168.1.11,slave2:192.168.1.12
+						// Extract slaves info (sekizinci parametre, varsa) - YENİ
+						// Format: fenrir:38.242.159.17
 						var slaves []*pb.SlaveNode
-						if len(parts) >= 7 && parts[6] != "" {
-							slavesInfo := parts[6]
-							log.Printf("Slaves info command'dan alındı: %s", slavesInfo)
+						if len(parts) >= 8 && parts[7] != "" {
+							slavesInfo := parts[7]
+							log.Printf("Slaves info: %s", slavesInfo)
 
 							// Parse slaves info
 							slaveEntries := strings.Split(slavesInfo, ",")
@@ -1453,8 +1457,8 @@ func (r *Reporter) listenForCommands() {
 							}
 						}
 
-						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s, CurrentMasterHost=%s, CurrentMasterIP=%s, SlaveCount=%d",
-							dataDir, jobID, currentMasterHost, currentMasterIP, len(slaves))
+						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s, NewMasterHost=%s, OldMasterHost=%s, OldMasterIP=%s, SlaveCount=%d",
+							dataDir, jobID, newMasterHost, oldMasterHost, oldMasterIP, len(slaves))
 
 						// Hostname'i al
 						hostname, _ := os.Hostname()
@@ -1466,9 +1470,9 @@ func (r *Reporter) listenForCommands() {
 							AgentId:           agentID,
 							NodeHostname:      hostname,
 							DataDirectory:     dataDir,
-							CurrentMasterHost: currentMasterHost, // Current master host
-							CurrentMasterIp:   currentMasterIP,   // YENİ: Current master IP
-							Slaves:            slaves,            // YENİ: Slave nodes listesi
+							CurrentMasterHost: oldMasterHost, // Old master host
+							CurrentMasterIp:   oldMasterIP,   // YENİ: Old master IP
+							Slaves:            slaves,        // YENİ: Slave nodes listesi
 						}
 
 						// PromotePostgresToMaster RPC'sini çağır
@@ -1520,7 +1524,7 @@ func (r *Reporter) listenForCommands() {
 						// Hemen başlatıldı bilgisi dön
 						initialResult := map[string]interface{}{
 							"status":  "accepted",
-							"message": fmt.Sprintf("PostgreSQL promotion işlemi başlatıldı (JobID: %s, DataDir: %s, CurrentMaster: %s)", jobID, dataDir, currentMasterHost),
+							"message": fmt.Sprintf("PostgreSQL promotion işlemi başlatıldı (JobID: %s, DataDir: %s, OldMaster: %s)", jobID, dataDir, oldMasterHost),
 							"job_id":  jobID,
 						}
 						sendQueryResult(r.stream, query.QueryId, initialResult)
@@ -1531,7 +1535,7 @@ func (r *Reporter) listenForCommands() {
 						// Eksik parametre
 						errorResult := map[string]interface{}{
 							"status":  "error",
-							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]|[current_master_host]|[current_master_ip]|[slave_count]|[slaves_info]",
+							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|data_dir|process_id|new_master_host|old_master_host|old_master_ip|slave_count|slaves_info",
 						}
 						sendQueryResult(r.stream, query.QueryId, errorResult)
 						isProcessingQuery = false
@@ -4118,7 +4122,18 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 	log.Printf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion)
 
 	// ✅ ARTIK HOSTNAME YERİNE DOĞRUDAN IP ADRESİ KULLANILIYOR - DNS ÇÖZÜMLEMESI GEREKSİZ
-	err = failoverManager.ConvertToSlaveWithIP(dataDir, req.NewMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion)
+	// Güvenlik kontrolü: NewMasterIP gerçekten IP adresi mi?
+	actualMasterIP := req.NewMasterIP
+	if net.ParseIP(actualMasterIP) == nil {
+		// NewMasterIP aslında hostname, IP'ye çevir
+		logger.LogMessage(fmt.Sprintf("UYARI: NewMasterIP (%s) hostname olarak geldi, IP'ye çevriliyor...", actualMasterIP))
+		actualMasterIP = r.resolveHostnameToIP(actualMasterIP)
+		logger.LogMessage(fmt.Sprintf("Hostname çözümlendi: %s -> %s", req.NewMasterIP, actualMasterIP))
+	} else {
+		logger.LogMessage(fmt.Sprintf("NewMasterIP doğru IP formatında: %s", actualMasterIP))
+	}
+
+	err = failoverManager.ConvertToSlaveWithIP(dataDir, actualMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
 		logger.LogError(errMsg, err)
@@ -4152,7 +4167,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 			return &ConvertPostgresToSlaveResponse{
 				JobId:  req.JobId,
 				Status: pb.JobStatus_JOB_STATUS_COMPLETED,
-				Result: fmt.Sprintf("Node başarıyla slave'e dönüştürüldü. Yeni master: %s (%s):%d", req.NewMasterHost, req.NewMasterIP, req.NewMasterPort),
+				Result: fmt.Sprintf("Node başarıyla slave'e dönüştürüldü. Yeni master: %s (%s):%d", req.NewMasterHost, actualMasterIP, req.NewMasterPort),
 			}, nil
 		}
 	}
