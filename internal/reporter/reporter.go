@@ -1231,43 +1231,57 @@ func (r *Reporter) listenForCommands() {
 				if strings.HasPrefix(query.Command, "convert_postgres_to_slave") {
 					log.Printf("PostgreSQL Master->Slave dönüşüm komutu tespit edildi: %s", query.Command)
 
-					// Komuttan parametreleri çıkar: convert_postgres_to_slave|new_master_host|new_master_port|data_dir|repl_user|repl_pass|coordination_job_id|old_master_host
+					// Komuttan parametreleri çıkar: convert_postgres_to_slave|new_master_host|new_master_ip|new_master_port|data_dir|coordination_job_id|old_master_host
+					// ✅ YENİ: repl_user ve repl_pass artık config'den okunuyor
 					parts := strings.Split(query.Command, "|")
-					if len(parts) >= 6 {
+					if len(parts) >= 5 {
 						newMasterHost := parts[1]
-						newMasterPort, _ := strconv.Atoi(parts[2])
-						dataDirectory := parts[3]
-						replUser := parts[4]
-						replPass := parts[5]
+						newMasterIP := parts[2] // ✅ YENİ: Master IP adresi
+						newMasterPort, _ := strconv.Atoi(parts[3])
+						dataDirectory := parts[4]
+
+						// Replication credentials'ı config'den al
+						replUser := r.cfg.PostgreSQL.ReplicationUser
+						replPass := r.cfg.PostgreSQL.ReplicationPass
+
+						// Fallback: Eğer replication credentials boşsa, normal PostgreSQL credentials kullan
+						if replUser == "" {
+							replUser = r.cfg.PostgreSQL.User
+							log.Printf("ReplicationUser config'de boş, normal PostgreSQL User kullanılıyor: %s", replUser)
+						}
+						if replPass == "" {
+							replPass = r.cfg.PostgreSQL.Pass
+							log.Printf("ReplicationPassword config'de boş, normal PostgreSQL Pass kullanılıyor")
+						}
 
 						// Yeni parametreler: coordination_job_id ve old_master_host (optional)
 						var coordinationJobId, oldMasterHost string
-						if len(parts) >= 7 {
-							coordinationJobId = parts[6]
+						if len(parts) >= 6 {
+							coordinationJobId = parts[5]
 						}
-						if len(parts) >= 8 {
-							oldMasterHost = parts[7]
+						if len(parts) >= 7 {
+							oldMasterHost = parts[6]
 						}
 
-						log.Printf("Parse edilen parametreler: NewMaster=%s:%d, DataDir=%s, CoordJobId=%s, OldMaster=%s",
-							newMasterHost, newMasterPort, dataDirectory, coordinationJobId, oldMasterHost)
+						log.Printf("Parse edilen parametreler: NewMaster=%s (%s):%d, DataDir=%s, CoordJobId=%s, OldMaster=%s",
+							newMasterHost, newMasterIP, newMasterPort, dataDirectory, coordinationJobId, oldMasterHost)
 
 						// Hostname'i otomatik tespit et
 						hostname, _ := os.Hostname()
 						agentId := fmt.Sprintf("agent_%s", hostname)
 
-						// ConvertPostgresToSlaveRequest oluştur
+						// ConvertPostgresToSlaveRequest oluştur - ✅ YENİ IP ALANI EKLENDİ, replication credentials kaldırıldı
 						convertReq := &ConvertPostgresToSlaveRequest{
-							JobId:               query.QueryId,
-							AgentId:             agentId,
-							NodeHostname:        hostname,
-							NewMasterHost:       newMasterHost,
-							NewMasterPort:       int32(newMasterPort),
-							DataDirectory:       dataDirectory,
-							ReplicationUser:     replUser,
-							ReplicationPassword: replPass,
-							CoordinationJobId:   coordinationJobId, // Coordination job ID'si ekle
-							OldMasterHost:       oldMasterHost,     // Eski master host ekle
+							JobId:         query.QueryId,
+							AgentId:       agentId,
+							NodeHostname:  hostname,
+							NewMasterHost: newMasterHost,
+							NewMasterIP:   newMasterIP, // ✅ YENİ: Master IP adresi
+							NewMasterPort: int32(newMasterPort),
+							DataDirectory: dataDirectory,
+							// ✅ YENİ: ReplicationUser ve ReplicationPassword kaldırıldı - config'den okunacak
+							CoordinationJobId: coordinationJobId, // Coordination job ID'si ekle
+							OldMasterHost:     oldMasterHost,     // Eski master host ekle
 						}
 
 						log.Printf("Master->Slave dönüşüm işlemi başlatılıyor: %+v", convertReq)
@@ -1275,7 +1289,17 @@ func (r *Reporter) listenForCommands() {
 						// ConvertPostgresToSlave işlemini çalıştır
 						convertResp, err := r.ConvertPostgresToSlave(context.Background(), convertReq)
 						if err != nil {
-							log.Printf("Master->Slave dönüşüm işlemi başarısız: %v", err)
+							log.Printf("ERROR: Master->Slave dönüşüm işlemi başarısız: %v", err)
+
+							// Hata durumunda da ProcessLogger oluşturup failed status gönder
+							if r.grpcClient != nil {
+								client := pb.NewAgentServiceClient(r.grpcClient)
+								errorLogger := NewProcessLogger(client, agentId, query.QueryId, "postgresql_convert_slave_error")
+								errorLogger.Start()
+								errorLogger.LogError(fmt.Sprintf("Master->Slave dönüşüm işlemi başarısız: %v", err), err)
+								errorLogger.Stop("failed")
+							}
+
 							errorResult := map[string]interface{}{
 								"status":  "error",
 								"message": fmt.Sprintf("Master->Slave dönüşüm işlemi başarısız: %v", err),
@@ -1309,7 +1333,7 @@ func (r *Reporter) listenForCommands() {
 						// Eksik parametre
 						errorResult := map[string]interface{}{
 							"status":  "error",
-							"message": "Geçersiz convert_postgres_to_slave komutu. Format: convert_postgres_to_slave|new_master_host|port|data_dir|repl_user|repl_pass|[coordination_job_id]|[old_master_host]",
+							"message": "Geçersiz convert_postgres_to_slave komutu. Format: convert_postgres_to_slave|new_master_host|new_master_ip|port|data_dir|[coordination_job_id]|[old_master_host] (replication credentials config'den okunur)",
 						}
 						sendQueryResult(r.stream, query.QueryId, errorResult)
 						isProcessingQuery = false
@@ -1318,7 +1342,8 @@ func (r *Reporter) listenForCommands() {
 				}
 
 				// PostgreSQL promotion özel işleme:
-				// Format: postgres_promote|<data_directory>|<query_id>|<current_master_host>
+				// Yeni format: postgres_promote|data_dir|process_id|old_master_host|old_master_ip|slave_count|slaves_info
+				// Eski format: postgres_promote|<data_directory>|<query_id>|<current_master_host>
 				if strings.HasPrefix(query.Command, "postgres_promote") {
 					log.Printf("PostgreSQL promotion komutu tespit edildi: %s", query.Command)
 
@@ -1341,19 +1366,62 @@ func (r *Reporter) listenForCommands() {
 							log.Printf("Current master host command'dan alındı: %s", currentMasterHost)
 						}
 
-						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s, CurrentMasterHost=%s", dataDir, jobID, currentMasterHost)
+						// Extract current master IP (beşinci parametre, varsa) - YENİ
+						currentMasterIP := ""
+						if len(parts) >= 5 && parts[4] != "" {
+							currentMasterIP = parts[4]
+							log.Printf("Current master IP command'dan alındı: %s", currentMasterIP)
+						}
+
+						// Extract slave count (altıncı parametre, varsa) - YENİ
+						slaveCount := 0
+						if len(parts) >= 6 && parts[5] != "" {
+							if count, err := strconv.Atoi(parts[5]); err == nil {
+								slaveCount = count
+								log.Printf("Slave count command'dan alındı: %d", slaveCount)
+							}
+						}
+
+						// Extract slaves info (yedinci parametre, varsa) - YENİ
+						// Format: slave1:192.168.1.11,slave2:192.168.1.12
+						var slaves []*pb.SlaveNode
+						if len(parts) >= 7 && parts[6] != "" {
+							slavesInfo := parts[6]
+							log.Printf("Slaves info command'dan alındı: %s", slavesInfo)
+
+							// Parse slaves info
+							slaveEntries := strings.Split(slavesInfo, ",")
+							for _, entry := range slaveEntries {
+								if strings.Contains(entry, ":") {
+									slaveParts := strings.Split(entry, ":")
+									if len(slaveParts) == 2 {
+										slaveNode := &pb.SlaveNode{
+											Hostname: strings.TrimSpace(slaveParts[0]),
+											Ip:       strings.TrimSpace(slaveParts[1]),
+										}
+										slaves = append(slaves, slaveNode)
+										log.Printf("Slave node parsed: %s -> %s", slaveNode.Hostname, slaveNode.Ip)
+									}
+								}
+							}
+						}
+
+						log.Printf("PostgreSQL promotion işlemi başlatılıyor. DataDir=%s, JobID=%s, CurrentMasterHost=%s, CurrentMasterIP=%s, SlaveCount=%d",
+							dataDir, jobID, currentMasterHost, currentMasterIP, len(slaves))
 
 						// Hostname'i al
 						hostname, _ := os.Hostname()
 						agentID := "agent_" + hostname
 
-						// RPC isteği oluştur
+						// RPC isteği oluştur - YENİ ALANLAR EKLENDİ
 						promoteReq := &pb.PostgresPromoteMasterRequest{
 							JobId:             jobID,
 							AgentId:           agentID,
 							NodeHostname:      hostname,
 							DataDirectory:     dataDir,
-							CurrentMasterHost: currentMasterHost, // Current master host'u ekle
+							CurrentMasterHost: currentMasterHost, // Current master host
+							CurrentMasterIp:   currentMasterIP,   // YENİ: Current master IP
+							Slaves:            slaves,            // YENİ: Slave nodes listesi
 						}
 
 						// PromotePostgresToMaster RPC'sini çağır
@@ -1361,7 +1429,17 @@ func (r *Reporter) listenForCommands() {
 							// Bu işlemi arka planda çalıştır, yoksa uzun sürebilir
 							promoteResp, err := r.PromotePostgresToMaster(context.Background(), promoteReq)
 							if err != nil {
-								log.Printf("PostgreSQL promotion RPC işlemi başarısız: %v", err)
+								log.Printf("ERROR: PostgreSQL promotion RPC işlemi başarısız: %v", err)
+
+								// Hata durumunda da ProcessLogger oluşturup failed status gönder
+								if r.grpcClient != nil {
+									client := pb.NewAgentServiceClient(r.grpcClient)
+									errorLogger := NewProcessLogger(client, agentID, jobID, "postgresql_promotion_error")
+									errorLogger.Start()
+									errorLogger.LogError(fmt.Sprintf("PostgreSQL promotion RPC işlemi başarısız: %v", err), err)
+									errorLogger.Stop("failed")
+								}
+
 								// Hata durumunda sonucu gönder
 								errorResult := map[string]interface{}{
 									"status":  "error",
@@ -1406,7 +1484,7 @@ func (r *Reporter) listenForCommands() {
 						// Eksik parametre
 						errorResult := map[string]interface{}{
 							"status":  "error",
-							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]|[current_master_host]",
+							"message": "Geçersiz PostgreSQL promotion komutu. Doğru format: postgres_promote|/data/directory|[job_id]|[current_master_host]|[current_master_ip]|[slave_count]|[slaves_info]",
 						}
 						sendQueryResult(r.stream, query.QueryId, errorResult)
 						isProcessingQuery = false
@@ -3853,16 +3931,16 @@ func (r *Reporter) FreezeMongoSecondary(ctx context.Context, req *pb.MongoFreeze
 
 // ConvertPostgresToSlaveRequest temporary struct until protobuf is updated
 type ConvertPostgresToSlaveRequest struct {
-	JobId               string
-	AgentId             string
-	NodeHostname        string
-	NewMasterHost       string
-	NewMasterPort       int32
-	DataDirectory       string
-	ReplicationUser     string
-	ReplicationPassword string
-	CoordinationJobId   string // API coordination job ID'si
-	OldMasterHost       string // Eski master host bilgisi
+	JobId         string
+	AgentId       string
+	NodeHostname  string
+	NewMasterHost string
+	NewMasterIP   string // ✅ YENİ: Master IP adresi (DNS çözümlemesi gereksiz)
+	NewMasterPort int32
+	DataDirectory string
+	// ✅ YENİ: ReplicationUser ve ReplicationPassword kaldırıldı - artık config'den okunuyor
+	CoordinationJobId string // API coordination job ID'si
+	OldMasterHost     string // Eski master host bilgisi
 }
 
 // ConvertPostgresToSlaveResponse temporary struct until protobuf is updated
@@ -3886,6 +3964,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 	if r.grpcClient == nil {
 		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
 		if err := r.reconnect(); err != nil {
+			log.Printf("ERROR: ConvertPostgresToSlave - gRPC bağlantısı kurulamadı: %v", err)
 			return &ConvertPostgresToSlaveResponse{
 				JobId:        req.JobId,
 				Status:       pb.JobStatus_JOB_STATUS_FAILED,
@@ -3917,12 +3996,13 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 		}
 	}()
 
-	// İlk log mesajı
-	logger.LogMessage(fmt.Sprintf("PostgreSQL Master->Slave dönüşüm işlemi başlatılıyor. Yeni Master: %s:%d", req.NewMasterHost, req.NewMasterPort))
+	// İlk log mesajı - ✅ IP BİLGİSİ EKLENDİ
+	logger.LogMessage(fmt.Sprintf("PostgreSQL Master->Slave dönüşüm işlemi başlatılıyor. Yeni Master: %s (%s):%d", req.NewMasterHost, req.NewMasterIP, req.NewMasterPort))
 
-	// Metadata ekle
+	// Metadata ekle - ✅ IP BİLGİSİ EKLENDİ
 	logger.AddMetadata("hostname", req.NodeHostname)
 	logger.AddMetadata("new_master_host", req.NewMasterHost)
+	logger.AddMetadata("new_master_ip", req.NewMasterIP) // ✅ YENİ: Master IP adresi
 	logger.AddMetadata("new_master_port", fmt.Sprintf("%d", req.NewMasterPort))
 
 	// Data Directory kontrolü
@@ -3967,37 +4047,31 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 	// Failover manager oluştur
 	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
 
-	// Replication credentials kontrolü - eğer request'te boşsa config'den al
-	replUser := req.ReplicationUser
-	replPassword := req.ReplicationPassword
+	// ✅ YENİ: Replication credentials'ı direkt config'den al (API artık göndermiyor)
+	replUser := r.cfg.PostgreSQL.ReplicationUser
+	replPassword := r.cfg.PostgreSQL.ReplicationPass
 
-	if replUser == "" {
-		replUser = r.cfg.PostgreSQL.ReplicationUser
-		logger.LogMessage(fmt.Sprintf("Request'te ReplicationUser boş, config'den alındı: %s", replUser))
-	}
+	logger.LogMessage(fmt.Sprintf("Replication credentials config'den alındı: user=%s, pass_empty=%t", replUser, replPassword == ""))
 
-	if replPassword == "" {
-		replPassword = r.cfg.PostgreSQL.ReplicationPass
-		logger.LogMessage("Request'te ReplicationPassword boş, config'den alındı")
-	}
-
-	// Fallback: Eğer replication credentials hala boşsa, normal PostgreSQL credentials kullan
+	// Fallback: Eğer replication credentials config'de boşsa, normal PostgreSQL credentials kullan
 	if replUser == "" {
 		replUser = r.cfg.PostgreSQL.User
-		logger.LogMessage(fmt.Sprintf("ReplicationUser hala boş, normal PostgreSQL User kullanılıyor: %s", replUser))
+		logger.LogMessage(fmt.Sprintf("Config'de ReplicationUser boş, normal PostgreSQL User kullanılıyor: %s", replUser))
 	}
 
 	if replPassword == "" {
 		replPassword = r.cfg.PostgreSQL.Pass
-		logger.LogMessage("ReplicationPassword hala boş, normal PostgreSQL Pass kullanılıyor")
+		logger.LogMessage("Config'de ReplicationPassword boş, normal PostgreSQL Pass kullanılıyor")
 	}
 
-	// Standby konfigürasyonu oluştur ve başlat
+	// Standby konfigürasyonu oluştur ve başlat - ✅ ARTIK IP ADRESİ KULLANILIYOR
 	logger.LogMessage("Standby konfigürasyonu oluşturuluyor ve PostgreSQL standby modunda başlatılıyor...")
 	logger.LogMessage(fmt.Sprintf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion))
-	logger.LogMessage(fmt.Sprintf("DEBUG: Parametreler - DataDir: %s, NewMaster: %s:%d, User: %s", dataDir, req.NewMasterHost, req.NewMasterPort, replUser))
+	logger.LogMessage(fmt.Sprintf("DEBUG: Parametreler - DataDir: %s, NewMaster: %s (%s):%d, User: %s", dataDir, req.NewMasterHost, req.NewMasterIP, req.NewMasterPort, replUser))
 	log.Printf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion)
-	err = failoverManager.ConvertToSlave(dataDir, req.NewMasterHost, int(req.NewMasterPort), replUser, replPassword, pgVersion)
+
+	// ✅ ARTIK HOSTNAME YERİNE DOĞRUDAN IP ADRESİ KULLANILIYOR - DNS ÇÖZÜMLEMESI GEREKSİZ
+	err = failoverManager.ConvertToSlaveWithIP(dataDir, req.NewMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
 		logger.LogError(errMsg, err)
@@ -4031,7 +4105,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 			return &ConvertPostgresToSlaveResponse{
 				JobId:  req.JobId,
 				Status: pb.JobStatus_JOB_STATUS_COMPLETED,
-				Result: fmt.Sprintf("Node başarıyla slave'e dönüştürüldü. Yeni master: %s:%d", req.NewMasterHost, req.NewMasterPort),
+				Result: fmt.Sprintf("Node başarıyla slave'e dönüştürüldü. Yeni master: %s (%s):%d", req.NewMasterHost, req.NewMasterIP, req.NewMasterPort),
 			}, nil
 		}
 	}
@@ -4064,7 +4138,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	if r.grpcClient == nil {
 		log.Printf("gRPC client nil, yeniden bağlantı kuruluyor...")
 		if err := r.reconnect(); err != nil {
-			log.Printf("PostgreSQL promotion işlemi başlatılamadı - gRPC bağlantısı kurulamadı: %v", err)
+			log.Printf("ERROR: PromotePostgresToMaster - gRPC bağlantısı kurulamadı: %v", err)
 			return &pb.PostgresPromoteMasterResponse{
 				JobId:        req.JobId,
 				Status:       pb.JobStatus_JOB_STATUS_FAILED,
@@ -4074,7 +4148,7 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 		// Hala nil ise hata döndür
 		if r.grpcClient == nil {
-			log.Printf("PostgreSQL promotion işlemi başlatılamadı - gRPC client hala nil")
+			log.Printf("ERROR: PromotePostgresToMaster - gRPC client hala nil")
 			return &pb.PostgresPromoteMasterResponse{
 				JobId:        req.JobId,
 				Status:       pb.JobStatus_JOB_STATUS_FAILED,
@@ -4106,12 +4180,25 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		}
 	}()
 
-	// İlk log mesajı
-	logger.LogMessage(fmt.Sprintf("PostgreSQL Master Promotion işlemi başlatılıyor. Data directory: %s", req.DataDirectory))
+	// İlk log mesajı - YENİ ALANLAR EKLENDİ
+	logger.LogMessage(fmt.Sprintf("PostgreSQL Master Promotion işlemi başlatılıyor. Data directory: %s, Current Master: %s (%s), Slave Count: %d",
+		req.DataDirectory, req.CurrentMasterHost, req.CurrentMasterIp, len(req.Slaves)))
 
 	// Metadata olarak hostname, data directory ve node status ekle
 	logger.AddMetadata("hostname", req.NodeHostname)
 	logger.AddMetadata("data_directory", req.DataDirectory)
+
+	// YENİ: Current master bilgilerini metadata'ya ekle
+	logger.AddMetadata("current_master_host", req.CurrentMasterHost)
+	logger.AddMetadata("current_master_ip", req.CurrentMasterIp)
+	logger.AddMetadata("slave_count", fmt.Sprintf("%d", len(req.Slaves)))
+
+	// YENİ: Slave bilgilerini metadata'ya ekle
+	for i, slave := range req.Slaves {
+		logger.AddMetadata(fmt.Sprintf("slave_%d_hostname", i), slave.Hostname)
+		logger.AddMetadata(fmt.Sprintf("slave_%d_ip", i), slave.Ip)
+		logger.LogMessage(fmt.Sprintf("Slave node %d: %s (%s)", i+1, slave.Hostname, slave.Ip))
+	}
 
 	// Mevcut PostgreSQL sürümünü metadata'ya ekle
 	currentPgVersion := postgres.GetPGVersion()
@@ -4664,8 +4751,8 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		logger.LogMessage(fmt.Sprintf("Request'ten eski master alındı: %s", oldMasterHost))
 	}
 
-	// API'ye failover koordinasyon talebi gönder
-	err = r.sendFailoverCoordinationToAPI(oldMasterHost, req.NodeHostname, dataDir, logger)
+	// API'ye failover koordinasyon talebi gönder - YENİ ALANLAR EKLENDİ
+	err = r.sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, req.CurrentMasterIp, req.NodeHostname, dataDir, req.Slaves, logger)
 	if err != nil {
 		logger.LogMessage(fmt.Sprintf("UYARI: API'ye failover koordinasyon talebi gönderilemedi: %v", err))
 		// Bu bir uyarı, ana promotion işlemini başarısız sayma
@@ -6300,9 +6387,14 @@ func (r *Reporter) sendCoordinationCompletionFeedback(coordinationJobId, oldMast
 	log.Printf("Coordination completion feedback (API format) ProcessLogger ile gönderildi")
 }
 
-// sendFailoverCoordinationToAPI API'ye failover koordinasyon talebi gönderir
+// sendFailoverCoordinationToAPI API'ye failover koordinasyon talebi gönderir (eski versiyon - backward compatibility)
 func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, dataDir string, logger *ProcessLogger) error {
-	logger.LogMessage(fmt.Sprintf("API'ye failover koordinasyon talebi gönderiliyor: %s -> %s", oldMasterHost, newMasterHost))
+	return r.sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, "", newMasterHost, dataDir, nil, logger)
+}
+
+// sendFailoverCoordinationToAPIWithSlaves API'ye failover koordinasyon talebi gönderir (yeni versiyon - slave bilgileri ile)
+func (r *Reporter) sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, oldMasterIP, newMasterHost, dataDir string, slaves []*pb.SlaveNode, logger *ProcessLogger) error {
+	logger.LogMessage(fmt.Sprintf("API'ye failover koordinasyon talebi gönderiliyor: %s (%s) -> %s", oldMasterHost, oldMasterIP, newMasterHost))
 
 	// Mevcut API bağlantısını kullan
 	if r.grpcClient == nil {
@@ -6313,8 +6405,17 @@ func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, d
 	// Bu sayede API'deki ProcessLoggerHandler bu mesajı alıp koordinasyon işlemini başlatacak
 	logger.AddMetadata("failover_coordination_request", "true")
 	logger.AddMetadata("old_master_host", oldMasterHost)
+	logger.AddMetadata("old_master_ip", oldMasterIP) // YENİ: Eski master IP
 	logger.AddMetadata("new_master_host", newMasterHost)
 	logger.AddMetadata("data_directory", dataDir)
+	logger.AddMetadata("slave_count", fmt.Sprintf("%d", len(slaves))) // YENİ: Slave sayısı
+
+	// YENİ: Slave bilgilerini metadata'ya ekle
+	for i, slave := range slaves {
+		logger.AddMetadata(fmt.Sprintf("slave_%d_hostname", i), slave.Hostname)
+		logger.AddMetadata(fmt.Sprintf("slave_%d_ip", i), slave.Ip)
+		logger.LogMessage(fmt.Sprintf("Koordinasyon için slave %d: %s (%s)", i+1, slave.Hostname, slave.Ip))
+	}
 
 	// Replication kullanıcı bilgilerini config'den al
 	replUser := r.cfg.PostgreSQL.ReplicationUser
@@ -6327,11 +6428,11 @@ func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, d
 	// Replication credentials kontrolü ve logla
 	if replUser == "" {
 		logger.LogMessage("UYARI: Config'de ReplicationUser boş, normal User kullanılacak")
-		replUser = r.cfg.PostgreSQL.ReplicationUser
+		replUser = r.cfg.PostgreSQL.User
 	}
 	if replPassword == "" {
 		logger.LogMessage("UYARI: Config'de ReplicationPassword boş, normal Pass kullanılacak")
-		replPassword = r.cfg.PostgreSQL.ReplicationPass
+		replPassword = r.cfg.PostgreSQL.Pass
 	}
 
 	logger.LogMessage(fmt.Sprintf("Replication bilgileri: user=%s, pass_empty=%t, port=%s",
@@ -6345,10 +6446,11 @@ func (r *Reporter) sendFailoverCoordinationToAPI(oldMasterHost, newMasterHost, d
 	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 
 	// Koordinasyon talep mesajı gönder
-	coordinationMsg := fmt.Sprintf("FAILOVER_COORDINATION_REQUEST: Promotion tamamlandı, eski master (%s) slave'e dönüştürülmeli", oldMasterHost)
+	coordinationMsg := fmt.Sprintf("FAILOVER_COORDINATION_REQUEST: Promotion tamamlandı, eski master (%s/%s) slave'e dönüştürülmeli, %d slave node var",
+		oldMasterHost, oldMasterIP, len(slaves))
 	logger.LogMessage(coordinationMsg)
 
-	logger.LogMessage("Koordinasyon metadata'sı ProcessLogger ile API'ye gönderildi")
+	logger.LogMessage("Koordinasyon metadata'sı (slave bilgileri ile) ProcessLogger ile API'ye gönderildi")
 
 	// Kısa bir bekleme - API'nin koordinasyon işlemini başlatması için
 	time.Sleep(2 * time.Second)

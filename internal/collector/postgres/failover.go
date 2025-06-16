@@ -27,38 +27,50 @@ func NewPostgreSQLFailoverManager(cfg *config.AgentConfig) *PostgreSQLFailoverMa
 	}
 }
 
-// ConvertToSlave master node'unu slave'e dönüştürür
+// ConvertToSlave master node'unu slave'e dönüştürür (hostname ile - DNS çözümlemesi yapar)
 func (fm *PostgreSQLFailoverManager) ConvertToSlave(dataDir, newMasterHost string, newMasterPort int, replUser, replPassword, pgVersion string) error {
 	// Hostname'i IP adresine çevir
-	masterIP := fm.resolveHostnameToIP(newMasterHost)
+	masterIP, err := fm.resolveHostnameToIPWithError(newMasterHost)
+	if err != nil {
+		return fmt.Errorf("hostname IP'ye çevrilemedi (%s): %v", newMasterHost, err)
+	}
 	log.Printf("Master->Slave dönüşüm başlatılıyor: %s -> %s:%d (IP: %s, version: %s)", dataDir, newMasterHost, newMasterPort, masterIP, pgVersion)
 	log.Printf("DEBUG: ConvertToSlave adım 1 - Hostname çözümlendi: %s -> %s", newMasterHost, masterIP)
 
+	// IP adresi ile devam et
+	return fm.ConvertToSlaveWithIP(dataDir, masterIP, newMasterPort, replUser, replPassword, pgVersion)
+}
+
+// ConvertToSlaveWithIP master node'unu slave'e dönüştürür (direkt IP ile - DNS çözümlemesi yapmaz)
+func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIP(dataDir, masterIP string, newMasterPort int, replUser, replPassword, pgVersion string) error {
+	log.Printf("Master->Slave dönüşüm başlatılıyor (IP ile): %s -> %s:%d (version: %s)", dataDir, masterIP, newMasterPort, pgVersion)
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 1 - IP adresi direkt kullanılıyor: %s", masterIP)
+
 	// Eski data directory'yi backup al ve temizle
-	log.Printf("DEBUG: ConvertToSlave adım 2 - Data directory backup/temizleme başlatılıyor")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme başlatılıyor")
 	err := fm.backupAndCleanDataDirectory(dataDir)
 	if err != nil {
 		return fmt.Errorf("data directory backup ve temizleme başarısız: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlave adım 2 - Data directory backup/temizleme tamamlandı")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme tamamlandı")
 
 	// pg_basebackup ile fresh backup al (-R parametresi ile standby konfigürasyonu otomatik oluşturulur)
-	log.Printf("DEBUG: ConvertToSlave adım 3 - pg_basebackup başlatılıyor")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup başlatılıyor")
 	err = fm.performBaseBackup(masterIP, newMasterPort, replUser, replPassword, dataDir)
 	if err != nil {
 		return fmt.Errorf("pg_basebackup başarısız: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlave adım 3 - pg_basebackup tamamlandı")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup tamamlandı")
 
 	log.Printf("pg_basebackup -R parametresi ile standby konfigürasyonu otomatik oluşturuldu (standby.signal ve postgresql.auto.conf)")
 
 	// PostgreSQL'i standby modunda başlat (pg_ctl ile)
-	log.Printf("DEBUG: ConvertToSlave adım 4 - PostgreSQL standby modunda başlatılıyor")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatılıyor")
 	err = fm.startPostgreSQLAsStandby(dataDir, pgVersion)
 	if err != nil {
 		return fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlave adım 4 - PostgreSQL standby modunda başlatıldı")
+	log.Printf("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatıldı")
 
 	return nil
 }
@@ -141,6 +153,8 @@ func (fm *PostgreSQLFailoverManager) CheckReplicationSlots() ([]string, error) {
 
 // resolveHostnameToIP hostname'i IP adresine çevirir
 func (fm *PostgreSQLFailoverManager) resolveHostnameToIP(hostname string) string {
+	log.Printf("DEBUG: resolveHostnameToIP çağrıldı - hostname: %s", hostname)
+
 	// Eğer zaten IP adresi ise, olduğu gibi döndür
 	if net.ParseIP(hostname) != nil {
 		log.Printf("Hostname zaten IP adresi: %s", hostname)
@@ -148,14 +162,20 @@ func (fm *PostgreSQLFailoverManager) resolveHostnameToIP(hostname string) string
 	}
 
 	// Hostname'i IP'ye çevir
+	log.Printf("DEBUG: net.LookupIP çağrılıyor - hostname: %s", hostname)
 	ips, err := net.LookupIP(hostname)
 	if err != nil {
-		log.Printf("Hostname çözümlenemedi (%s), hostname olarak kullanılacak: %v", hostname, err)
-		return hostname
+		log.Printf("HATA: Hostname çözümlenemedi (%s), bu durumda pg_basebackup başarısız olacak: %v", hostname, err)
+		// DNS çözümlemesi başarısız olduğunda hostname döndürme, hata ver
+		log.Printf("KRITIK: DNS çözümlemesi başarısız, pg_basebackup çalışmayacak")
+		return hostname // Hala hostname döndürüyoruz ama bu sorunlu
 	}
 
+	log.Printf("DEBUG: net.LookupIP başarılı - %d IP adresi bulundu", len(ips))
+
 	// İlk IPv4 adresini kullan
-	for _, ip := range ips {
+	for i, ip := range ips {
+		log.Printf("DEBUG: IP %d: %s (IPv4: %v)", i, ip.String(), ip.To4() != nil)
 		if ipv4 := ip.To4(); ipv4 != nil {
 			log.Printf("Hostname çözümlendi: %s -> %s", hostname, ipv4.String())
 			return ipv4.String()
@@ -168,8 +188,45 @@ func (fm *PostgreSQLFailoverManager) resolveHostnameToIP(hostname string) string
 		return ips[0].String()
 	}
 
-	log.Printf("IP çözümlenemedi, hostname olarak kullanılacak: %s", hostname)
+	log.Printf("HATA: IP çözümlenemedi, hostname olarak kullanılacak ama pg_basebackup başarısız olacak: %s", hostname)
 	return hostname
+}
+
+// resolveHostnameToIPWithError hostname'i IP adresine çevirir ve hata döndürür
+func (fm *PostgreSQLFailoverManager) resolveHostnameToIPWithError(hostname string) (string, error) {
+	log.Printf("DEBUG: resolveHostnameToIPWithError çağrıldı - hostname: %s", hostname)
+
+	// Eğer zaten IP adresi ise, olduğu gibi döndür
+	if net.ParseIP(hostname) != nil {
+		log.Printf("Hostname zaten IP adresi: %s", hostname)
+		return hostname, nil
+	}
+
+	// Hostname'i IP'ye çevir
+	log.Printf("DEBUG: net.LookupIP çağrılıyor - hostname: %s", hostname)
+	ips, err := net.LookupIP(hostname)
+	if err != nil {
+		return "", fmt.Errorf("DNS çözümlemesi başarısız: %v", err)
+	}
+
+	log.Printf("DEBUG: net.LookupIP başarılı - %d IP adresi bulundu", len(ips))
+
+	// İlk IPv4 adresini kullan
+	for i, ip := range ips {
+		log.Printf("DEBUG: IP %d: %s (IPv4: %v)", i, ip.String(), ip.To4() != nil)
+		if ipv4 := ip.To4(); ipv4 != nil {
+			log.Printf("Hostname çözümlendi: %s -> %s", hostname, ipv4.String())
+			return ipv4.String(), nil
+		}
+	}
+
+	// IPv4 bulunamadıysa, ilk IP'yi kullan
+	if len(ips) > 0 {
+		log.Printf("IPv4 bulunamadı, ilk IP kullanılıyor: %s -> %s", hostname, ips[0].String())
+		return ips[0].String(), nil
+	}
+
+	return "", fmt.Errorf("hiçbir IP adresi bulunamadı")
 }
 
 // createStandbyConfigurationWithVersion standby konfigürasyon dosyalarını oluşturur
