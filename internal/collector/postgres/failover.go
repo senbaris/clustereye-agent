@@ -508,3 +508,35 @@ func (fm *PostgreSQLFailoverManager) performBaseBackup(masterIP string, masterPo
 
 	return nil
 }
+
+// ReconfigureSlaveToNewMaster mevcut slave'i yeni master'a yönlendirir
+func (fm *PostgreSQLFailoverManager) ReconfigureSlaveToNewMaster(dataDir, newMasterIP string, newMasterPort int, replUser, replPassword, pgVersion string) error {
+	log.Printf("Slave reconfiguration başlatılıyor: yeni master %s:%d", newMasterIP, newMasterPort)
+
+	// PostgreSQL version'ını parse et
+	majorVersionInt, err := fm.parsePGVersion(pgVersion)
+	if err != nil {
+		return fmt.Errorf("PostgreSQL version parse edilemedi: %v", err)
+	}
+
+	if majorVersionInt >= 12 {
+		// PostgreSQL 12+ için postgresql.auto.conf güncelle
+		postgresqlAutoConfPath := filepath.Join(dataDir, "postgresql.auto.conf")
+		log.Printf("PostgreSQL 12+ için postgresql.auto.conf güncelleniyor: %s", postgresqlAutoConfPath)
+		err = fm.updatePostgreSQLAutoConf(postgresqlAutoConfPath, newMasterIP, newMasterPort, replUser, replPassword)
+		if err != nil {
+			return fmt.Errorf("postgresql.auto.conf güncellenemedi: %v", err)
+		}
+	} else {
+		// PostgreSQL 11 ve öncesi için recovery.conf güncelle
+		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
+		log.Printf("PostgreSQL 11- için recovery.conf güncelleniyor: %s", recoveryConfPath)
+		err = fm.createRecoveryConf(recoveryConfPath, newMasterIP, newMasterPort, replUser, replPassword)
+		if err != nil {
+			return fmt.Errorf("recovery.conf güncellenemedi: %v", err)
+		}
+	}
+
+	log.Printf("Slave başarıyla yeni master'a yönlendirildi: %s:%d", newMasterIP, newMasterPort)
+	return nil
+}

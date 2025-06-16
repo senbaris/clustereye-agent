@@ -1227,6 +1227,53 @@ func (r *Reporter) listenForCommands() {
 				lastMessageType = "query"
 				log.Printf("Yeni sorgu geldi: %s (ID: %s)", trimString(query.Command, 100), query.QueryId)
 
+				// PostgreSQL Slave Reconfiguration komutu kontrolü (yeni master'a yönlendirme)
+				if strings.HasPrefix(query.Command, "reconfigure_slave_master") {
+					log.Printf("Slave master reconfiguration komutu tespit edildi: %s", query.Command)
+
+					// Komuttan parametreleri çıkar: reconfigure_slave_master|new_master_host|new_master_ip|new_master_port|parent_job_id
+					parts := strings.Split(query.Command, "|")
+					if len(parts) >= 4 {
+						newMasterHost := parts[1]
+						newMasterIP := parts[2]
+						newMasterPort, _ := strconv.Atoi(parts[3])
+						parentJobId := ""
+						if len(parts) >= 5 {
+							parentJobId = parts[4]
+						}
+
+						log.Printf("Slave reconfiguration parametreleri: NewMaster=%s (%s):%d, ParentJobId=%s",
+							newMasterHost, newMasterIP, newMasterPort, parentJobId)
+
+						// Slave'in primary_conninfo'sunu güncelle
+						err := r.reconfigureSlaveConnection(newMasterHost, newMasterIP, newMasterPort, parentJobId)
+						if err != nil {
+							log.Printf("ERROR: Slave reconfiguration başarısız: %v", err)
+							errorResult := map[string]interface{}{
+								"status":  "error",
+								"message": fmt.Sprintf("Slave reconfiguration başarısız: %v", err),
+							}
+							sendQueryResult(r.stream, query.QueryId, errorResult)
+						} else {
+							successResult := map[string]interface{}{
+								"status":  "success",
+								"message": fmt.Sprintf("Slave başarıyla yeni master'a yönlendirildi: %s (%s):%d", newMasterHost, newMasterIP, newMasterPort),
+							}
+							sendQueryResult(r.stream, query.QueryId, successResult)
+						}
+					} else {
+						// Eksik parametre
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz reconfigure_slave_master komutu. Format: reconfigure_slave_master|new_master_host|new_master_ip|new_master_port|[parent_job_id]",
+						}
+						sendQueryResult(r.stream, query.QueryId, errorResult)
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
 				// PostgreSQL Master -> Slave dönüşüm komutu kontrolü
 				if strings.HasPrefix(query.Command, "convert_postgres_to_slave") {
 					log.Printf("PostgreSQL Master->Slave dönüşüm komutu tespit edildi: %s", query.Command)
@@ -6417,6 +6464,9 @@ func (r *Reporter) sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, oldMas
 		logger.LogMessage(fmt.Sprintf("Koordinasyon için slave %d: %s (%s)", i+1, slave.Hostname, slave.Ip))
 	}
 
+	// Replication port'u al (aşağıda tanımlanmış replPort değişkenini kullan)
+	// Bu kısım replication bilgileri alındıktan sonra gelecek
+
 	// Replication kullanıcı bilgilerini config'den al
 	replUser := r.cfg.PostgreSQL.ReplicationUser
 	replPassword := r.cfg.PostgreSQL.ReplicationPass
@@ -6445,6 +6495,24 @@ func (r *Reporter) sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, oldMas
 	logger.AddMetadata("requested_by", "promotion_agent")
 	logger.AddMetadata("timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 
+	// YENİ: Slave reconfiguration komutları için metadata ekle
+	logger.AddMetadata("slave_reconfiguration_required", "true")
+	logger.AddMetadata("new_master_host", newMasterHost)
+	logger.AddMetadata("new_master_ip", r.resolveHostnameToIP(newMasterHost)) // Yeni master'ın IP'si
+	logger.AddMetadata("new_master_port", replPort)
+
+	// Her slave için reconfiguration komutu oluştur
+	for i, slave := range slaves {
+		reconfigCmd := fmt.Sprintf("reconfigure_slave_master|%s|%s|%s|%s",
+			newMasterHost,
+			r.resolveHostnameToIP(newMasterHost),
+			replPort,
+			fmt.Sprintf("promotion_%d", time.Now().Unix()))
+
+		logger.AddMetadata(fmt.Sprintf("slave_%d_reconfigure_command", i), reconfigCmd)
+		logger.LogMessage(fmt.Sprintf("Slave %d (%s) için reconfiguration komutu: %s", i+1, slave.Hostname, reconfigCmd))
+	}
+
 	// Koordinasyon talep mesajı gönder
 	coordinationMsg := fmt.Sprintf("FAILOVER_COORDINATION_REQUEST: Promotion tamamlandı, eski master (%s/%s) slave'e dönüştürülmeli, %d slave node var",
 		oldMasterHost, oldMasterIP, len(slaves))
@@ -6456,6 +6524,81 @@ func (r *Reporter) sendFailoverCoordinationToAPIWithSlaves(oldMasterHost, oldMas
 	time.Sleep(2 * time.Second)
 
 	return nil
+}
+
+// reconfigureSlaveConnection slave'in bağlantısını yeni master'a yönlendirir
+func (r *Reporter) reconfigureSlaveConnection(newMasterHost, newMasterIP string, newMasterPort int, parentJobId string) error {
+	log.Printf("Slave connection reconfiguration başlatılıyor: yeni master %s (%s):%d", newMasterHost, newMasterIP, newMasterPort)
+
+	// PostgreSQL'i durdur
+	if err := r.stopPostgreSQLService(); err != nil {
+		return fmt.Errorf("PostgreSQL durdurulamadı: %v", err)
+	}
+
+	// Data directory'yi al
+	dataDir, err := postgres.GetDataDirectory()
+	if err != nil {
+		dataDir = "/var/lib/postgresql/data"
+		log.Printf("Data directory otomatik tespit edilemedi, varsayılan kullanılıyor: %s", dataDir)
+	}
+
+	// Replication credentials'ı config'den al
+	replUser := r.cfg.PostgreSQL.ReplicationUser
+	replPassword := r.cfg.PostgreSQL.ReplicationPass
+
+	if replUser == "" {
+		replUser = r.cfg.PostgreSQL.User
+		log.Printf("Config'de ReplicationUser boş, normal PostgreSQL User kullanılıyor: %s", replUser)
+	}
+	if replPassword == "" {
+		replPassword = r.cfg.PostgreSQL.Pass
+		log.Printf("Config'de ReplicationPassword boş, normal PostgreSQL Pass kullanılıyor")
+	}
+
+	// PostgreSQL version'ını al
+	pgVersion := postgres.GetPGVersion()
+	majorVersion := strings.Split(pgVersion, ".")[0]
+	majorVersionInt, parseErr := strconv.Atoi(majorVersion)
+
+	if parseErr != nil {
+		log.Printf("WARNING: Version parse hatası, PostgreSQL 15+ olarak varsayılıyor")
+		majorVersionInt = 15
+	}
+
+	// PostgreSQL konfigürasyonunu güncelle
+	if majorVersionInt >= 12 {
+		// PostgreSQL 12+ için postgresql.auto.conf güncelle
+		postgresqlAutoConfPath := filepath.Join(dataDir, "postgresql.auto.conf")
+		log.Printf("PostgreSQL 12+ tespit edildi, postgresql.auto.conf güncelleniyor: %s", postgresqlAutoConfPath)
+		err = r.updatePostgreSQLConf(postgresqlAutoConfPath, newMasterIP, newMasterPort, replUser, replPassword)
+	} else {
+		// PostgreSQL 11 ve öncesi için recovery.conf güncelle
+		recoveryConfPath := filepath.Join(dataDir, "recovery.conf")
+		log.Printf("PostgreSQL 11- tespit edildi, recovery.conf güncelleniyor: %s", recoveryConfPath)
+		err = r.createRecoveryConf(recoveryConfPath, newMasterIP, newMasterPort, replUser, replPassword)
+	}
+
+	if err != nil {
+		return fmt.Errorf("PostgreSQL konfigürasyonu güncellenemedi: %v", err)
+	}
+
+	// PostgreSQL'i yeniden başlat
+	if err := r.startPostgreSQLService(); err != nil {
+		return fmt.Errorf("PostgreSQL başlatılamadı: %v", err)
+	}
+
+	// Bağlantının çalışıp çalışmadığını kontrol et
+	time.Sleep(5 * time.Second) // PostgreSQL'in başlaması için bekle
+
+	nodeStatus := postgres.GetNodeStatus()
+	log.Printf("Reconfiguration sonrası node durumu: %s", nodeStatus)
+
+	if nodeStatus == "SLAVE" || nodeStatus == "STANDBY" {
+		log.Printf("Slave başarıyla yeni master'a yönlendirildi: %s (%s):%d", newMasterHost, newMasterIP, newMasterPort)
+		return nil
+	} else {
+		return fmt.Errorf("slave reconfiguration tamamlandı ancak node durumu beklendiği gibi değil: %s", nodeStatus)
+	}
 }
 
 // sanitizeData recursively traverses a data structure and sanitizes problematic values
