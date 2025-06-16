@@ -1274,6 +1274,124 @@ func (r *Reporter) listenForCommands() {
 					continue
 				}
 
+				// PostgreSQL Rollback komutu kontrolü
+				if strings.HasPrefix(query.Command, "rollback_postgres_failover") {
+					log.Printf("PostgreSQL rollback komutu tespit edildi: %s", query.Command)
+
+					// Komuttan parametreleri çıkar: rollback_postgres_failover|job_id|reason
+					parts := strings.Split(query.Command, "|")
+					if len(parts) >= 2 {
+						jobID := parts[1]
+						reason := "Manual rollback requested"
+						if len(parts) >= 3 {
+							reason = parts[2]
+						}
+
+						log.Printf("PostgreSQL rollback işlemi başlatılıyor: JobID=%s, Reason=%s", jobID, reason)
+
+						// Hostname'i al
+						hostname, _ := os.Hostname()
+						agentID := "agent_" + hostname
+
+						// ProcessLogger oluştur
+						if r.grpcClient != nil {
+							client := pb.NewAgentServiceClient(r.grpcClient)
+							rollbackLogger := NewProcessLogger(client, agentID, query.QueryId, "postgresql_rollback")
+							rollbackLogger.Start()
+
+							// Failover manager oluştur ve rollback yap
+							failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
+							err := failoverManager.RollbackFailover(rollbackLogger)
+
+							if err != nil {
+								log.Printf("ERROR: PostgreSQL rollback başarısız: %v", err)
+								rollbackLogger.LogError(fmt.Sprintf("Rollback başarısız: %v", err), err)
+								rollbackLogger.Stop("failed")
+
+								errorResult := map[string]interface{}{
+									"status":  "error",
+									"message": fmt.Sprintf("PostgreSQL rollback başarısız: %v", err),
+								}
+								sendQueryResult(r.stream, query.QueryId, errorResult)
+							} else {
+								rollbackLogger.LogMessage("PostgreSQL rollback başarıyla tamamlandı")
+								rollbackLogger.Stop("completed")
+
+								successResult := map[string]interface{}{
+									"status":  "success",
+									"message": "PostgreSQL rollback başarıyla tamamlandı",
+								}
+								sendQueryResult(r.stream, query.QueryId, successResult)
+							}
+						} else {
+							errorResult := map[string]interface{}{
+								"status":  "error",
+								"message": "gRPC client bulunamadı",
+							}
+							sendQueryResult(r.stream, query.QueryId, errorResult)
+						}
+					} else {
+						// Eksik parametre
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": "Geçersiz rollback komutu. Format: rollback_postgres_failover|job_id|[reason]",
+						}
+						sendQueryResult(r.stream, query.QueryId, errorResult)
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
+				// PostgreSQL Rollback durumu sorgulama komutu
+				if strings.HasPrefix(query.Command, "get_postgres_rollback_info") {
+					log.Printf("PostgreSQL rollback durumu sorgusu tespit edildi: %s", query.Command)
+
+					// Failover manager oluştur ve rollback bilgilerini al
+					failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
+					rollbackInfo, err := failoverManager.GetRollbackInfo()
+
+					if err != nil {
+						log.Printf("ERROR: Rollback bilgileri alınamadı: %v", err)
+						errorResult := map[string]interface{}{
+							"status":  "error",
+							"message": fmt.Sprintf("Rollback bilgileri alınamadı: %v", err),
+						}
+						sendQueryResult(r.stream, query.QueryId, errorResult)
+					} else if rollbackInfo == nil {
+						// Aktif failover yok
+						noStateResult := map[string]interface{}{
+							"status":       "success",
+							"message":      "Aktif failover işlemi bulunamadı",
+							"has_state":    false,
+							"can_rollback": false,
+						}
+						sendQueryResult(r.stream, query.QueryId, noStateResult)
+					} else {
+						// Rollback bilgilerini döndür
+						canRollback, rollbackReason := failoverManager.CanRollback()
+
+						rollbackResult := map[string]interface{}{
+							"status":               "success",
+							"has_state":            true,
+							"job_id":               rollbackInfo.JobID,
+							"start_time":           rollbackInfo.StartTime.Format(time.RFC3339),
+							"current_step":         rollbackInfo.CurrentStep,
+							"completed_steps":      rollbackInfo.CompletedSteps,
+							"original_node_status": rollbackInfo.OriginalNodeStatus,
+							"data_directory":       rollbackInfo.DataDirectory,
+							"postgresql_version":   rollbackInfo.PostgreSQLVersion,
+							"can_rollback":         canRollback,
+							"rollback_reason":      rollbackReason,
+							"last_error":           rollbackInfo.LastError,
+						}
+						sendQueryResult(r.stream, query.QueryId, rollbackResult)
+					}
+
+					isProcessingQuery = false
+					continue
+				}
+
 				// PostgreSQL Master -> Slave dönüşüm komutu kontrolü
 				if strings.HasPrefix(query.Command, "convert_postgres_to_slave") {
 					log.Printf("PostgreSQL Master->Slave dönüşüm komutu tespit edildi: %s", query.Command)
@@ -4359,6 +4477,12 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 		}
 	}
 
+	// Failover manager oluştur ve promotion state'i başlat
+	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
+	if err := failoverManager.InitializePromotionState(req.JobId, dataDir); err != nil {
+		logger.LogMessage(fmt.Sprintf("Failed to initialize promotion state: %v", err))
+	}
+
 	// Data directory varlığını kontrol et
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
 		errMsg := fmt.Sprintf("Data directory bulunamadı: %s", dataDir)
@@ -4540,11 +4664,20 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 	logger.LogMessage("Ön kontroller tamamlandı, promotion işlemi başlatılabilir")
 
 	// Failover manager ile promotion yap
-	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
+	failoverManager = postgres.NewPostgreSQLFailoverManager(r.cfg)
+
+	// Promotion state'i başlat (rollback için)
+	if err := failoverManager.InitializePromotionState(req.JobId, dataDir); err != nil {
+		logger.LogMessage(fmt.Sprintf("Promotion state initialization failed: %v", err))
+		// Bu hata kritik değil, promotion devam edebilir
+	} else {
+		logger.LogMessage("Promotion state initialized for rollback capability")
+	}
+
 	promoted := false
 
 	logger.LogMessage("PostgreSQL master promotion: Failover manager ile promotion deneniyor...")
-	err = failoverManager.PromoteToMaster(dataDir)
+	err = failoverManager.PromoteToMasterWithLogger(dataDir, logger)
 	if err == nil {
 		logger.LogMessage("Failover manager ile promotion başarılı!")
 		promoted = true

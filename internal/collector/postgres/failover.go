@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -15,16 +16,444 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/config"
 )
 
+// FailoverState failover işleminin durumunu takip eder
+type FailoverState struct {
+	JobID              string            `json:"job_id"`
+	StartTime          time.Time         `json:"start_time"`
+	CurrentStep        string            `json:"current_step"`
+	CompletedSteps     []string          `json:"completed_steps"`
+	BackupPaths        map[string]string `json:"backup_paths"`    // step -> backup_path
+	OriginalConfig     map[string]string `json:"original_config"` // config_file -> original_content
+	OriginalNodeStatus string            `json:"original_node_status"`
+	OriginalMasterHost string            `json:"original_master_host"`
+	OriginalMasterIP   string            `json:"original_master_ip"`
+	OriginalMasterPort int               `json:"original_master_port"`
+	NewMasterHost      string            `json:"new_master_host"`
+	NewMasterIP        string            `json:"new_master_ip"`
+	NewMasterPort      int               `json:"new_master_port"`
+	DataDirectory      string            `json:"data_directory"`
+	PostgreSQLVersion  string            `json:"postgresql_version"`
+	ReplicationUser    string            `json:"replication_user"`
+	CanRollback        bool              `json:"can_rollback"`
+	RollbackReason     string            `json:"rollback_reason,omitempty"`
+	LastError          string            `json:"last_error,omitempty"`
+}
+
 // PostgreSQLFailoverManager PostgreSQL failover işlemlerini yönetir
 type PostgreSQLFailoverManager struct {
-	cfg *config.AgentConfig
+	cfg           *config.AgentConfig
+	currentState  *FailoverState
+	stateFilePath string
 }
 
 // NewPostgreSQLFailoverManager yeni bir failover manager oluşturur
 func NewPostgreSQLFailoverManager(cfg *config.AgentConfig) *PostgreSQLFailoverManager {
+	stateDir := "/tmp/clustereye-failover"
+	os.MkdirAll(stateDir, 0755)
+
 	return &PostgreSQLFailoverManager{
-		cfg: cfg,
+		cfg:           cfg,
+		stateFilePath: filepath.Join(stateDir, "failover-state.json"),
 	}
+}
+
+// SaveState failover durumunu dosyaya kaydeder
+func (fm *PostgreSQLFailoverManager) SaveState() error {
+	if fm.currentState == nil {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(fm.currentState, "", "  ")
+	if err != nil {
+		return fmt.Errorf("state serialization failed: %v", err)
+	}
+
+	err = os.WriteFile(fm.stateFilePath, data, 0600)
+	if err != nil {
+		return fmt.Errorf("state file write failed: %v", err)
+	}
+
+	log.Printf("Failover state saved: step=%s, can_rollback=%v", fm.currentState.CurrentStep, fm.currentState.CanRollback)
+	return nil
+}
+
+// LoadState failover durumunu dosyadan yükler
+func (fm *PostgreSQLFailoverManager) LoadState() error {
+	if _, err := os.Stat(fm.stateFilePath); os.IsNotExist(err) {
+		return nil // State file yok, normal
+	}
+
+	data, err := os.ReadFile(fm.stateFilePath)
+	if err != nil {
+		return fmt.Errorf("state file read failed: %v", err)
+	}
+
+	fm.currentState = &FailoverState{}
+	err = json.Unmarshal(data, fm.currentState)
+	if err != nil {
+		return fmt.Errorf("state deserialization failed: %v", err)
+	}
+
+	log.Printf("Failover state loaded: job_id=%s, step=%s, can_rollback=%v",
+		fm.currentState.JobID, fm.currentState.CurrentStep, fm.currentState.CanRollback)
+	return nil
+}
+
+// ClearState failover durumunu temizler
+func (fm *PostgreSQLFailoverManager) ClearState() error {
+	fm.currentState = nil
+	if _, err := os.Stat(fm.stateFilePath); err == nil {
+		return os.Remove(fm.stateFilePath)
+	}
+	return nil
+}
+
+// InitializeFailoverState yeni bir failover işlemi için state başlatır
+func (fm *PostgreSQLFailoverManager) InitializeFailoverState(jobID, dataDir, newMasterHost, newMasterIP string, newMasterPort int) error {
+	// Mevcut durumu kaydet
+	originalNodeStatus := GetNodeStatus()
+	pgVersion := GetPGVersion()
+
+	fm.currentState = &FailoverState{
+		JobID:              jobID,
+		StartTime:          time.Now(),
+		CurrentStep:        "initialized",
+		CompletedSteps:     []string{},
+		BackupPaths:        make(map[string]string),
+		OriginalConfig:     make(map[string]string),
+		OriginalNodeStatus: originalNodeStatus,
+		NewMasterHost:      newMasterHost,
+		NewMasterIP:        newMasterIP,
+		NewMasterPort:      newMasterPort,
+		DataDirectory:      dataDir,
+		PostgreSQLVersion:  pgVersion,
+		CanRollback:        true,
+	}
+
+	// Replication credentials'ı al
+	replUser := fm.cfg.PostgreSQL.ReplicationUser
+	if replUser == "" {
+		replUser = fm.cfg.PostgreSQL.User
+	}
+	fm.currentState.ReplicationUser = replUser
+
+	return fm.SaveState()
+}
+
+// InitializePromotionState promotion işlemi için state başlatır
+func (fm *PostgreSQLFailoverManager) InitializePromotionState(jobID, dataDir string) error {
+	originalNodeStatus := GetNodeStatus()
+	pgVersion := GetPGVersion()
+
+	fm.currentState = &FailoverState{
+		JobID:              jobID,
+		StartTime:          time.Now(),
+		CurrentStep:        "promotion_initialized",
+		CompletedSteps:     []string{},
+		BackupPaths:        make(map[string]string),
+		OriginalConfig:     make(map[string]string),
+		OriginalNodeStatus: originalNodeStatus,
+		DataDirectory:      dataDir,
+		PostgreSQLVersion:  pgVersion,
+		CanRollback:        true,
+	}
+
+	return fm.SaveState()
+}
+
+// MarkStepCompleted bir adımı tamamlandı olarak işaretler
+func (fm *PostgreSQLFailoverManager) MarkStepCompleted(step string) error {
+	if fm.currentState == nil {
+		return fmt.Errorf("no active failover state")
+	}
+
+	fm.currentState.CompletedSteps = append(fm.currentState.CompletedSteps, step)
+	fm.currentState.CurrentStep = step
+
+	// Kritik adımlardan sonra rollback imkansız hale gelir
+	criticalSteps := []string{"data_directory_cleaned", "pg_basebackup_completed", "promotion_completed"}
+	for _, criticalStep := range criticalSteps {
+		if step == criticalStep {
+			fm.currentState.CanRollback = false
+			fm.currentState.RollbackReason = fmt.Sprintf("Critical step completed: %s", step)
+			break
+		}
+	}
+
+	return fm.SaveState()
+}
+
+// AddBackupPath bir backup yolunu state'e ekler
+func (fm *PostgreSQLFailoverManager) AddBackupPath(step, backupPath string) error {
+	if fm.currentState == nil {
+		return fmt.Errorf("no active failover state")
+	}
+
+	fm.currentState.BackupPaths[step] = backupPath
+	return fm.SaveState()
+}
+
+// SaveOriginalConfig orijinal konfigürasyonu saklar
+func (fm *PostgreSQLFailoverManager) SaveOriginalConfig(configFile string) error {
+	if fm.currentState == nil {
+		return fmt.Errorf("no active failover state")
+	}
+
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		return fmt.Errorf("failed to read config file %s: %v", configFile, err)
+	}
+
+	fm.currentState.OriginalConfig[configFile] = string(content)
+	return fm.SaveState()
+}
+
+// SetError bir hata durumunu state'e kaydeder
+func (fm *PostgreSQLFailoverManager) SetError(err error) {
+	if fm.currentState != nil {
+		fm.currentState.LastError = err.Error()
+		fm.SaveState()
+	}
+}
+
+// CanRollback rollback yapılıp yapılamayacağını kontrol eder
+func (fm *PostgreSQLFailoverManager) CanRollback() (bool, string) {
+	if fm.currentState == nil {
+		return false, "No active failover state"
+	}
+
+	if !fm.currentState.CanRollback {
+		return false, fm.currentState.RollbackReason
+	}
+
+	// Zaman kontrolü - 1 saatten eski işlemler için rollback riskli
+	if time.Since(fm.currentState.StartTime) > time.Hour {
+		return false, "Failover too old (>1 hour), rollback risky"
+	}
+
+	return true, ""
+}
+
+// RollbackFailover failover işlemini geri alır
+func (fm *PostgreSQLFailoverManager) RollbackFailover(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	// State yükle
+	if err := fm.LoadState(); err != nil {
+		return fmt.Errorf("failed to load failover state: %v", err)
+	}
+
+	if fm.currentState == nil {
+		return fmt.Errorf("no failover state found")
+	}
+
+	canRollback, reason := fm.CanRollback()
+	if !canRollback {
+		return fmt.Errorf("rollback not possible: %s", reason)
+	}
+
+	logMessage(fmt.Sprintf("Starting rollback for job %s (step: %s)", fm.currentState.JobID, fm.currentState.CurrentStep))
+
+	// Rollback adımlarını ters sırada uygula
+	completedSteps := fm.currentState.CompletedSteps
+	for i := len(completedSteps) - 1; i >= 0; i-- {
+		step := completedSteps[i]
+		logMessage(fmt.Sprintf("Rolling back step: %s", step))
+
+		switch step {
+		case "postgresql_stopped":
+			if err := fm.rollbackPostgreSQLStop(logger); err != nil {
+				logMessage(fmt.Sprintf("Failed to rollback PostgreSQL stop: %v", err))
+				// Continue with other rollback steps
+			}
+
+		case "config_backup_created":
+			if err := fm.rollbackConfigChanges(logger); err != nil {
+				logMessage(fmt.Sprintf("Failed to rollback config changes: %v", err))
+			}
+
+		case "data_directory_backed_up":
+			if err := fm.rollbackDataDirectoryChanges(logger); err != nil {
+				logMessage(fmt.Sprintf("Failed to rollback data directory: %v", err))
+			}
+
+		case "standby_config_created":
+			if err := fm.rollbackStandbyConfig(logger); err != nil {
+				logMessage(fmt.Sprintf("Failed to rollback standby config: %v", err))
+			}
+
+		default:
+			logMessage(fmt.Sprintf("No rollback action defined for step: %s", step))
+		}
+	}
+
+	// PostgreSQL'i orijinal durumda başlat
+	if err := fm.restoreOriginalState(logger); err != nil {
+		logMessage(fmt.Sprintf("Failed to restore original state: %v", err))
+		return err
+	}
+
+	// State'i temizle
+	if err := fm.ClearState(); err != nil {
+		logMessage(fmt.Sprintf("Failed to clear state: %v", err))
+	}
+
+	logMessage("Rollback completed successfully")
+	return nil
+}
+
+// rollbackPostgreSQLStop PostgreSQL'i yeniden başlatır
+func (fm *PostgreSQLFailoverManager) rollbackPostgreSQLStop(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage("Rolling back PostgreSQL stop - starting PostgreSQL")
+	return fm.StartPostgreSQLService(fm.currentState.PostgreSQLVersion)
+}
+
+// rollbackConfigChanges konfigürasyon değişikliklerini geri alır
+func (fm *PostgreSQLFailoverManager) rollbackConfigChanges(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	for configFile, originalContent := range fm.currentState.OriginalConfig {
+		logMessage(fmt.Sprintf("Restoring original config: %s", configFile))
+
+		err := os.WriteFile(configFile, []byte(originalContent), 0600)
+		if err != nil {
+			return fmt.Errorf("failed to restore config %s: %v", configFile, err)
+		}
+
+		logMessage(fmt.Sprintf("Config restored: %s", configFile))
+	}
+
+	return nil
+}
+
+// rollbackDataDirectoryChanges data directory değişikliklerini geri alır
+func (fm *PostgreSQLFailoverManager) rollbackDataDirectoryChanges(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	backupPath, exists := fm.currentState.BackupPaths["data_directory_backed_up"]
+	if !exists {
+		logMessage("No data directory backup found, skipping restore")
+		return nil
+	}
+
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		return fmt.Errorf("backup directory not found: %s", backupPath)
+	}
+
+	dataDir := fm.currentState.DataDirectory
+	logMessage(fmt.Sprintf("Restoring data directory from backup: %s -> %s", backupPath, dataDir))
+
+	// Mevcut data directory'yi temizle
+	cmd := exec.Command("sudo", "-u", "postgres", "find", dataDir, "-mindepth", "1", "-delete")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		logMessage(fmt.Sprintf("Warning: failed to clean data directory: %v - %s", err, string(output)))
+	}
+
+	// Backup'tan restore et
+	cmd = exec.Command("sudo", "-u", "postgres", "cp", "-r", backupPath+"/.", dataDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to restore data directory: %v - %s", err, string(output))
+	}
+
+	logMessage("Data directory restored successfully")
+	return nil
+}
+
+// rollbackStandbyConfig standby konfigürasyonunu kaldırır
+func (fm *PostgreSQLFailoverManager) rollbackStandbyConfig(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	dataDir := fm.currentState.DataDirectory
+
+	// standby.signal dosyasını kaldır
+	standbySignalPath := filepath.Join(dataDir, "standby.signal")
+	if _, err := os.Stat(standbySignalPath); err == nil {
+		if err := os.Remove(standbySignalPath); err != nil {
+			logMessage(fmt.Sprintf("Warning: failed to remove standby.signal: %v", err))
+		} else {
+			logMessage("standby.signal removed")
+		}
+	}
+
+	// recovery.signal dosyasını kaldır
+	recoverySignalPath := filepath.Join(dataDir, "recovery.signal")
+	if _, err := os.Stat(recoverySignalPath); err == nil {
+		if err := os.Remove(recoverySignalPath); err != nil {
+			logMessage(fmt.Sprintf("Warning: failed to remove recovery.signal: %v", err))
+		} else {
+			logMessage("recovery.signal removed")
+		}
+	}
+
+	return nil
+}
+
+// restoreOriginalState orijinal PostgreSQL durumunu restore eder
+func (fm *PostgreSQLFailoverManager) restoreOriginalState(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage("Restoring original PostgreSQL state")
+
+	// PostgreSQL'i başlat
+	if err := fm.StartPostgreSQLService(fm.currentState.PostgreSQLVersion); err != nil {
+		return fmt.Errorf("failed to start PostgreSQL: %v", err)
+	}
+
+	// Node durumunu kontrol et
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		time.Sleep(2 * time.Second)
+		currentStatus := GetNodeStatus()
+
+		logMessage(fmt.Sprintf("Current node status: %s (expected: %s)", currentStatus, fm.currentState.OriginalNodeStatus))
+
+		if currentStatus == fm.currentState.OriginalNodeStatus {
+			logMessage("Original node status restored successfully")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to restore original node status within timeout")
+}
+
+// GetRollbackInfo mevcut rollback durumu hakkında bilgi verir
+func (fm *PostgreSQLFailoverManager) GetRollbackInfo() (*FailoverState, error) {
+	if err := fm.LoadState(); err != nil {
+		return nil, err
+	}
+	return fm.currentState, nil
 }
 
 // ConvertToSlave master node'unu slave'e dönüştürür (hostname ile - DNS çözümlemesi yapar)
@@ -61,14 +490,69 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIPAndLogger(dataDir, mast
 		}
 	}
 
+	// Failover state'i başlat
+	jobID := fmt.Sprintf("convert_to_slave_%d", time.Now().Unix())
+	if err := fm.InitializeFailoverState(jobID, dataDir, "", masterIP, newMasterPort); err != nil {
+		logMessage(fmt.Sprintf("Failed to initialize failover state: %v", err))
+	}
+
+	// Otomatik rollback wrapper - TÜM HATA DURUMLARI İÇİN
+	var rollbackPerformed bool = false
+	defer func() {
+		if r := recover(); r != nil {
+			logMessage(fmt.Sprintf("Panic during conversion: %v", r))
+			if canRollback, _ := fm.CanRollback(); canRollback && !rollbackPerformed {
+				logMessage("Attempting automatic rollback due to panic")
+				if rollbackErr := fm.RollbackFailover(logger); rollbackErr != nil {
+					logMessage(fmt.Sprintf("Automatic rollback failed: %v", rollbackErr))
+				} else {
+					logMessage("Automatic rollback completed successfully")
+				}
+				rollbackPerformed = true
+			}
+		}
+	}()
+
+	// Otomatik rollback fonksiyonu - normal hatalar için
+	performAutoRollback := func(reason string, originalErr error) error {
+		if rollbackPerformed {
+			return originalErr // Zaten rollback yapılmış
+		}
+
+		canRollback, rollbackReason := fm.CanRollback()
+		if !canRollback {
+			logMessage(fmt.Sprintf("Automatic rollback not possible: %s", rollbackReason))
+			return originalErr
+		}
+
+		logMessage(fmt.Sprintf("Performing automatic rollback due to: %s", reason))
+		if rollbackErr := fm.RollbackFailover(logger); rollbackErr != nil {
+			logMessage(fmt.Sprintf("Automatic rollback failed: %v", rollbackErr))
+			return fmt.Errorf("original error: %v; rollback also failed: %v", originalErr, rollbackErr)
+		}
+
+		logMessage("Automatic rollback completed successfully")
+		rollbackPerformed = true
+		return fmt.Errorf("operation failed (%s) but automatic rollback completed: %v", reason, originalErr)
+	}
+
 	logMessage(fmt.Sprintf("Master->Slave dönüşüm başlatılıyor (IP ile): %s -> %s:%d (version: %s)", dataDir, masterIP, newMasterPort, pgVersion))
 	logMessage(fmt.Sprintf("DEBUG: ConvertToSlaveWithIP adım 1 - IP adresi direkt kullanılıyor: %s", masterIP))
+
+	// PostgreSQL'i durdur
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 1.5 - PostgreSQL durduruluyor")
+	if err := fm.StopPostgreSQLService(pgVersion); err != nil {
+		fm.SetError(err)
+		return performAutoRollback("PostgreSQL stop failed", fmt.Errorf("PostgreSQL durdurulamadı: %v", err))
+	}
+	fm.MarkStepCompleted("postgresql_stopped")
 
 	// Eski data directory'yi backup al ve temizle
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme başlatılıyor")
 	err := fm.backupAndCleanDataDirectoryWithLogger(dataDir, logger)
 	if err != nil {
-		return fmt.Errorf("data directory backup ve temizleme başarısız: %v", err)
+		fm.SetError(err)
+		return performAutoRollback("Data directory backup/cleanup failed", fmt.Errorf("data directory backup ve temizleme başarısız: %v", err))
 	}
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme tamamlandı")
 
@@ -76,8 +560,10 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIPAndLogger(dataDir, mast
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup başlatılıyor")
 	err = fm.performBaseBackupWithLogger(masterIP, newMasterPort, replUser, replPassword, dataDir, logger)
 	if err != nil {
-		return fmt.Errorf("pg_basebackup başarısız: %v", err)
+		fm.SetError(err)
+		return performAutoRollback("pg_basebackup failed", fmt.Errorf("pg_basebackup başarısız: %v", err))
 	}
+	fm.MarkStepCompleted("pg_basebackup_completed")
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup tamamlandı")
 
 	logMessage("pg_basebackup -R parametresi ile standby konfigürasyonu otomatik oluşturuldu (standby.signal ve postgresql.auto.conf)")
@@ -86,10 +572,14 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIPAndLogger(dataDir, mast
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatılıyor")
 	err = fm.startPostgreSQLAsStandbyWithLogger(dataDir, pgVersion, logger)
 	if err != nil {
-		return fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v", err)
+		fm.SetError(err)
+		return performAutoRollback("PostgreSQL standby start failed", fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v", err))
 	}
 	logMessage("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatıldı")
 
+	// Başarılı tamamlama - state'i temizle
+	fm.ClearState()
+	logMessage("Master->Slave conversion completed successfully - no rollback needed")
 	return nil
 }
 
@@ -235,23 +725,87 @@ func (fm *PostgreSQLFailoverManager) StartPostgreSQLService(pgVersion string) er
 
 // PromoteToMaster standby node'unu master'a yükseltir
 func (fm *PostgreSQLFailoverManager) PromoteToMaster(dataDir string) error {
-	log.Printf("PostgreSQL promotion başlatılıyor: %s", dataDir)
+	return fm.PromoteToMasterWithLogger(dataDir, nil)
+}
+
+// PromoteToMasterWithLogger standby node'unu master'a yükseltir (logger ile + otomatik rollback)
+func (fm *PostgreSQLFailoverManager) PromoteToMasterWithLogger(dataDir string, logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage(fmt.Sprintf("PostgreSQL promotion başlatılıyor: %s", dataDir))
+
+	// Promotion state'i başlat
+	jobID := fmt.Sprintf("promotion_%d", time.Now().Unix())
+	if err := fm.InitializePromotionState(jobID, dataDir); err != nil {
+		logMessage(fmt.Sprintf("Failed to initialize promotion state: %v", err))
+	}
+
+	// Otomatik rollback wrapper - TÜM HATA DURUMLARI İÇİN
+	var rollbackPerformed bool = false
+	defer func() {
+		if r := recover(); r != nil {
+			logMessage(fmt.Sprintf("Panic during promotion: %v", r))
+			if canRollback, _ := fm.CanRollback(); canRollback && !rollbackPerformed {
+				logMessage("Attempting automatic rollback due to panic")
+				if rollbackErr := fm.RollbackFailover(logger); rollbackErr != nil {
+					logMessage(fmt.Sprintf("Automatic rollback failed: %v", rollbackErr))
+				} else {
+					logMessage("Automatic rollback completed successfully")
+				}
+				rollbackPerformed = true
+			}
+		}
+	}()
+
+	// Otomatik rollback fonksiyonu - normal hatalar için
+	performAutoRollback := func(reason string, originalErr error) error {
+		if rollbackPerformed {
+			return originalErr // Zaten rollback yapılmış
+		}
+
+		canRollback, rollbackReason := fm.CanRollback()
+		if !canRollback {
+			logMessage(fmt.Sprintf("Automatic rollback not possible: %s", rollbackReason))
+			return originalErr
+		}
+
+		logMessage(fmt.Sprintf("Performing automatic rollback due to: %s", reason))
+		if rollbackErr := fm.RollbackFailover(logger); rollbackErr != nil {
+			logMessage(fmt.Sprintf("Automatic rollback failed: %v", rollbackErr))
+			return fmt.Errorf("original error: %v; rollback also failed: %v", originalErr, rollbackErr)
+		}
+
+		logMessage("Automatic rollback completed successfully")
+		rollbackPerformed = true
+		return fmt.Errorf("promotion failed (%s) but automatic rollback completed: %v", reason, originalErr)
+	}
 
 	// PostgreSQL version al
 	pgVersion := GetPGVersion()
 	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
 	if pgCtlCmd == "" {
-		return fmt.Errorf("pg_ctl komutu bulunamadı")
+		fm.SetError(fmt.Errorf("pg_ctl komutu bulunamadı"))
+		return performAutoRollback("pg_ctl command not found", fmt.Errorf("pg_ctl komutu bulunamadı"))
 	}
 
 	// pg_ctl promote komutu ile yükselt
+	logMessage(fmt.Sprintf("pg_ctl promote komutu çalıştırılıyor: %s", pgCtlCmd))
 	cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "promote", "-D", dataDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("promotion başarısız: %v - Çıktı: %s", err, string(output))
+		fm.SetError(err)
+		return performAutoRollback("pg_ctl promote failed", fmt.Errorf("promotion başarısız: %v - Çıktı: %s", err, string(output)))
 	}
 
-	log.Printf("PostgreSQL promotion başarılı: %s", string(output))
+	// Başarılı tamamlama - state'i temizle
+	fm.ClearState()
+	logMessage(fmt.Sprintf("PostgreSQL promotion başarılı: %s", string(output)))
+	logMessage("Promotion completed successfully - no rollback needed")
 	return nil
 }
 
@@ -640,6 +1194,8 @@ func (fm *PostgreSQLFailoverManager) backupAndCleanDataDirectoryWithLogger(dataD
 		// Backup başarısız olsa da devam et, sadece uyar
 	} else {
 		logMessage(fmt.Sprintf("Data directory backup başarıyla alındı: %s", backupDir))
+		// Backup path'ini state'e kaydet
+		fm.AddBackupPath("data_directory_backed_up", backupDir)
 	}
 
 	// Data directory içeriğini temizle (dizini silme, sadece içeriği temizle)
@@ -651,6 +1207,7 @@ func (fm *PostgreSQLFailoverManager) backupAndCleanDataDirectoryWithLogger(dataD
 	}
 
 	logMessage("Data directory başarıyla temizlendi")
+	fm.MarkStepCompleted("data_directory_backed_up")
 	return nil
 }
 
