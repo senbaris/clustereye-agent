@@ -4156,7 +4156,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 
 	logger.LogMessage(fmt.Sprintf("Final master IP adresi: %s", actualMasterIP))
 
-	err = failoverManager.ConvertToSlaveWithIP(dataDir, actualMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion)
+	err = failoverManager.ConvertToSlaveWithIPAndLogger(dataDir, actualMasterIP, int(req.NewMasterPort), replUser, replPassword, pgVersion, logger)
 	if err != nil {
 		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
 		logger.LogError(errMsg, err)

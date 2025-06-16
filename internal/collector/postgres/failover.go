@@ -41,36 +41,54 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlave(dataDir, newMasterHost strin
 	return fm.ConvertToSlaveWithIP(dataDir, masterIP, newMasterPort, replUser, replPassword, pgVersion)
 }
 
+// Logger interface for process logging
+type Logger interface {
+	LogMessage(message string)
+	LogError(message string, err error)
+}
+
 // ConvertToSlaveWithIP master node'unu slave'e dönüştürür (direkt IP ile - DNS çözümlemesi yapmaz)
 func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIP(dataDir, masterIP string, newMasterPort int, replUser, replPassword, pgVersion string) error {
-	log.Printf("Master->Slave dönüşüm başlatılıyor (IP ile): %s -> %s:%d (version: %s)", dataDir, masterIP, newMasterPort, pgVersion)
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 1 - IP adresi direkt kullanılıyor: %s", masterIP)
+	return fm.ConvertToSlaveWithIPAndLogger(dataDir, masterIP, newMasterPort, replUser, replPassword, pgVersion, nil)
+}
+
+// ConvertToSlaveWithIPAndLogger master node'unu slave'e dönüştürür (logger ile)
+func (fm *PostgreSQLFailoverManager) ConvertToSlaveWithIPAndLogger(dataDir, masterIP string, newMasterPort int, replUser, replPassword, pgVersion string, logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage(fmt.Sprintf("Master->Slave dönüşüm başlatılıyor (IP ile): %s -> %s:%d (version: %s)", dataDir, masterIP, newMasterPort, pgVersion))
+	logMessage(fmt.Sprintf("DEBUG: ConvertToSlaveWithIP adım 1 - IP adresi direkt kullanılıyor: %s", masterIP))
 
 	// Eski data directory'yi backup al ve temizle
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme başlatılıyor")
-	err := fm.backupAndCleanDataDirectory(dataDir)
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme başlatılıyor")
+	err := fm.backupAndCleanDataDirectoryWithLogger(dataDir, logger)
 	if err != nil {
 		return fmt.Errorf("data directory backup ve temizleme başarısız: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme tamamlandı")
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 2 - Data directory backup/temizleme tamamlandı")
 
 	// pg_basebackup ile fresh backup al (-R parametresi ile standby konfigürasyonu otomatik oluşturulur)
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup başlatılıyor")
-	err = fm.performBaseBackup(masterIP, newMasterPort, replUser, replPassword, dataDir)
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup başlatılıyor")
+	err = fm.performBaseBackupWithLogger(masterIP, newMasterPort, replUser, replPassword, dataDir, logger)
 	if err != nil {
 		return fmt.Errorf("pg_basebackup başarısız: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup tamamlandı")
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 3 - pg_basebackup tamamlandı")
 
-	log.Printf("pg_basebackup -R parametresi ile standby konfigürasyonu otomatik oluşturuldu (standby.signal ve postgresql.auto.conf)")
+	logMessage("pg_basebackup -R parametresi ile standby konfigürasyonu otomatik oluşturuldu (standby.signal ve postgresql.auto.conf)")
 
 	// PostgreSQL'i standby modunda başlat (pg_ctl ile)
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatılıyor")
-	err = fm.startPostgreSQLAsStandby(dataDir, pgVersion)
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatılıyor")
+	err = fm.startPostgreSQLAsStandbyWithLogger(dataDir, pgVersion, logger)
 	if err != nil {
 		return fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v", err)
 	}
-	log.Printf("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatıldı")
+	logMessage("DEBUG: ConvertToSlaveWithIP adım 4 - PostgreSQL standby modunda başlatıldı")
 
 	return nil
 }
@@ -460,12 +478,24 @@ trigger_file = '%s/promote.trigger'
 
 // startPostgreSQLAsStandby PostgreSQL'i standby modunda başlatır
 func (fm *PostgreSQLFailoverManager) startPostgreSQLAsStandby(dataDir, pgVersion string) error {
-	log.Printf("PostgreSQL standby modunda başlatılıyor: %s", dataDir)
+	return fm.startPostgreSQLAsStandbyWithLogger(dataDir, pgVersion, nil)
+}
+
+// startPostgreSQLAsStandbyWithLogger PostgreSQL'i standby modunda başlatır (logger ile)
+func (fm *PostgreSQLFailoverManager) startPostgreSQLAsStandbyWithLogger(dataDir, pgVersion string, logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage(fmt.Sprintf("PostgreSQL standby modunda başlatılıyor: %s", dataDir))
 
 	// PostgreSQL version'ını parse et
 	majorVersionInt, err := fm.parsePGVersion(pgVersion)
 	if err != nil {
-		log.Printf("PostgreSQL version parse edilemedi: %v, varsayılan 15 kullanılacak", err)
+		logMessage(fmt.Sprintf("PostgreSQL version parse edilemedi: %v, varsayılan 15 kullanılacak", err))
 		majorVersionInt = 15
 	}
 
@@ -479,42 +509,42 @@ func (fm *PostgreSQLFailoverManager) startPostgreSQLAsStandby(dataDir, pgVersion
 
 	// Systemctl ile cluster-aware başlatma deneyi
 	for _, serviceName := range serviceNames {
-		log.Printf("Systemctl ile PostgreSQL başlatılmaya çalışılıyor: %s", serviceName)
+		logMessage(fmt.Sprintf("Systemctl ile PostgreSQL başlatılmaya çalışılıyor: %s", serviceName))
 		cmd := exec.Command("systemctl", "start", serviceName)
 		output, err := cmd.CombinedOutput()
 		if err == nil {
-			log.Printf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName)
+			logMessage(fmt.Sprintf("PostgreSQL servisi systemctl ile başlatıldı: %s", serviceName))
 			return nil
 		}
-		log.Printf("DEBUG: %s servisi systemctl ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+		logMessage(fmt.Sprintf("DEBUG: %s servisi systemctl ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output)))
 	}
 
 	// Systemctl başarısız olduysa pg_ctl ile dene
-	log.Printf("Systemctl başarısız, pg_ctl ile deneniyor...")
+	logMessage("Systemctl başarısız, pg_ctl ile deneniyor...")
 	pgCtlCmd := fm.findPgCtlCommand(pgVersion)
 	if pgCtlCmd != "" {
 		// pg_ctl ile başlat
 		cmd := exec.Command("sudo", "-u", "postgres", pgCtlCmd, "start", "-D", dataDir)
 		output, err := cmd.CombinedOutput()
 		if err == nil {
-			log.Printf("PostgreSQL standby modunda pg_ctl ile başarıyla başlatıldı: %s", string(output))
+			logMessage(fmt.Sprintf("PostgreSQL standby modunda pg_ctl ile başarıyla başlatıldı: %s", string(output)))
 			return nil
 		}
-		log.Printf("pg_ctl ile başlatma başarısız: %v - Çıktı: %s", err, string(output))
+		logMessage(fmt.Sprintf("pg_ctl ile başlatma başarısız: %v - Çıktı: %s", err, string(output)))
 	} else {
-		log.Printf("pg_ctl komutu bulunamadı")
+		logMessage("pg_ctl komutu bulunamadı")
 	}
 
 	// Service komutu ile başlatma deneyi (eski sistemler için)
 	for _, serviceName := range serviceNames {
-		log.Printf("Service komutu ile PostgreSQL başlatılıyor: %s", serviceName)
+		logMessage(fmt.Sprintf("Service komutu ile PostgreSQL başlatılıyor: %s", serviceName))
 		serviceCmd := exec.Command("service", serviceName, "start")
 		output, err := serviceCmd.CombinedOutput()
 		if err == nil {
-			log.Printf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName)
+			logMessage(fmt.Sprintf("PostgreSQL servisi service komutu ile başlatıldı: %s", serviceName))
 			return nil
 		}
-		log.Printf("DEBUG: %s servisi service komutu ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output))
+		logMessage(fmt.Sprintf("DEBUG: %s servisi service komutu ile başlatılamadı: %v - Çıktı: %s", serviceName, err, string(output)))
 	}
 
 	return fmt.Errorf("PostgreSQL standby modunda başlatılamadı - tüm yöntemler başarısız (systemctl, pg_ctl, service)")
@@ -578,51 +608,75 @@ func (fm *PostgreSQLFailoverManager) parsePGVersion(pgVersion string) (int, erro
 
 // backupAndCleanDataDirectory eski data directory'yi backup alır ve temizler
 func (fm *PostgreSQLFailoverManager) backupAndCleanDataDirectory(dataDir string) error {
-	log.Printf("Data directory backup alınıyor ve temizleniyor: %s", dataDir)
+	return fm.backupAndCleanDataDirectoryWithLogger(dataDir, nil)
+}
+
+// backupAndCleanDataDirectoryWithLogger eski data directory'yi backup alır ve temizler (logger ile)
+func (fm *PostgreSQLFailoverManager) backupAndCleanDataDirectoryWithLogger(dataDir string, logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage(fmt.Sprintf("Data directory backup alınıyor ve temizleniyor: %s", dataDir))
 
 	// Backup directory oluştur
 	backupDir := fmt.Sprintf("%s_backup_%d", dataDir, time.Now().Unix())
 
 	// Data directory'nin var olup olmadığını kontrol et
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		log.Printf("Data directory zaten yok: %s", dataDir)
+		logMessage(fmt.Sprintf("Data directory zaten yok: %s", dataDir))
 		return nil
 	}
 
 	// Backup al
-	log.Printf("Data directory backup alınıyor: %s -> %s", dataDir, backupDir)
+	logMessage(fmt.Sprintf("Data directory backup alınıyor: %s -> %s", dataDir, backupDir))
 	cmd := exec.Command("sudo", "-u", "postgres", "cp", "-r", dataDir, backupDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Backup alma başarısız: %v - Çıktı: %s", err, string(output))
+		logMessage(fmt.Sprintf("Backup alma başarısız: %v - Çıktı: %s", err, string(output)))
 		// Backup başarısız olsa da devam et, sadece uyar
 	} else {
-		log.Printf("Data directory backup başarıyla alındı: %s", backupDir)
+		logMessage(fmt.Sprintf("Data directory backup başarıyla alındı: %s", backupDir))
 	}
 
 	// Data directory içeriğini temizle (dizini silme, sadece içeriği temizle)
-	log.Printf("Data directory içeriği temizleniyor: %s", dataDir)
+	logMessage(fmt.Sprintf("Data directory içeriği temizleniyor: %s", dataDir))
 	cmd = exec.Command("sudo", "-u", "postgres", "find", dataDir, "-mindepth", "1", "-delete")
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("data directory temizleme başarısız: %v - Çıktı: %s", err, string(output))
 	}
 
-	log.Printf("Data directory başarıyla temizlendi")
+	logMessage("Data directory başarıyla temizlendi")
 	return nil
 }
 
 // performBaseBackup pg_basebackup ile fresh backup alır
 func (fm *PostgreSQLFailoverManager) performBaseBackup(masterIP string, masterPort int, replUser, replPassword, dataDir string) error {
-	log.Printf("pg_basebackup başlatılıyor: %s:%d -> %s", masterIP, masterPort, dataDir)
+	return fm.performBaseBackupWithLogger(masterIP, masterPort, replUser, replPassword, dataDir, nil)
+}
+
+// performBaseBackupWithLogger pg_basebackup ile fresh backup alır (logger ile)
+func (fm *PostgreSQLFailoverManager) performBaseBackupWithLogger(masterIP string, masterPort int, replUser, replPassword, dataDir string, logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	logMessage(fmt.Sprintf("pg_basebackup başlatılıyor: %s:%d -> %s", masterIP, masterPort, dataDir))
 
 	// pg_basebackup komutunu oluştur
 	// PGPASSWORD=replicator_password pg_basebackup -h <new_primary_ip> -D /var/lib/postgresql/15/main -U replicator -Fp -Xs -P
 	basebackupCmd := fmt.Sprintf("PGPASSWORD=%s pg_basebackup -h %s -p %d -D %s -U %s -Fp -Xs -P -R",
 		replPassword, masterIP, masterPort, dataDir, replUser)
 
-	log.Printf("pg_basebackup komutu çalıştırılıyor: %s", basebackupCmd)
-	log.Printf("DEBUG: Master IP: %s, Port: %d, User: %s, DataDir: %s", masterIP, masterPort, replUser, dataDir)
+	logMessage(fmt.Sprintf("pg_basebackup komutu çalıştırılıyor: PGPASSWORD=*** pg_basebackup -h %s -p %d -D %s -U %s -Fp -Xs -P -R", masterIP, masterPort, dataDir, replUser))
+	logMessage(fmt.Sprintf("DEBUG: Master IP: %s, Port: %d, User: %s, DataDir: %s", masterIP, masterPort, replUser, dataDir))
 
 	// Komutu postgres kullanıcısı olarak çalıştır
 	cmd := exec.Command("sudo", "-u", "postgres", "bash", "-c", basebackupCmd)
@@ -630,35 +684,34 @@ func (fm *PostgreSQLFailoverManager) performBaseBackup(masterIP string, masterPo
 	// Çıktıyı yakala
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("pg_basebackup hatası: %v", err)
-		log.Printf("pg_basebackup çıktısı: %s", string(output))
+		logMessage(fmt.Sprintf("pg_basebackup hatası: %v", err))
+		logMessage(fmt.Sprintf("pg_basebackup çıktısı: %s", string(output)))
 		return fmt.Errorf("pg_basebackup başarısız: %v - Çıktı: %s", err, string(output))
 	}
 
-	log.Printf("pg_basebackup çıktısı: %s", string(output))
-
-	log.Printf("pg_basebackup başarıyla tamamlandı")
+	logMessage(fmt.Sprintf("pg_basebackup çıktısı: %s", string(output)))
+	logMessage("pg_basebackup başarıyla tamamlandı")
 
 	// Data directory ownership'ini postgres kullanıcısına ayarla
-	log.Printf("Data directory ownership düzeltiliyor: %s", dataDir)
+	logMessage(fmt.Sprintf("Data directory ownership düzeltiliyor: %s", dataDir))
 	chownCmd := exec.Command("sudo", "chown", "-R", "postgres:postgres", dataDir)
 	chownOutput, chownErr := chownCmd.CombinedOutput()
 	if chownErr != nil {
-		log.Printf("UYARI: Ownership düzeltme başarısız: %v - Çıktı: %s", chownErr, string(chownOutput))
+		logMessage(fmt.Sprintf("UYARI: Ownership düzeltme başarısız: %v - Çıktı: %s", chownErr, string(chownOutput)))
 		// Ownership hatası kritik değil, uyarı olarak devam et
 	} else {
-		log.Printf("Data directory ownership başarıyla düzeltildi")
+		logMessage("Data directory ownership başarıyla düzeltildi")
 	}
 
 	// Data directory permissions'ını ayarla (700 - sadece postgres kullanıcısı erişebilir)
-	log.Printf("Data directory permissions düzeltiliyor: %s", dataDir)
+	logMessage(fmt.Sprintf("Data directory permissions düzeltiliyor: %s", dataDir))
 	chmodCmd := exec.Command("sudo", "chmod", "700", dataDir)
 	chmodOutput, chmodErr := chmodCmd.CombinedOutput()
 	if chmodErr != nil {
-		log.Printf("UYARI: Permissions düzeltme başarısız: %v - Çıktı: %s", chmodErr, string(chmodOutput))
+		logMessage(fmt.Sprintf("UYARI: Permissions düzeltme başarısız: %v - Çıktı: %s", chmodErr, string(chmodOutput)))
 		// Permissions hatası kritik değil, uyarı olarak devam et
 	} else {
-		log.Printf("Data directory permissions başarıyla düzeltildi (700)")
+		logMessage("Data directory permissions başarıyla düzeltildi (700)")
 	}
 
 	return nil
