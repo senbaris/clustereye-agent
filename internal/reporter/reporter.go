@@ -3964,29 +3964,17 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 		}
 	}
 
-	// PostgreSQL'i graceful shutdown yap
-	logger.LogMessage("PostgreSQL graceful shutdown yapılıyor...")
-	err = r.stopPostgreSQLServiceWithVersion(pgVersion)
-	if err != nil {
-		errMsg := fmt.Sprintf("PostgreSQL durdurma işlemi başarısız: %v", err)
-		logger.LogError(errMsg, err)
-		logger.Stop("failed")
-		loggerStopped = true
-		return &ConvertPostgresToSlaveResponse{
-			JobId:        req.JobId,
-			Status:       pb.JobStatus_JOB_STATUS_FAILED,
-			ErrorMessage: errMsg,
-		}, nil
-	}
+	// Failover manager oluştur
+	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
 
-	// Standby konfigürasyonu oluştur
-	logger.LogMessage("Standby konfigürasyonu oluşturuluyor...")
-	log.Printf("DEBUG: createStandbyConfigurationWithVersion çağrılıyor (version: %s)", pgVersion)
-	err = r.createStandbyConfigurationWithVersion(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword, pgVersion)
+	// Standby konfigürasyonu oluştur ve başlat
+	logger.LogMessage("Standby konfigürasyonu oluşturuluyor ve PostgreSQL standby modunda başlatılıyor...")
+	log.Printf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion)
+	err = failoverManager.ConvertToSlave(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword, pgVersion)
 	if err != nil {
-		errMsg := fmt.Sprintf("Standby konfigürasyon oluşturma başarısız: %v", err)
+		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
 		logger.LogError(errMsg, err)
-		log.Printf("ERROR: Standby konfigürasyon hatası: %v", err)
+		log.Printf("ERROR: Master->Slave dönüşüm hatası: %v", err)
 		logger.Stop("failed")
 		loggerStopped = true
 		return &ConvertPostgresToSlaveResponse{
@@ -3995,25 +3983,7 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 			ErrorMessage: errMsg,
 		}, nil
 	}
-	log.Printf("DEBUG: Standby konfigürasyonu başarıyla oluşturuldu")
-
-	// PostgreSQL'i standby modunda başlat
-	logger.LogMessage("PostgreSQL standby modunda başlatılıyor...")
-	log.Printf("DEBUG: startPostgreSQLServiceWithVersion çağrılıyor (version: %s)", pgVersion)
-	err = r.startPostgreSQLServiceWithVersion(pgVersion)
-	if err != nil {
-		errMsg := fmt.Sprintf("PostgreSQL standby modunda başlatma başarısız: %v", err)
-		logger.LogError(errMsg, err)
-		log.Printf("ERROR: PostgreSQL başlatma hatası: %v", err)
-		logger.Stop("failed")
-		loggerStopped = true
-		return &ConvertPostgresToSlaveResponse{
-			JobId:        req.JobId,
-			Status:       pb.JobStatus_JOB_STATUS_FAILED,
-			ErrorMessage: errMsg,
-		}, nil
-	}
-	log.Printf("DEBUG: PostgreSQL başarıyla başlatıldı, slave durumu kontrol edilecek")
+	log.Printf("DEBUG: Master->Slave dönüşüm başarıyla tamamlandı")
 
 	// Standby durumunu doğrula
 	logger.LogMessage("Standby durumu doğrulanıyor...")
@@ -6072,8 +6042,9 @@ func (r *Reporter) createStandbyConfigurationWithVersion(dataDir, masterHost str
 }
 
 // updatePostgreSQLConf postgresql.conf dosyasını standby konfigürasyonu ile günceller
-func (r *Reporter) updatePostgreSQLConf(confPath, masterHost string, masterPort int, replUser, replPassword string) error {
+func (r *Reporter) updatePostgreSQLConf(confPath, masterIP string, masterPort int, replUser, replPassword string) error {
 	log.Printf("postgresql.conf dosyası güncelleniyor: %s", confPath)
+	log.Printf("Master IP kullanılıyor: %s", masterIP)
 
 	// Mevcut dosyayı oku
 	content, err := os.ReadFile(confPath)
@@ -6093,7 +6064,7 @@ func (r *Reporter) updatePostgreSQLConf(confPath, masterHost string, masterPort 
 		if strings.HasPrefix(trimmedLine, "primary_conninfo") && !strings.HasPrefix(trimmedLine, "#") {
 			// IP adresi kullanarak yeni primary_conninfo oluştur
 			newPrimaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
-				masterHost, masterPort, replUser, replPassword)
+				masterIP, masterPort, replUser, replPassword)
 			newLines = append(newLines, newPrimaryConnInfo)
 			primaryConnInfoUpdated = true
 			log.Printf("Mevcut primary_conninfo güncellendi: %s", newPrimaryConnInfo)
@@ -6116,7 +6087,7 @@ func (r *Reporter) updatePostgreSQLConf(confPath, masterHost string, masterPort 
 		newLines = append(newLines, "")
 		newLines = append(newLines, "# Standby configuration added by ClusterEye")
 		newPrimaryConnInfo := fmt.Sprintf("primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'",
-			masterHost, masterPort, replUser, replPassword)
+			masterIP, masterPort, replUser, replPassword)
 		newLines = append(newLines, newPrimaryConnInfo)
 	}
 
@@ -6186,8 +6157,9 @@ func (r *Reporter) findPostgreSQLConfigFile() (string, error) {
 }
 
 // createRecoveryConf recovery.conf dosyası oluşturur (PostgreSQL 11 ve öncesi)
-func (r *Reporter) createRecoveryConf(recoveryPath, masterHost string, masterPort int, replUser, replPassword string) error {
+func (r *Reporter) createRecoveryConf(recoveryPath, masterIP string, masterPort int, replUser, replPassword string) error {
 	log.Printf("recovery.conf dosyası oluşturuluyor: %s", recoveryPath)
+	log.Printf("Master IP kullanılıyor: %s", masterIP)
 
 	// Recovery.conf içeriği - IP adresi kullan ve gereksiz ayarları kaldır
 	recoveryContent := fmt.Sprintf(`# Recovery configuration created by ClusterEye
@@ -6195,7 +6167,7 @@ standby_mode = 'on'
 primary_conninfo = 'host=%s port=%d user=%s password=%s application_name=standby'
 trigger_file = '%s/promote.trigger'
 `,
-		masterHost, masterPort, replUser, replPassword, filepath.Dir(recoveryPath))
+		masterIP, masterPort, replUser, replPassword, filepath.Dir(recoveryPath))
 
 	// Dosyayı oluştur
 	err := os.WriteFile(recoveryPath, []byte(recoveryContent), 0600)
