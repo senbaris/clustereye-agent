@@ -409,19 +409,21 @@ func (fm *PostgreSQLFailoverManager) performBaseBackup(masterIP string, masterPo
 	basebackupCmd := fmt.Sprintf("PGPASSWORD=%s pg_basebackup -h %s -p %d -D %s -U %s -Fp -Xs -P -R",
 		replPassword, masterIP, masterPort, dataDir, replUser)
 
-	log.Printf("pg_basebackup komutu çalıştırılıyor...")
+	log.Printf("pg_basebackup komutu çalıştırılıyor: %s", basebackupCmd)
+	log.Printf("DEBUG: Master IP: %s, Port: %d, User: %s, DataDir: %s", masterIP, masterPort, replUser, dataDir)
 
 	// Komutu postgres kullanıcısı olarak çalıştır
 	cmd := exec.Command("sudo", "-u", "postgres", "bash", "-c", basebackupCmd)
 
-	// Çıktıyı gerçek zamanlı olarak logla
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	err := cmd.Run()
+	// Çıktıyı yakala
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("pg_basebackup başarısız: %v", err)
+		log.Printf("pg_basebackup hatası: %v", err)
+		log.Printf("pg_basebackup çıktısı: %s", string(output))
+		return fmt.Errorf("pg_basebackup başarısız: %v - Çıktı: %s", err, string(output))
 	}
+
+	log.Printf("pg_basebackup çıktısı: %s", string(output))
 
 	log.Printf("pg_basebackup başarıyla tamamlandı")
 

@@ -3967,12 +3967,37 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 	// Failover manager oluştur
 	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
 
+	// Replication credentials kontrolü - eğer request'te boşsa config'den al
+	replUser := req.ReplicationUser
+	replPassword := req.ReplicationPassword
+
+	if replUser == "" {
+		replUser = r.cfg.PostgreSQL.ReplicationUser
+		logger.LogMessage(fmt.Sprintf("Request'te ReplicationUser boş, config'den alındı: %s", replUser))
+	}
+
+	if replPassword == "" {
+		replPassword = r.cfg.PostgreSQL.ReplicationPass
+		logger.LogMessage("Request'te ReplicationPassword boş, config'den alındı")
+	}
+
+	// Fallback: Eğer replication credentials hala boşsa, normal PostgreSQL credentials kullan
+	if replUser == "" {
+		replUser = r.cfg.PostgreSQL.User
+		logger.LogMessage(fmt.Sprintf("ReplicationUser hala boş, normal PostgreSQL User kullanılıyor: %s", replUser))
+	}
+
+	if replPassword == "" {
+		replPassword = r.cfg.PostgreSQL.Pass
+		logger.LogMessage("ReplicationPassword hala boş, normal PostgreSQL Pass kullanılıyor")
+	}
+
 	// Standby konfigürasyonu oluştur ve başlat
 	logger.LogMessage("Standby konfigürasyonu oluşturuluyor ve PostgreSQL standby modunda başlatılıyor...")
 	logger.LogMessage(fmt.Sprintf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion))
-	logger.LogMessage(fmt.Sprintf("DEBUG: Parametreler - DataDir: %s, NewMaster: %s:%d, User: %s", dataDir, req.NewMasterHost, req.NewMasterPort, req.ReplicationUser))
+	logger.LogMessage(fmt.Sprintf("DEBUG: Parametreler - DataDir: %s, NewMaster: %s:%d, User: %s", dataDir, req.NewMasterHost, req.NewMasterPort, replUser))
 	log.Printf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion)
-	err = failoverManager.ConvertToSlave(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword, pgVersion)
+	err = failoverManager.ConvertToSlave(dataDir, req.NewMasterHost, int(req.NewMasterPort), replUser, replPassword, pgVersion)
 	if err != nil {
 		errMsg := fmt.Sprintf("Master->Slave dönüşüm başarısız: %v", err)
 		logger.LogError(errMsg, err)
