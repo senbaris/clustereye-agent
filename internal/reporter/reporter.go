@@ -3969,6 +3969,8 @@ func (r *Reporter) ConvertPostgresToSlave(ctx context.Context, req *ConvertPostg
 
 	// Standby konfigürasyonu oluştur ve başlat
 	logger.LogMessage("Standby konfigürasyonu oluşturuluyor ve PostgreSQL standby modunda başlatılıyor...")
+	logger.LogMessage(fmt.Sprintf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion))
+	logger.LogMessage(fmt.Sprintf("DEBUG: Parametreler - DataDir: %s, NewMaster: %s:%d, User: %s", dataDir, req.NewMasterHost, req.NewMasterPort, req.ReplicationUser))
 	log.Printf("DEBUG: failoverManager.ConvertToSlave çağrılıyor (version: %s)", pgVersion)
 	err = failoverManager.ConvertToSlave(dataDir, req.NewMasterHost, int(req.NewMasterPort), req.ReplicationUser, req.ReplicationPassword, pgVersion)
 	if err != nil {
@@ -4340,77 +4342,89 @@ func (r *Reporter) PromotePostgresToMaster(ctx context.Context, req *pb.Postgres
 
 	logger.LogMessage("Ön kontroller tamamlandı, promotion işlemi başlatılabilir")
 
-	// İki yöntem deneyeceğiz:
-	// 1. Promotion trigger file oluşturma (PostgreSQL 12+)
-	// 2. pg_ctl promote komutunu çalıştırma (fallback)
-
-	// 1. Promotion işlemi için trigger dosyası yöntemi (PostgreSQL 12+)
-	logger.LogMessage("PostgreSQL master promotion metod 1: Trigger dosyası yöntemi deneniyor...")
-
-	triggerFilePath := filepath.Join(dataDir, "promote.trigger")
-	standbySignalPath := filepath.Join(dataDir, "standby.signal")
-	recoverySignalPath := filepath.Join(dataDir, "recovery.signal")
-
-	// Standby sinyali dosyasının varlığını kontrol et
-	isStandby := false
-	if _, err := os.Stat(standbySignalPath); err == nil {
-		isStandby = true
-		logger.LogMessage(fmt.Sprintf("standby.signal dosyası bulundu: %s", standbySignalPath))
-	} else if _, err := os.Stat(recoverySignalPath); err == nil {
-		isStandby = true
-		logger.LogMessage(fmt.Sprintf("recovery.signal dosyası bulundu: %s", recoverySignalPath))
-	} else {
-		logger.LogMessage("Standby sinyal dosyaları bulunamadı, alternatif metot deneyeceğiz")
-	}
-
+	// Failover manager ile promotion yap
+	failoverManager := postgres.NewPostgreSQLFailoverManager(r.cfg)
 	promoted := false
 
-	if isStandby {
-		// Trigger dosyasını oluştur
-		logger.LogMessage(fmt.Sprintf("Promotion trigger dosyası oluşturuluyor: %s", triggerFilePath))
-		file, err := os.Create(triggerFilePath)
-		if err != nil {
-			logger.LogMessage(fmt.Sprintf("Promotion trigger dosyası oluşturulamadı: %v, alternatif metot deneyeceğiz", err))
+	logger.LogMessage("PostgreSQL master promotion: Failover manager ile promotion deneniyor...")
+	err = failoverManager.PromoteToMaster(dataDir)
+	if err == nil {
+		logger.LogMessage("Failover manager ile promotion başarılı!")
+		promoted = true
+	} else {
+		logger.LogMessage(fmt.Sprintf("Failover manager ile promotion başarısız: %v, manuel yöntem deneniyor...", err))
+
+		// Manuel yöntem - eski kod
+		// İki yöntem deneyeceğiz:
+		// 1. Promotion trigger file oluşturma (PostgreSQL 12+)
+		// 2. pg_ctl promote komutunu çalıştırma (fallback)
+
+		// 1. Promotion işlemi için trigger dosyası yöntemi (PostgreSQL 12+)
+		logger.LogMessage("PostgreSQL master promotion metod 1: Trigger dosyası yöntemi deneniyor...")
+
+		triggerFilePath := filepath.Join(dataDir, "promote.trigger")
+		standbySignalPath := filepath.Join(dataDir, "standby.signal")
+		recoverySignalPath := filepath.Join(dataDir, "recovery.signal")
+
+		// Standby sinyali dosyasının varlığını kontrol et
+		isStandby := false
+		if _, err := os.Stat(standbySignalPath); err == nil {
+			isStandby = true
+			logger.LogMessage(fmt.Sprintf("standby.signal dosyası bulundu: %s", standbySignalPath))
+		} else if _, err := os.Stat(recoverySignalPath); err == nil {
+			isStandby = true
+			logger.LogMessage(fmt.Sprintf("recovery.signal dosyası bulundu: %s", recoverySignalPath))
 		} else {
-			file.Close()
-			logger.LogMessage("Promotion trigger dosyası başarıyla oluşturuldu")
+			logger.LogMessage("Standby sinyal dosyaları bulunamadı, alternatif metot deneyeceğiz")
+		}
 
-			// PostgreSQL'in dosyayı farketmesi için biraz bekle
-			logger.LogMessage("PostgreSQL'in promotion trigger dosyasını farketmesi bekleniyor...")
-			time.Sleep(5 * time.Second)
+		if isStandby {
+			// Trigger dosyasını oluştur
+			logger.LogMessage(fmt.Sprintf("Promotion trigger dosyası oluşturuluyor: %s", triggerFilePath))
+			file, err := os.Create(triggerFilePath)
+			if err != nil {
+				logger.LogMessage(fmt.Sprintf("Promotion trigger dosyası oluşturulamadı: %v, alternatif metot deneyeceğiz", err))
+			} else {
+				file.Close()
+				logger.LogMessage("Promotion trigger dosyası başarıyla oluşturuldu")
 
-			// Promocyonun gerçekleşip gerçekleşmediğini kontrol et
-			checkCount := 0
-			maxChecks := 12 // 60 saniye toplam (5s * 12)
-
-			for checkCount < maxChecks {
-				// Standby sinyal dosyası hala var mı kontrol et
-				_, standbyExists := os.Stat(standbySignalPath)
-				_, recoveryExists := os.Stat(recoverySignalPath)
-
-				if standbyExists != nil && recoveryExists != nil {
-					// Standby sinyalleri kaldırılmış, promotion başarılı
-					logger.LogMessage("Standby sinyal dosyaları kaldırılmış, promotion başarılı!")
-					promoted = true
-					break
-				}
-
-				// Node durumunu kontrol et
-				currentStatus := postgres.GetNodeStatus()
-				logger.LogMessage(fmt.Sprintf("Mevcut node durumu: %s", currentStatus))
-
-				if currentStatus == "MASTER" || currentStatus == "PRIMARY" {
-					logger.LogMessage(fmt.Sprintf("Node durumu artık %s, promotion başarılı!", currentStatus))
-					promoted = true
-					break
-				}
-
-				logger.LogMessage(fmt.Sprintf("Promotion hala tamamlanmadı, 5 saniye daha bekleniyor... (%d/%d)", checkCount+1, maxChecks))
+				// PostgreSQL'in dosyayı farketmesi için biraz bekle
+				logger.LogMessage("PostgreSQL'in promotion trigger dosyasını farketmesi bekleniyor...")
 				time.Sleep(5 * time.Second)
-				checkCount++
+
+				// Promocyonun gerçekleşip gerçekleşmediğini kontrol et
+				checkCount := 0
+				maxChecks := 12 // 60 saniye toplam (5s * 12)
+
+				for checkCount < maxChecks {
+					// Standby sinyal dosyası hala var mı kontrol et
+					_, standbyExists := os.Stat(standbySignalPath)
+					_, recoveryExists := os.Stat(recoverySignalPath)
+
+					if standbyExists != nil && recoveryExists != nil {
+						// Standby sinyalleri kaldırılmış, promotion başarılı
+						logger.LogMessage("Standby sinyal dosyaları kaldırılmış, promotion başarılı!")
+						promoted = true
+						break
+					}
+
+					// Node durumunu kontrol et
+					currentStatus := postgres.GetNodeStatus()
+					logger.LogMessage(fmt.Sprintf("Mevcut node durumu: %s", currentStatus))
+
+					if currentStatus == "MASTER" || currentStatus == "PRIMARY" {
+						logger.LogMessage(fmt.Sprintf("Node durumu artık %s, promotion başarılı!", currentStatus))
+						promoted = true
+						break
+					}
+
+					logger.LogMessage(fmt.Sprintf("Promotion hala tamamlanmadı, 5 saniye daha bekleniyor... (%d/%d)", checkCount+1, maxChecks))
+					time.Sleep(5 * time.Second)
+					checkCount++
+				}
 			}
 		}
-	}
+	} // Manuel yöntem bloğunun kapanışı
 
 	// Eğer ilk yöntem başarısız olduysa veya standby sinyal dosyaları bulunamadıysa ikinci yöntemi dene
 	if !promoted {

@@ -32,26 +32,33 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlave(dataDir, newMasterHost strin
 	// Hostname'i IP adresine çevir
 	masterIP := fm.resolveHostnameToIP(newMasterHost)
 	log.Printf("Master->Slave dönüşüm başlatılıyor: %s -> %s:%d (IP: %s, version: %s)", dataDir, newMasterHost, newMasterPort, masterIP, pgVersion)
+	log.Printf("DEBUG: ConvertToSlave adım 1 - Hostname çözümlendi: %s -> %s", newMasterHost, masterIP)
 
 	// Eski data directory'yi backup al ve temizle
+	log.Printf("DEBUG: ConvertToSlave adım 2 - Data directory backup/temizleme başlatılıyor")
 	err := fm.backupAndCleanDataDirectory(dataDir)
 	if err != nil {
 		return fmt.Errorf("data directory backup ve temizleme başarısız: %v", err)
 	}
+	log.Printf("DEBUG: ConvertToSlave adım 2 - Data directory backup/temizleme tamamlandı")
 
 	// pg_basebackup ile fresh backup al (-R parametresi ile standby konfigürasyonu otomatik oluşturulur)
+	log.Printf("DEBUG: ConvertToSlave adım 3 - pg_basebackup başlatılıyor")
 	err = fm.performBaseBackup(masterIP, newMasterPort, replUser, replPassword, dataDir)
 	if err != nil {
 		return fmt.Errorf("pg_basebackup başarısız: %v", err)
 	}
+	log.Printf("DEBUG: ConvertToSlave adım 3 - pg_basebackup tamamlandı")
 
 	log.Printf("pg_basebackup -R parametresi ile standby konfigürasyonu otomatik oluşturuldu (standby.signal ve postgresql.auto.conf)")
 
 	// PostgreSQL'i standby modunda başlat (pg_ctl ile)
+	log.Printf("DEBUG: ConvertToSlave adım 4 - PostgreSQL standby modunda başlatılıyor")
 	err = fm.startPostgreSQLAsStandby(dataDir, pgVersion)
 	if err != nil {
 		return fmt.Errorf("PostgreSQL standby modunda başlatılamadı: %v", err)
 	}
+	log.Printf("DEBUG: ConvertToSlave adım 4 - PostgreSQL standby modunda başlatıldı")
 
 	return nil
 }
