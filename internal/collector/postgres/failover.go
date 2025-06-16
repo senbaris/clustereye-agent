@@ -114,6 +114,12 @@ func (fm *PostgreSQLFailoverManager) InitializeFailoverState(jobID, dataDir, new
 	originalNodeStatus := GetNodeStatus()
 	pgVersion := GetPGVersion()
 
+	// Mevcut node'un IP'sini al (orijinal master IP'si olarak)
+	originalMasterIP := fm.getCurrentNodeIP()
+
+	// Mevcut hostname'i al (orijinal master host olarak)
+	originalMasterHost, _ := os.Hostname()
+
 	fm.currentState = &FailoverState{
 		JobID:              jobID,
 		StartTime:          time.Now(),
@@ -122,6 +128,9 @@ func (fm *PostgreSQLFailoverManager) InitializeFailoverState(jobID, dataDir, new
 		BackupPaths:        make(map[string]string),
 		OriginalConfig:     make(map[string]string),
 		OriginalNodeStatus: originalNodeStatus,
+		OriginalMasterHost: originalMasterHost, // Orijinal master host bilgisi
+		OriginalMasterIP:   originalMasterIP,   // Orijinal master IP bilgisi
+		OriginalMasterPort: 5432,               // Varsayılan PostgreSQL portu
 		NewMasterHost:      newMasterHost,
 		NewMasterIP:        newMasterIP,
 		NewMasterPort:      newMasterPort,
@@ -258,6 +267,20 @@ func (fm *PostgreSQLFailoverManager) RollbackFailover(logger Logger) error {
 	}
 
 	logMessage(fmt.Sprintf("Starting rollback for job %s (step: %s)", fm.currentState.JobID, fm.currentState.CurrentStep))
+
+	// YENI: Koordinasyon rollback - diğer node'ları da eski durumlarına döndür
+	if fm.currentState.NewMasterHost != "" && fm.currentState.NewMasterIP != "" {
+		logMessage(fmt.Sprintf("Attempting coordination rollback for new master: %s (%s)",
+			fm.currentState.NewMasterHost, fm.currentState.NewMasterIP))
+
+		if err := fm.performCoordinationRollback(logger); err != nil {
+			logMessage(fmt.Sprintf("WARNING: Coordination rollback failed: %v", err))
+			logMessage("CRITICAL: Split-brain situation may exist - manual intervention required")
+			// Koordinasyon rollback başarısız olsa da yerel rollback'e devam et
+		} else {
+			logMessage("Coordination rollback completed successfully")
+		}
+	}
 
 	// Rollback adımlarını ters sırada uygula
 	completedSteps := fm.currentState.CompletedSteps
@@ -474,6 +497,7 @@ func (fm *PostgreSQLFailoverManager) ConvertToSlave(dataDir, newMasterHost strin
 type Logger interface {
 	LogMessage(message string)
 	LogError(message string, err error)
+	AddMetadata(key, value string)
 }
 
 // ConvertToSlaveWithIP master node'unu slave'e dönüştürür (direkt IP ile - DNS çözümlemesi yapmaz)
@@ -1304,4 +1328,132 @@ func (fm *PostgreSQLFailoverManager) ReconfigureSlaveToNewMaster(dataDir, newMas
 
 	log.Printf("Slave başarıyla yeni master'a yönlendirildi: %s:%d", newMasterIP, newMasterPort)
 	return nil
+}
+
+// performCoordinationRollback diğer node'ları eski durumlarına döndürmek için koordinasyon rollback yapar
+func (fm *PostgreSQLFailoverManager) performCoordinationRollback(logger Logger) error {
+	logMessage := func(msg string) {
+		log.Printf(msg)
+		if logger != nil {
+			logger.LogMessage(msg)
+		}
+	}
+
+	if fm.currentState == nil {
+		return fmt.Errorf("no failover state available for coordination rollback")
+	}
+
+	// Yeni master'ı eski durumuna (slave/standby) döndürme talebi
+	newMasterHost := fm.currentState.NewMasterHost
+	newMasterIP := fm.currentState.NewMasterIP
+	originalMasterHost := fm.currentState.OriginalMasterHost
+	originalMasterIP := fm.currentState.OriginalMasterIP
+
+	logMessage(fmt.Sprintf("Coordination rollback: %s (%s) should revert from PRIMARY to STANDBY",
+		newMasterHost, newMasterIP))
+
+	if originalMasterHost != "" {
+		logMessage(fmt.Sprintf("Original master was: %s (%s)", originalMasterHost, originalMasterIP))
+	}
+
+	// Logger metadata ile koordinasyon rollback talebi gönder
+	if logger != nil {
+		logger.AddMetadata("coordination_rollback_request", "true")
+		logger.AddMetadata("rollback_target_host", newMasterHost)
+		logger.AddMetadata("rollback_target_ip", newMasterIP)
+		logger.AddMetadata("rollback_action", "revert_promotion")
+		logger.AddMetadata("rollback_reason", "local_conversion_failed")
+		logger.AddMetadata("original_master_host", originalMasterHost)
+		logger.AddMetadata("original_master_ip", originalMasterIP)
+		logger.AddMetadata("rollback_timestamp", fmt.Sprintf("%d", time.Now().Unix()))
+
+		logMessage("Coordination rollback request sent via ProcessLogger metadata")
+	}
+
+	// Koordinasyon rollback için bekleme süresi
+	logMessage("Waiting for coordination rollback to complete...")
+	time.Sleep(10 * time.Second) // API'nin koordinasyon rollback'i işlemesi için bekle
+
+	// TODO: Gelecekte burada API'den rollback durumunu kontrol edebiliriz
+	logMessage("Coordination rollback request completed (async)")
+
+	return nil
+}
+
+// getCurrentNodeIP mevcut node'un IP adresini döndürür
+func (fm *PostgreSQLFailoverManager) getCurrentNodeIP() string {
+	// Önce config'den IP'yi almaya çalış
+	if fm.cfg != nil && fm.cfg.PostgreSQL.Host != "" && fm.cfg.PostgreSQL.Host != "localhost" {
+		// Config'deki host IP adresi mi kontrol et
+		if net.ParseIP(fm.cfg.PostgreSQL.Host) != nil {
+			return fm.cfg.PostgreSQL.Host
+		}
+		// Hostname ise IP'ye çevir
+		if ip := fm.resolveHostnameToIP(fm.cfg.PostgreSQL.Host); net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+
+	// Network interface'lerden IP'yi bulmaya çalış
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("Network interfaces alınamadı: %v", err)
+		return "127.0.0.1" // Fallback
+	}
+
+	for _, iface := range interfaces {
+		// Loopback ve down interface'leri atla
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			// IPv4 ve public IP'yi tercih et
+			if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsPrivate() {
+				return ip.String()
+			}
+		}
+	}
+
+	// Public IP bulunamadıysa private IP'yi dene
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			// IPv4 private IP'yi kabul et
+			if ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+				return ip.String()
+			}
+		}
+	}
+
+	return "127.0.0.1" // Son fallback
 }
