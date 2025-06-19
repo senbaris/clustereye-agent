@@ -979,7 +979,7 @@ func (p *PostgreSQLMetricsCollector) collectTableMetrics(db *sql.DB, metrics *[]
 	query := `
 		SELECT 
 			schemaname,
-			tablename,
+			relname,
 			seq_scan,
 			seq_tup_read,
 			idx_scan,
@@ -1002,11 +1002,11 @@ func (p *PostgreSQLMetricsCollector) collectTableMetrics(db *sql.DB, metrics *[]
 	defer rows.Close()
 
 	for rows.Next() {
-		var schemaname, tablename string
+		var schemaname, relname string
 		var seqScan, seqTupRead, idxScan, idxTupFetch int64
 		var nTupIns, nTupUpd, nTupDel, nLiveTup, nDeadTup int64
 
-		if err := rows.Scan(&schemaname, &tablename, &seqScan, &seqTupRead,
+		if err := rows.Scan(&schemaname, &relname, &seqScan, &seqTupRead,
 			&idxScan, &idxTupFetch, &nTupIns, &nTupUpd, &nTupDel,
 			&nLiveTup, &nDeadTup); err != nil {
 			continue
@@ -1015,7 +1015,7 @@ func (p *PostgreSQLMetricsCollector) collectTableMetrics(db *sql.DB, metrics *[]
 		tags := []MetricTag{
 			{Key: "host", Value: p.getHostname()},
 			{Key: "schema", Value: schemaname},
-			{Key: "table", Value: tablename},
+			{Key: "table", Value: relname},
 		}
 
 		*metrics = append(*metrics,
@@ -1060,8 +1060,8 @@ func (p *PostgreSQLMetricsCollector) collectIndexMetrics(db *sql.DB, metrics *[]
 	query := `
 		SELECT 
 			schemaname,
-			tablename,
-			indexname,
+			relname,
+			indexrelname,
 			idx_scan,
 			idx_tup_read,
 			idx_tup_fetch
@@ -1076,18 +1076,18 @@ func (p *PostgreSQLMetricsCollector) collectIndexMetrics(db *sql.DB, metrics *[]
 	defer rows.Close()
 
 	for rows.Next() {
-		var schemaname, tablename, indexname string
+		var schemaname, relname, indexrelname string
 		var idxScan, idxTupRead, idxTupFetch int64
 
-		if err := rows.Scan(&schemaname, &tablename, &indexname, &idxScan, &idxTupRead, &idxTupFetch); err != nil {
+		if err := rows.Scan(&schemaname, &relname, &indexrelname, &idxScan, &idxTupRead, &idxTupFetch); err != nil {
 			continue
 		}
 
 		tags := []MetricTag{
 			{Key: "host", Value: p.getHostname()},
 			{Key: "schema", Value: schemaname},
-			{Key: "table", Value: tablename},
-			{Key: "index", Value: indexname},
+			{Key: "table", Value: relname},
+			{Key: "index", Value: indexrelname},
 		}
 
 		*metrics = append(*metrics,

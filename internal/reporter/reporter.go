@@ -2829,7 +2829,6 @@ func (r *Reporter) listenForCommands() {
 					isProcessingQuery = false
 					continue
 				}
-
 				// MongoDB log analizi sorgusu için özel işlem
 				if strings.HasPrefix(query.Command, "analyze_mongo_log") {
 					log.Printf("MongoDB log analizi sorgusu tespit edildi: %s", query.Command)
