@@ -3587,38 +3587,20 @@ func (r *Reporter) reconnect() error {
 		return fmt.Errorf("maksimum yeniden bağlantı denemesi aşıldı: %v", err)
 	}
 
-	// Simple agent re-registration without starting new goroutines
-	// Skip periodic reporting and collector initialization to prevent goroutine explosion
-	if err := r.simpleAgentReRegistration("reconnected"); err != nil {
-		log.Printf("Agent yeniden kaydı başarısız: %v", err)
-		// Continue anyway, connection is working
-	}
-
-	// Alarm monitörünün client'ını güncelle
-	if r.alarmMonitor != nil {
-		client := pb.NewAgentServiceClient(r.grpcClient)
-		r.alarmMonitor.UpdateClient(client)
-		log.Printf("Alarm monitörü client'ı yeniden bağlantı sonrası güncellendi")
-	}
-
-	log.Printf("Yeniden bağlantı tamamlandı. Platform: %s", r.platform)
-	return nil
-}
-
-// simpleAgentReRegistration performs a simple agent re-registration without starting new goroutines
-func (r *Reporter) simpleAgentReRegistration(testResult string) error {
+	// Tam agent kaydı yap - bu sunucunun agent'ı connected olarak işaretlemesini sağlar
+	// Goroutine patlamasını önlemek için özel bir yaklaşım kullanıyoruz
 	hostname, _ := os.Hostname()
-	ip := utils.GetLocalIP()
+	agentID := "agent_" + hostname
 
 	// Agent bilgilerini hazırla
 	agentInfo := &pb.AgentInfo{
 		Key:          r.cfg.Key,
-		AgentId:      "agent_" + hostname,
+		AgentId:      agentID,
 		Hostname:     hostname,
-		Ip:           ip,
+		Ip:           utils.GetLocalIP(),
 		Platform:     r.platform,
 		Auth:         getAuthStatus(r.platform, r.cfg),
-		Test:         testResult,
+		Test:         "reconnected",
 		PostgresUser: r.cfg.PostgreSQL.User,
 		PostgresPass: r.cfg.PostgreSQL.Pass,
 	}
@@ -3630,12 +3612,52 @@ func (r *Reporter) simpleAgentReRegistration(testResult string) error {
 		},
 	}
 
-	// Mesajı gönder (simple, no retry logic)
+	// Mesajı gönder
 	if err := r.stream.Send(agentMessage); err != nil {
-		return fmt.Errorf("simple agent re-registration failed: %v", err)
+		log.Printf("Agent yeniden kaydı başarısız: %v", err)
+		// Continue anyway, connection is working
+	} else {
+		log.Printf("Agent yeniden kaydı başarılı: %s@%s", r.platform, hostname)
+
+		// Yeniden bağlantı sonrası ilk bilgileri gönder - bu sunucunun agent'ı aktif olarak görmesine yardımcı olur
+		if r.platform == "postgres" {
+			go func() {
+				time.Sleep(1 * time.Second)
+				if err := r.SendPostgresInfo(); err != nil {
+					log.Printf("Yeniden bağlantı sonrası PostgreSQL bilgileri gönderilemedi: %v", err)
+				} else {
+					log.Printf("Yeniden bağlantı sonrası PostgreSQL bilgileri başarıyla gönderildi")
+				}
+			}()
+		} else if r.platform == "mongo" {
+			go func() {
+				time.Sleep(1 * time.Second)
+				if err := r.SendMongoInfo(); err != nil {
+					log.Printf("Yeniden bağlantı sonrası MongoDB bilgileri gönderilemedi: %v", err)
+				} else {
+					log.Printf("Yeniden bağlantı sonrası MongoDB bilgileri başarıyla gönderildi")
+				}
+			}()
+		} else if r.platform == "mssql" {
+			go func() {
+				time.Sleep(1 * time.Second)
+				if err := r.SendMSSQLInfo(); err != nil {
+					log.Printf("Yeniden bağlantı sonrası MSSQL bilgileri gönderilemedi: %v", err)
+				} else {
+					log.Printf("Yeniden bağlantı sonrası MSSQL bilgileri başarıyla gönderildi")
+				}
+			}()
+		}
 	}
 
-	log.Printf("Simple agent re-registration completed (Platform: %s)", r.platform)
+	// Alarm monitörünün client'ını güncelle
+	if r.alarmMonitor != nil {
+		client := pb.NewAgentServiceClient(r.grpcClient)
+		r.alarmMonitor.UpdateClient(client)
+		log.Printf("Alarm monitörü client'ı yeniden bağlantı sonrası güncellendi")
+	}
+
+	log.Printf("Yeniden bağlantı tamamlandı. Platform: %s", r.platform)
 	return nil
 }
 
