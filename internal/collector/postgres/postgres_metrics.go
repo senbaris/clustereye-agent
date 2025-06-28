@@ -35,6 +35,16 @@ type QueryInfo struct {
 
 // ToMap converts QueryInfo to map[string]interface{} for JSON serialization
 func (qi *QueryInfo) ToMap() map[string]interface{} {
+	// Calculate completion time based on state
+	var completionTime string
+	if qi.State == "completed" {
+		// For completed queries, use StartTime as completion detection time
+		completionTime = qi.StartTime.Format(time.RFC3339Nano)
+	} else {
+		// For active queries, no completion time yet
+		completionTime = ""
+	}
+
 	return map[string]interface{}{
 		"pid":              qi.PID,
 		"database_name":    qi.DatabaseName,
@@ -48,6 +58,7 @@ func (qi *QueryInfo) ToMap() map[string]interface{} {
 		"wait_event":       qi.WaitEvent,
 		"timestamp":        qi.StartTime.Format(time.RFC3339Nano),
 		"query_start":      qi.QueryStart.Format(time.RFC3339Nano),
+		"completion_time":  completionTime,
 	}
 }
 
