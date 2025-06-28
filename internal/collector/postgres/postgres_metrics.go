@@ -1133,6 +1133,9 @@ func (p *PostgreSQLMetricsCollector) collectQueryPerformanceMetrics(db *sql.DB, 
 
 	// 3. Collect database-level query stats
 	p.collectDatabaseQueryStats(db, metrics, timestamp, tags)
+
+	// 4. Collect active queries for historical tracking
+	p.collectActiveQueries(db, metrics, timestamp, tags)
 }
 
 // collectPgStatStatementsMetrics collects metrics from pg_stat_statements extension
@@ -1456,6 +1459,103 @@ func (p *PostgreSQLMetricsCollector) collectDatabaseQueryStats(db *sql.DB, metri
 			Timestamp:   timestamp,
 			Unit:        "percent",
 			Description: "Sequential scan ratio (100 - index_scan_ratio)",
+		})
+	}
+}
+
+// collectActiveQueries collects currently running queries for historical analysis
+func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[]Metric, timestamp int64, baseTags []MetricTag) {
+	// Query to get active queries with details
+	query := `
+		SELECT 
+			datname AS database_name,
+			usename AS username,
+			application_name,
+			client_addr,
+			state,
+			EXTRACT(EPOCH FROM (NOW() - query_start)) AS duration_seconds,
+			wait_event_type,
+			wait_event,
+			query
+		FROM pg_stat_activity
+		WHERE state = 'active'
+		  AND pid <> pg_backend_pid()
+		  AND query NOT LIKE '%pg_stat_activity%'
+		ORDER BY duration_seconds DESC
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		logger.Error("Failed to collect active queries: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dbName, username, appName, state, waitEventType, waitEvent, queryText string
+		var clientAddr sql.NullString
+		var durationSeconds float64
+
+		err := rows.Scan(
+			&dbName,
+			&username,
+			&appName,
+			&clientAddr,
+			&state,
+			&durationSeconds,
+			&waitEventType,
+			&waitEvent,
+			&queryText,
+		)
+		if err != nil {
+			logger.Error("Error scanning active query row: %v", err)
+			continue
+		}
+
+		// Truncate query text if too long
+		if len(queryText) > 1000 {
+			queryText = queryText[:1000] + "..."
+		}
+
+		// Create tags for this specific query
+		tags := append([]MetricTag{}, baseTags...)
+		tags = append(tags,
+			MetricTag{Key: "database", Value: dbName},
+			MetricTag{Key: "username", Value: username},
+			MetricTag{Key: "application", Value: appName},
+			MetricTag{Key: "state", Value: state},
+		)
+
+		if clientAddr.Valid {
+			tags = append(tags, MetricTag{Key: "client_addr", Value: clientAddr.String})
+		}
+
+		if waitEventType != "" {
+			tags = append(tags, MetricTag{Key: "wait_event_type", Value: waitEventType})
+		}
+
+		if waitEvent != "" {
+			tags = append(tags, MetricTag{Key: "wait_event", Value: waitEvent})
+		}
+
+		// Add query text as a string value metric
+		queryStrValue := queryText
+		*metrics = append(*metrics, Metric{
+			Name:        "postgresql.active_query.text",
+			Value:       MetricValue{StringValue: &queryStrValue},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Description: "Currently running SQL query text",
+		})
+
+		// Add query duration as a separate metric
+		*metrics = append(*metrics, Metric{
+			Name:        "postgresql.active_query.duration",
+			Value:       MetricValue{DoubleValue: &durationSeconds},
+			Tags:        tags,
+			Timestamp:   timestamp,
+			Unit:        "seconds",
+			Description: "Duration of currently running query in seconds",
 		})
 	}
 }

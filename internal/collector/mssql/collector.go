@@ -352,6 +352,23 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 		// Önbellekte HA bilgisi varsa onu kullan
 		if hasHAState {
 			log.Printf("Servis kapalı ama önbellekte HA durumu mevcut: %s, önbellekteki bilgiler kullanılıyor", haState.role)
+
+			// Eğer bu node daha önce bir cluster üyesi olarak işaretlenmişse,
+			// geçici bağlantı sorunları veya failover durumlarında önbelleği kullan
+			cacheFile := getCacheFilePath()
+			existingData, _ := os.ReadFile(cacheFile)
+
+			if len(existingData) > 0 {
+				var existingCache struct {
+					IsClusterMember bool `json:"is_cluster_member"`
+				}
+
+				if json.Unmarshal(existingData, &existingCache) == nil && existingCache.IsClusterMember {
+					log.Printf("Bu node bir cluster üyesi olarak işaretlenmiş, failover/bakım durumunda olabilir")
+					return haState.role, true
+				}
+			}
+
 			return haState.role, true
 		}
 
@@ -453,6 +470,9 @@ func (c *MSSQLCollector) getHAStateFromCache(key string) (struct{ role, group st
 		Role        string    `json:"role"`
 		Group       string    `json:"group"`
 		LastUpdated time.Time `json:"last_updated"`
+		// Failover durumları için eklenen yeni alanlar
+		IsClusterMember bool      `json:"is_cluster_member"`
+		LastFailover    time.Time `json:"last_failover"`
 	}
 
 	if err := json.Unmarshal(data, &cachedData); err != nil {
@@ -468,15 +488,25 @@ func (c *MSSQLCollector) getHAStateFromCache(key string) (struct{ role, group st
 		return emptyState, false
 	}
 
-	// Check if cache is stale (7 days max)
-	if time.Since(cachedData.LastUpdated) > 7*24*time.Hour {
-		log.Printf("MSSQL HA durum önbelleği çok eski (7 günden fazla): %s, yeni veri gerekli",
-			cachedData.LastUpdated.Format("2006-01-02 15:04:05"))
+	// Failover durumlarında daha uzun bir önbellek süresi kullanılır (normal: 7 gün, failover: 14 gün)
+	var cacheValidityPeriod time.Duration
+	if cachedData.IsClusterMember && cachedData.Group != "" {
+		// Eğer bu node daha önce bir cluster üyesi olarak işaretlenmişse, önbellek süresini uzat
+		cacheValidityPeriod = 14 * 24 * time.Hour // 14 gün
+		log.Printf("Bu node bir cluster üyesi olarak işaretlenmiş, uzatılmış önbellek süresi kullanılıyor (14 gün)")
+	} else {
+		cacheValidityPeriod = 7 * 24 * time.Hour // 7 gün (normal süre)
+	}
+
+	// Check if cache is stale
+	if time.Since(cachedData.LastUpdated) > cacheValidityPeriod {
+		log.Printf("MSSQL HA durum önbelleği çok eski (%d günden fazla): %s, yeni veri gerekli",
+			cacheValidityPeriod/(24*time.Hour), cachedData.LastUpdated.Format("2006-01-02 15:04:05"))
 		return emptyState, false
 	}
 
-	log.Printf("MSSQL HA durum önbelleğinden bilgi alındı: Role=%s, Group=%s, LastUpdated=%s",
-		cachedData.Role, cachedData.Group, cachedData.LastUpdated.Format("2006-01-02 15:04:05"))
+	log.Printf("MSSQL HA durum önbelleğinden bilgi alındı: Role=%s, Group=%s, LastUpdated=%s, IsClusterMember=%v",
+		cachedData.Role, cachedData.Group, cachedData.LastUpdated.Format("2006-01-02 15:04:05"), cachedData.IsClusterMember)
 
 	return struct{ role, group string }{cachedData.Role, cachedData.Group}, true
 }
@@ -510,15 +540,57 @@ func getCacheFilePath() string {
 
 // saveHAStateToCache saves HA information to a cache file
 func (c *MSSQLCollector) saveHAStateToCache(role, group string) {
-	// Prepare cache data with timestamp
+	// Önce mevcut önbelleği oku (varsa) - failover tespiti için
+	var isFailover bool
+	var lastFailover time.Time
+	var previousRole string
+
+	cacheFile := getCacheFilePath()
+	existingData, _ := os.ReadFile(cacheFile)
+
+	// Mevcut önbellek dosyasını okuma
+	if len(existingData) > 0 {
+		var existingCache struct {
+			Role            string    `json:"role"`
+			Group           string    `json:"group"`
+			LastUpdated     time.Time `json:"last_updated"`
+			IsClusterMember bool      `json:"is_cluster_member"`
+			LastFailover    time.Time `json:"last_failover"`
+		}
+
+		jsonErr := json.Unmarshal(existingData, &existingCache)
+		if jsonErr == nil {
+			previousRole = existingCache.Role
+			lastFailover = existingCache.LastFailover
+
+			// Eğer önceki rol PRIMARY iken şimdi SECONDARY olmuşsa veya tam tersi, failover olmuş demektir
+			if (previousRole == "PRIMARY" && role == "SECONDARY") || (previousRole == "SECONDARY" && role == "PRIMARY") {
+				isFailover = true
+				lastFailover = time.Now()
+				log.Printf("Failover tespit edildi! Önceki rol: %s, Yeni rol: %s", previousRole, role)
+			}
+		}
+	}
+
+	// Prepare cache data with timestamp and failover information
 	cacheData := struct {
-		Role        string    `json:"role"`
-		Group       string    `json:"group"`
-		LastUpdated time.Time `json:"last_updated"`
+		Role            string    `json:"role"`
+		Group           string    `json:"group"`
+		LastUpdated     time.Time `json:"last_updated"`
+		IsClusterMember bool      `json:"is_cluster_member"`
+		LastFailover    time.Time `json:"last_failover"`
 	}{
-		Role:        role,
-		Group:       group,
-		LastUpdated: time.Now(),
+		Role:            role,
+		Group:           group,
+		LastUpdated:     time.Now(),
+		IsClusterMember: group != "", // Eğer group (cluster adı) boş değilse, bu node bir cluster üyesidir
+		LastFailover:    lastFailover,
+	}
+
+	// Failover durumunu güncelle
+	if isFailover {
+		cacheData.LastFailover = lastFailover
+		log.Printf("Failover bilgisi önbelleğe kaydediliyor. Zaman: %s", lastFailover.Format("2006-01-02 15:04:05"))
 	}
 
 	// Convert to JSON
@@ -529,7 +601,7 @@ func (c *MSSQLCollector) saveHAStateToCache(role, group string) {
 	}
 
 	// Get cache file path
-	cacheFile := getCacheFilePath()
+	cacheFile = getCacheFilePath()
 
 	// Ensure directory exists
 	cacheDir := filepath.Dir(cacheFile)
@@ -1473,6 +1545,26 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 			nodeStatus = haState.role
 			clusterName = haState.group
 			isHAEnabled = (nodeStatus != "STANDALONE" && nodeStatus != "")
+
+			// Eğer bu node bir cluster üyesi olarak işaretlenmişse, failover durumunda olabilir
+			cacheFile := getCacheFilePath()
+			existingData, _ := os.ReadFile(cacheFile)
+
+			if len(existingData) > 0 {
+				var existingCache struct {
+					IsClusterMember bool      `json:"is_cluster_member"`
+					LastFailover    time.Time `json:"last_failover"`
+				}
+
+				if json.Unmarshal(existingData, &existingCache) == nil && existingCache.IsClusterMember {
+					log.Printf("Bu node bir cluster üyesi olarak işaretlenmiş, failover/bakım durumunda olabilir")
+					// Failover durumunda olduğunu kesin olarak belirt
+					if !existingCache.LastFailover.IsZero() {
+						log.Printf("Son failover zamanı: %s", existingCache.LastFailover.Format("2006-01-02 15:04:05"))
+					}
+					isHAEnabled = true // Kesinlikle HA olarak işaretle
+				}
+			}
 		} else {
 			nodeStatus = "STANDALONE"
 			isHAEnabled = false
@@ -2345,69 +2437,126 @@ func (c *MSSQLCollector) ExplainMSSQLQuery(database, queryStr string) (string, e
 		}
 	}
 
-	// Get the execution plan
-	var planXML string
-	err = db.QueryRowContext(ctx, "SET SHOWPLAN_XML ON; "+queryStr+"; SET SHOWPLAN_XML OFF;").Scan(&planXML)
-
-	// If query doesn't return a resultset, try alternative approach
+	// Method 1: Try to get the actual execution plan using STATISTICS XML
+	_, err = db.ExecContext(ctx, "SET STATISTICS XML ON")
 	if err != nil {
-		log.Printf("Execution plan için sorgu başarısız (direct): %v", err)
-		log.Printf("Alternatif execution plan yaklaşımı deneniyor...")
-
-		// Reset connection
-		db.Close()
-		db, err = c.GetClient()
-		if err != nil {
-			return "", fmt.Errorf("bağlantı açılamadı: %v", err)
-		}
-		defer db.Close()
-
-		// Use database
-		if database != "" && database != "master" {
-			_, err = db.ExecContext(ctx, "USE "+database)
-			if err != nil {
-				return "", fmt.Errorf("veritabanı değiştirilemedi: %v", err)
+		log.Printf("STATISTICS XML açılamadı: %v", err)
+	} else {
+		// Execute the query to get actual execution plan
+		rows, err := db.QueryContext(ctx, queryStr)
+		if err == nil {
+			// Process any result rows (needed to get the plan)
+			for rows.Next() {
+				// Just advance through the rows
 			}
-		}
+			rows.Close()
 
-		// Method 2: Temporary stored procedure to capture the execution plan
-		_, err = db.ExecContext(ctx, "IF OBJECT_ID('tempdb..#get_plan') IS NOT NULL DROP PROCEDURE #get_plan")
-		if err != nil {
-			log.Printf("Temporary procedure silme hatası: %v", err)
-		}
+			// Check for plan in the messages
+			var planXML string
+			// The plan should be in the driver's messages, but we can't access it directly
+			// Let's try to get it using a different approach
 
-		createProcQuery := `
-		CREATE PROCEDURE #get_plan AS 
-		BEGIN
-			SET SHOWPLAN_XML ON;
-			` + queryStr + `
-			SET SHOWPLAN_XML OFF;
-		END
-		`
-
-		_, err = db.ExecContext(ctx, createProcQuery)
-		if err != nil {
-			log.Printf("Temporary procedure oluşturma hatası: %v", err)
-
-			// Method 3: Try SHOWPLAN_XML query directly
+			// Method 2: Try to get the plan from the query store if available
 			planQuery := `
-			SELECT query_plan
-			FROM sys.dm_exec_query_plan(
-				(SELECT TOP 1 plan_handle 
-				 FROM sys.dm_exec_query_stats 
-				 CROSS APPLY sys.dm_exec_sql_text(sql_handle) AS st
-				 WHERE st.text LIKE @query
-				 ORDER BY last_execution_time DESC)
-			)
+			SELECT TOP 1 qp.query_plan
+			FROM sys.query_store_query_text qt
+			JOIN sys.query_store_query q ON qt.query_text_id = q.query_text_id
+			JOIN sys.query_store_plan qp ON q.query_id = qp.query_id
+			WHERE qt.query_sql_text LIKE @query
+			ORDER BY qp.last_execution_time DESC
 			`
 
 			err = db.QueryRowContext(ctx, planQuery, sql.Named("query", "%"+queryStr+"%")).Scan(&planXML)
+			if err == nil && planXML != "" {
+				// Turn off STATISTICS XML
+				db.ExecContext(ctx, "SET STATISTICS XML OFF")
+				return "## SQL Server Actual Execution Plan\n```xml\n" + planXML + "\n```", nil
+			}
+		}
+
+		// Turn off STATISTICS XML
+		db.ExecContext(ctx, "SET STATISTICS XML OFF")
+	}
+
+	// Method 3: Fallback to estimated plan using SHOWPLAN_XML
+	var planXML string
+
+	// Create a new connection for the estimated plan
+	db.Close()
+	db, err = c.GetClient()
+	if err != nil {
+		return "", fmt.Errorf("bağlantı açılamadı: %v", err)
+	}
+	defer db.Close()
+
+	// Use database
+	if database != "" && database != "master" {
+		_, err = db.ExecContext(ctx, "USE "+database)
+		if err != nil {
+			return "", fmt.Errorf("veritabanı değiştirilemedi: %v", err)
+		}
+	}
+
+	// Try to get the estimated plan using a temporary stored procedure
+	_, err = db.ExecContext(ctx, "IF OBJECT_ID('tempdb..#get_plan') IS NOT NULL DROP PROCEDURE #get_plan")
+	if err != nil {
+		log.Printf("Temporary procedure silme hatası: %v", err)
+	}
+
+	createProcQuery := `
+	CREATE PROCEDURE #get_plan AS 
+	BEGIN
+		SET SHOWPLAN_XML ON;
+		` + queryStr + `
+		SET SHOWPLAN_XML OFF;
+	END
+	`
+
+	_, err = db.ExecContext(ctx, createProcQuery)
+	if err != nil {
+		log.Printf("Temporary procedure oluşturma hatası: %v", err)
+
+		// Method 4: Try direct SHOWPLAN_XML approach
+		showplanQuery := "SET SHOWPLAN_XML ON; " + queryStr
+		err = db.QueryRowContext(ctx, showplanQuery).Scan(&planXML)
+		if err != nil {
+			// Method 5: Last resort - try to get the plan from cache
+			dmQuery := `
+			SELECT TOP 1 query_plan
+			FROM sys.dm_exec_query_plan(
+				(SELECT TOP 1 plan_handle 
+				FROM sys.dm_exec_query_stats 
+				CROSS APPLY sys.dm_exec_sql_text(sql_handle) AS st
+				WHERE st.text LIKE @query
+				ORDER BY last_execution_time DESC)
+			)
+			`
+
+			err = db.QueryRowContext(ctx, dmQuery, sql.Named("query", "%"+queryStr+"%")).Scan(&planXML)
 			if err != nil {
 				return "", fmt.Errorf("execution plan alınamadı: %v", err)
 			}
-		} else {
-			// Execute the procedure to get the plan
-			err = db.QueryRowContext(ctx, "EXEC sp_executesql N'EXEC #get_plan'; SELECT CAST(query_plan AS NVARCHAR(MAX)) FROM sys.dm_exec_query_plan(MOST_RECENT plan_handle);").Scan(&planXML)
+		}
+
+		// Turn off SHOWPLAN_XML if it was turned on
+		db.ExecContext(ctx, "SET SHOWPLAN_XML OFF")
+	} else {
+		// Execute the procedure to get the plan
+		err = db.QueryRowContext(ctx, "EXEC sp_executesql N'EXEC #get_plan'").Scan(&planXML)
+		if err != nil {
+			log.Printf("Procedure execution hatası: %v", err)
+
+			// Try to get the plan from cache as last resort
+			cacheQuery := `
+			SELECT TOP 1 query_plan
+			FROM sys.dm_exec_cached_plans cp
+			CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) qp
+			CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
+			WHERE st.text LIKE @query
+			ORDER BY cp.usecounts DESC
+			`
+
+			err = db.QueryRowContext(ctx, cacheQuery, sql.Named("query", "%"+queryStr+"%")).Scan(&planXML)
 			if err != nil {
 				return "", fmt.Errorf("execution plan alınamadı: %v", err)
 			}
@@ -2415,9 +2564,15 @@ func (c *MSSQLCollector) ExplainMSSQLQuery(database, queryStr string) (string, e
 	}
 
 	// Format the execution plan for easier reading
-	prettyPlan := "## SQL Server Execution Plan\n```xml\n" + planXML + "\n```"
-
-	return prettyPlan, nil
+	if !strings.Contains(planXML, "ActualExecutionMode") {
+		// This is an estimated plan
+		prettyPlan := "## SQL Server Estimated Execution Plan\n```xml\n" + planXML + "\n```"
+		return prettyPlan, nil
+	} else {
+		// This is an actual plan
+		prettyPlan := "## SQL Server Actual Execution Plan\n```xml\n" + planXML + "\n```"
+		return prettyPlan, nil
+	}
 }
 
 // FindMSSQLLogFiles finds SQL Server log files
