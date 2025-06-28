@@ -1499,7 +1499,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 	defer rows.Close()
 
 	queryCount := 0
-	activeQueries := []map[string]interface{}{}
+	activeQueries := []interface{}{}
 
 	logger.Debug("PostgreSQL - Starting to scan active query results")
 
@@ -1595,16 +1595,29 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			"timestamp":        time.Unix(0, timestamp).Format(time.RFC3339Nano),
 		}
 
+		// Debug log for each field in queryData
+		logger.Debug("PostgreSQL - Created queryData map:")
+		logger.Debug("PostgreSQL -   database_name: '%s' (from NULL: %v)", queryData["database_name"], !dbNameNull.Valid)
+		logger.Debug("PostgreSQL -   username: '%s' (from NULL: %v)", queryData["username"], !usernameNull.Valid)
+		logger.Debug("PostgreSQL -   application_name: '%s' (from NULL: %v)", queryData["application_name"], !appNameNull.Valid)
+		logger.Debug("PostgreSQL -   client_addr: '%s' (from NULL: %v)", queryData["client_addr"], !clientAddr.Valid)
+		logger.Debug("PostgreSQL -   state: '%s' (from NULL: %v)", queryData["state"], !stateNull.Valid)
+		logger.Debug("PostgreSQL -   duration_seconds: %v (type: %T)", queryData["duration_seconds"], queryData["duration_seconds"])
+		logger.Debug("PostgreSQL -   query: '%s' (length: %d, from NULL: %v)", queryData["query"], len(queryText), !queryTextNull.Valid)
+		logger.Debug("PostgreSQL -   timestamp: '%s'", queryData["timestamp"])
+
 		// Log query data map
 		logger.Debug("PostgreSQL - Created query data map with query field: %s", queryText[:min(len(queryText), 50)])
 
 		// Add optional fields only if they're valid
 		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
 			queryData["wait_event_type"] = waitEventTypeNull.String
+			logger.Debug("PostgreSQL -   wait_event_type: '%s'", queryData["wait_event_type"])
 		}
 
 		if waitEventNull.Valid && waitEventNull.String != "" {
 			queryData["wait_event"] = waitEventNull.String
+			logger.Debug("PostgreSQL -   wait_event: '%s'", queryData["wait_event"])
 		}
 
 		// Add to the active queries list
@@ -1676,13 +1689,38 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 	// Add the active queries as a single JSON object
 	if len(activeQueries) > 0 {
 		logger.Debug("PostgreSQL - Converting %d active queries to JSON", len(activeQueries))
+
+		// Debug log for each query before JSON marshalling
+		for i, query := range activeQueries {
+			logger.Debug("PostgreSQL - Query %d before JSON marshalling:", i+1)
+			if queryMap, ok := query.(map[string]interface{}); ok {
+				for key, value := range queryMap {
+					logger.Debug("PostgreSQL -   %s: %v (type: %T)", key, value, value)
+				}
+			}
+		}
+
 		activeQueriesJSON, err := json.Marshal(activeQueries)
 		if err != nil {
 			logger.Error("PostgreSQL - Error marshalling active queries: %v", err)
 		} else {
 			activeQueriesStr := string(activeQueriesJSON)
 			logger.Debug("PostgreSQL - Successfully marshalled active queries to JSON (length: %d bytes)", len(activeQueriesStr))
-			logger.Debug("PostgreSQL - First 200 chars of JSON: %s", activeQueriesStr[:min(len(activeQueriesStr), 200)])
+			logger.Debug("PostgreSQL - Full JSON: %s", activeQueriesStr)
+
+			// Parse back the JSON to verify it's correct
+			var verifyQueries []map[string]interface{}
+			if err := json.Unmarshal(activeQueriesJSON, &verifyQueries); err != nil {
+				logger.Error("PostgreSQL - Error verifying JSON: %v", err)
+			} else {
+				logger.Debug("PostgreSQL - JSON verification successful, parsed %d queries", len(verifyQueries))
+				if len(verifyQueries) > 0 {
+					logger.Debug("PostgreSQL - First query after JSON round-trip:")
+					for key, value := range verifyQueries[0] {
+						logger.Debug("PostgreSQL -   %s: %v (type: %T)", key, value, value)
+					}
+				}
+			}
 
 			*metrics = append(*metrics, Metric{
 				Name:        "postgresql.active_queries",
