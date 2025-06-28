@@ -2,6 +2,7 @@ package reporter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -296,7 +297,49 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 	// Convert internal metrics to protobuf
 	pbMetrics := make([]*pb.Metric, 0, len(batch.Metrics))
 
+	// Special handling for active_queries metric
+	var activeQueriesData []interface{}
+	var hasActiveQueries bool
+
 	for _, metric := range batch.Metrics {
+		// Special handling for active_queries metric
+		if metric.Name == "postgresql.active_queries" && metric.Value.StringValue != nil {
+			// Parse the JSON string to extract active queries data
+			var queries []interface{}
+			err := json.Unmarshal([]byte(*metric.Value.StringValue), &queries)
+			if err != nil {
+				log.Printf("DEBUG: Error parsing active queries JSON: %v", err)
+			} else {
+				activeQueriesData = queries
+				hasActiveQueries = true
+				log.Printf("DEBUG: Parsed active_queries metric with %d queries", len(queries))
+
+				// Skip adding this metric to pbMetrics as we'll handle it specially
+				continue
+			}
+		}
+
+		// Debug log for active query metrics
+		if metric.Name == "postgresql.active_query.text" {
+			if metric.Value.StringValue != nil {
+				queryText := *metric.Value.StringValue
+				queryLen := len(queryText)
+				previewLen := minInt(queryLen, 100)
+				log.Printf("DEBUG: Active query text metric (length: %d): '%s'",
+					queryLen, queryText[:previewLen])
+
+				// Log tags for this query
+				var tagInfo string
+				for _, tag := range metric.Tags {
+					if tag.Key == "database" || tag.Key == "username" || tag.Key == "client_addr" {
+						tagInfo += fmt.Sprintf("%s=%s ", tag.Key, tag.Value)
+					}
+				}
+				log.Printf("DEBUG: Query tags: %s", tagInfo)
+			} else {
+				log.Printf("DEBUG: Active query text metric with NULL value")
+			}
+		}
 
 		pbMetric := &pb.Metric{
 			Name:        metric.Name,
@@ -327,6 +370,31 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 		Metrics:             pbMetrics,
 		CollectionTimestamp: batch.CollectionTimestamp,
 		Metadata:            batch.Metadata,
+	}
+
+	// Add active_queries data to metadata if available
+	if hasActiveQueries {
+		// Convert active queries data to JSON string
+		activeQueriesJSON, err := json.Marshal(activeQueriesData)
+		if err != nil {
+			log.Printf("DEBUG: Error marshalling active queries data: %v", err)
+		} else {
+			// Add to metadata
+			if pbBatch.Metadata == nil {
+				pbBatch.Metadata = make(map[string]string)
+			}
+			pbBatch.Metadata["active_queries"] = string(activeQueriesJSON)
+			log.Printf("DEBUG: Added active_queries data to metadata with %d queries", len(activeQueriesData))
+		}
+	}
+
+	// Debug log for metrics count by type
+	metricTypeCount := make(map[string]int)
+	for _, metric := range pbMetrics {
+		metricTypeCount[metric.Name]++
+	}
+	for metricName, count := range metricTypeCount {
+		log.Printf("DEBUG: Metric type count: %s = %d", metricName, count)
 	}
 
 	// Create request
@@ -389,6 +457,14 @@ func (ms *MetricsSender) convertPostgreSQLMetricValue(value postgres.MetricValue
 	}
 
 	return pbValue
+}
+
+// minInt returns the smaller of x or y
+func minInt(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 // StartPeriodicMetricsCollection starts collecting and sending metrics periodically

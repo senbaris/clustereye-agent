@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/senbaris/clustereye-agent/internal/config"
@@ -1476,7 +1478,11 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			EXTRACT(EPOCH FROM (NOW() - query_start)) AS duration_seconds,
 			wait_event_type,
 			wait_event,
-			query
+			CASE 
+				WHEN query IS NULL THEN 'NULL_QUERY'
+				WHEN LENGTH(TRIM(query)) = 0 THEN 'EMPTY_QUERY'
+				ELSE query
+			END AS query
 		FROM pg_stat_activity
 		WHERE state = 'active' and usename!='replicator'
 		  AND pid <> pg_backend_pid()
@@ -1484,6 +1490,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 		ORDER BY duration_seconds DESC
 	`
 
+	logger.Debug("Executing active queries collection query")
 	rows, err := db.Query(query)
 	if err != nil {
 		logger.Error("Failed to collect active queries: %v", err)
@@ -1491,14 +1498,18 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 	}
 	defer rows.Close()
 
+	queryCount := 0
+	activeQueries := []map[string]interface{}{}
+
 	for rows.Next() {
+		queryCount++
 		var dbNameNull sql.NullString
 		var usernameNull sql.NullString
 		var appNameNull sql.NullString
 		var stateNull sql.NullString
 		var waitEventTypeNull sql.NullString
 		var waitEventNull sql.NullString
-		var queryText string
+		var queryTextNull sql.NullString
 		var clientAddr sql.NullString
 		var durationSeconds float64
 
@@ -1511,11 +1522,56 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			&durationSeconds,
 			&waitEventTypeNull,
 			&waitEventNull,
-			&queryText,
+			&queryTextNull,
 		)
 		if err != nil {
 			logger.Error("Error scanning active query row: %v", err)
 			continue
+		}
+
+		// Debug log to check query text
+		if queryTextNull.Valid {
+			queryLen := len(queryTextNull.String)
+			previewLen := min(queryLen, 100)
+			logger.Debug("Query text found (length: %d): '%s'", queryLen, queryTextNull.String[:previewLen])
+
+			// Additional debug for query content
+			if queryLen > 0 {
+				logger.Debug("Query first char code: %d, last char code: %d",
+					int(queryTextNull.String[0]), int(queryTextNull.String[queryLen-1]))
+
+				// Check for special characters
+				if strings.Contains(queryTextNull.String, "\u0000") {
+					logger.Debug("Query contains NULL bytes which may cause issues")
+				}
+			} else {
+				logger.Debug("Query text is empty string (length 0)")
+			}
+		} else {
+			logger.Debug("Query text is NULL")
+		}
+
+		// Handle NULL query text
+		queryText := "UNKNOWN_QUERY"
+		if queryTextNull.Valid {
+			queryText = queryTextNull.String
+
+			// Log original query text before processing
+			logger.Debug("Original query before processing: '%s'", queryText[:min(len(queryText), 100)])
+
+			// Replace newlines with spaces for better readability in metrics
+			queryText = strings.Replace(queryText, "\n", " ", -1)
+			queryText = strings.Replace(queryText, "\r", " ", -1)
+			queryText = strings.Replace(queryText, "\t", " ", -1)
+
+			// Remove NULL bytes which can cause JSON issues
+			queryText = strings.Replace(queryText, "\u0000", "", -1)
+
+			// Remove extra spaces
+			queryText = strings.Join(strings.Fields(queryText), " ")
+
+			// Log processed query text
+			logger.Debug("Processed query text: '%s'", queryText[:min(len(queryText), 100)])
 		}
 
 		// Truncate query text if too long
@@ -1523,7 +1579,31 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			queryText = queryText[:1000] + "..."
 		}
 
-		// Create tags for this specific query
+		// Create a map for each active query in the format expected by the API
+		queryData := map[string]interface{}{
+			"database_name":    dbNameNull.String,
+			"username":         usernameNull.String,
+			"application_name": appNameNull.String,
+			"client_addr":      clientAddr.String,
+			"state":            stateNull.String,
+			"duration_seconds": durationSeconds,
+			"query":            queryText, // API expects "query" field
+			"timestamp":        time.Unix(0, timestamp).Format(time.RFC3339Nano),
+		}
+
+		// Add optional fields only if they're valid
+		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
+			queryData["wait_event_type"] = waitEventTypeNull.String
+		}
+
+		if waitEventNull.Valid && waitEventNull.String != "" {
+			queryData["wait_event"] = waitEventNull.String
+		}
+
+		// Add to the active queries list
+		activeQueries = append(activeQueries, queryData)
+
+		// Create tags for this specific query (for backward compatibility with existing metrics)
 		tags := append([]MetricTag{}, baseTags...)
 
 		// Handle NULL database name
@@ -1572,16 +1652,6 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			tags = append(tags, MetricTag{Key: "wait_event", Value: waitEventNull.String})
 		}
 
-		// Add query text as a string value metric
-		queryStrValue := queryText
-		*metrics = append(*metrics, Metric{
-			Name:        "postgresql.active_query.text",
-			Value:       MetricValue{StringValue: &queryStrValue},
-			Tags:        tags,
-			Timestamp:   timestamp,
-			Description: "Currently running SQL query text",
-		})
-
 		// Add query duration as a separate metric
 		*metrics = append(*metrics, Metric{
 			Name:        "postgresql.active_query.duration",
@@ -1592,6 +1662,34 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			Description: "Duration of currently running query in seconds",
 		})
 	}
+
+	logger.Debug("Collected %d active queries", queryCount)
+
+	// Add the active queries as a single JSON object
+	if len(activeQueries) > 0 {
+		activeQueriesJSON, err := json.Marshal(activeQueries)
+		if err != nil {
+			logger.Error("Error marshalling active queries: %v", err)
+		} else {
+			activeQueriesStr := string(activeQueriesJSON)
+			*metrics = append(*metrics, Metric{
+				Name:        "postgresql.active_queries",
+				Value:       MetricValue{StringValue: &activeQueriesStr},
+				Tags:        baseTags,
+				Timestamp:   timestamp,
+				Description: "List of currently running SQL queries",
+			})
+			logger.Debug("Added active_queries metric with %d queries", len(activeQueries))
+		}
+	}
+}
+
+// min returns the smaller of x or y
+func min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 // getHostname returns the hostname for tagging
