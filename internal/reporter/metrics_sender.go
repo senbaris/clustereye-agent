@@ -301,18 +301,63 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 	var activeQueriesData []interface{}
 	var hasActiveQueries bool
 
+	log.Printf("DEBUG: sendPostgreSQLMetricBatch - Processing %d metrics for batch type %s",
+		len(batch.Metrics), batch.MetricType)
+
+	// First pass to check if we have active queries
+	for _, metric := range batch.Metrics {
+		if metric.Name == "postgresql.active_queries" {
+			log.Printf("DEBUG: Found postgresql.active_queries metric in batch")
+			if metric.Value.StringValue != nil {
+				log.Printf("DEBUG: postgresql.active_queries metric has string value (length: %d)",
+					len(*metric.Value.StringValue))
+			} else {
+				log.Printf("DEBUG: postgresql.active_queries metric has NULL string value")
+			}
+			break
+		}
+	}
+
 	for _, metric := range batch.Metrics {
 		// Special handling for active_queries metric
 		if metric.Name == "postgresql.active_queries" && metric.Value.StringValue != nil {
 			// Parse the JSON string to extract active queries data
 			var queries []interface{}
+			log.Printf("DEBUG: Processing active_queries metric, JSON length: %d",
+				len(*metric.Value.StringValue))
+
+			// Log a preview of the JSON
+			jsonPreview := *metric.Value.StringValue
+			if len(jsonPreview) > 200 {
+				jsonPreview = jsonPreview[:200] + "..."
+			}
+			log.Printf("DEBUG: Active queries JSON preview: %s", jsonPreview)
+
 			err := json.Unmarshal([]byte(*metric.Value.StringValue), &queries)
 			if err != nil {
 				log.Printf("DEBUG: Error parsing active queries JSON: %v", err)
 			} else {
 				activeQueriesData = queries
 				hasActiveQueries = true
-				log.Printf("DEBUG: Parsed active_queries metric with %d queries", len(queries))
+				log.Printf("DEBUG: Successfully parsed active_queries metric with %d queries", len(queries))
+
+				// Log details of first query if available
+				if len(queries) > 0 {
+					firstQuery, ok := queries[0].(map[string]interface{})
+					if ok {
+						log.Printf("DEBUG: First active query details:")
+						for k, v := range firstQuery {
+							log.Printf("DEBUG:   %s: %v", k, v)
+						}
+
+						// Specifically check for query field
+						if queryText, ok := firstQuery["query"]; ok {
+							log.Printf("DEBUG: First query has 'query' field: %v", queryText)
+						} else {
+							log.Printf("DEBUG: First query is MISSING 'query' field!")
+						}
+					}
+				}
 
 				// Skip adding this metric to pbMetrics as we'll handle it specially
 				continue
@@ -375,6 +420,7 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 	// Add active_queries data to metadata if available
 	if hasActiveQueries {
 		// Convert active queries data to JSON string
+		log.Printf("DEBUG: Converting %d active queries to JSON for metadata", len(activeQueriesData))
 		activeQueriesJSON, err := json.Marshal(activeQueriesData)
 		if err != nil {
 			log.Printf("DEBUG: Error marshalling active queries data: %v", err)
@@ -384,8 +430,36 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 				pbBatch.Metadata = make(map[string]string)
 			}
 			pbBatch.Metadata["active_queries"] = string(activeQueriesJSON)
-			log.Printf("DEBUG: Added active_queries data to metadata with %d queries", len(activeQueriesData))
+			log.Printf("DEBUG: Successfully added active_queries data to metadata with %d queries (JSON length: %d)",
+				len(activeQueriesData), len(string(activeQueriesJSON)))
+
+			// Verify the metadata contains the active_queries field
+			if metadataJSON, ok := pbBatch.Metadata["active_queries"]; ok {
+				log.Printf("DEBUG: Verified metadata contains active_queries field (length: %d)",
+					len(metadataJSON))
+
+				// Verify we can parse it back
+				var verifyQueries []interface{}
+				if err := json.Unmarshal([]byte(metadataJSON), &verifyQueries); err != nil {
+					log.Printf("DEBUG: Error verifying active_queries JSON: %v", err)
+				} else {
+					log.Printf("DEBUG: Successfully verified active_queries JSON can be parsed back")
+
+					// Check first query
+					if len(verifyQueries) > 0 {
+						if firstQuery, ok := verifyQueries[0].(map[string]interface{}); ok {
+							if queryText, ok := firstQuery["query"]; ok {
+								log.Printf("DEBUG: Verified first query has 'query' field: %v", queryText)
+							}
+						}
+					}
+				}
+			} else {
+				log.Printf("DEBUG: ERROR: Failed to verify active_queries in metadata")
+			}
 		}
+	} else {
+		log.Printf("DEBUG: No active queries data to add to metadata")
 	}
 
 	// Debug log for metrics count by type
@@ -413,12 +487,17 @@ func (ms *MetricsSender) sendPostgreSQLMetricBatch(ctx context.Context, batch *p
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	log.Printf("DEBUG: Sending metrics request to API with %d metrics and metadata keys: %v",
+		len(pbMetrics), getMapKeys(pbBatch.Metadata))
+
 	response, err := client.SendMetrics(ctx, request)
 	if err != nil {
+		log.Printf("DEBUG: Failed to send PostgreSQL metrics: %v", err)
 		return fmt.Errorf("failed to send PostgreSQL metrics: %w", err)
 	}
 
 	if response.Status != "success" {
+		log.Printf("DEBUG: Server returned error status: %s - %s", response.Status, response.Message)
 		return fmt.Errorf("server returned error: %s - %s", response.Status, response.Message)
 	}
 
@@ -816,4 +895,13 @@ func (ms *MetricsSender) StartMongoDBPeriodicCollection(interval time.Duration) 
 	}()
 
 	log.Printf("Started periodic MongoDB metrics collection with interval: %v", interval)
+}
+
+// Helper function to get map keys
+func getMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

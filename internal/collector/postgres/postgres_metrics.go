@@ -1490,16 +1490,18 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 		ORDER BY duration_seconds DESC
 	`
 
-	logger.Debug("Executing active queries collection query")
+	logger.Debug("PostgreSQL - Executing active queries collection query: %s", query)
 	rows, err := db.Query(query)
 	if err != nil {
-		logger.Error("Failed to collect active queries: %v", err)
+		logger.Error("PostgreSQL - Failed to collect active queries: %v", err)
 		return
 	}
 	defer rows.Close()
 
 	queryCount := 0
 	activeQueries := []map[string]interface{}{}
+
+	logger.Debug("PostgreSQL - Starting to scan active query results")
 
 	for rows.Next() {
 		queryCount++
@@ -1525,30 +1527,32 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			&queryTextNull,
 		)
 		if err != nil {
-			logger.Error("Error scanning active query row: %v", err)
+			logger.Error("PostgreSQL - Error scanning active query row: %v", err)
 			continue
 		}
 
 		// Debug log to check query text
+		logger.Debug("PostgreSQL - Active query #%d scan complete", queryCount)
+
 		if queryTextNull.Valid {
 			queryLen := len(queryTextNull.String)
 			previewLen := min(queryLen, 100)
-			logger.Debug("Query text found (length: %d): '%s'", queryLen, queryTextNull.String[:previewLen])
+			logger.Debug("PostgreSQL - Query text found (length: %d): '%s'", queryLen, queryTextNull.String[:previewLen])
 
 			// Additional debug for query content
 			if queryLen > 0 {
-				logger.Debug("Query first char code: %d, last char code: %d",
+				logger.Debug("PostgreSQL - Query first char code: %d, last char code: %d",
 					int(queryTextNull.String[0]), int(queryTextNull.String[queryLen-1]))
 
 				// Check for special characters
 				if strings.Contains(queryTextNull.String, "\u0000") {
-					logger.Debug("Query contains NULL bytes which may cause issues")
+					logger.Debug("PostgreSQL - Query contains NULL bytes which may cause issues")
 				}
 			} else {
-				logger.Debug("Query text is empty string (length 0)")
+				logger.Debug("PostgreSQL - Query text is empty string (length 0)")
 			}
 		} else {
-			logger.Debug("Query text is NULL")
+			logger.Debug("PostgreSQL - Query text is NULL")
 		}
 
 		// Handle NULL query text
@@ -1557,7 +1561,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			queryText = queryTextNull.String
 
 			// Log original query text before processing
-			logger.Debug("Original query before processing: '%s'", queryText[:min(len(queryText), 100)])
+			logger.Debug("PostgreSQL - Original query before processing: '%s'", queryText[:min(len(queryText), 100)])
 
 			// Replace newlines with spaces for better readability in metrics
 			queryText = strings.Replace(queryText, "\n", " ", -1)
@@ -1571,7 +1575,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			queryText = strings.Join(strings.Fields(queryText), " ")
 
 			// Log processed query text
-			logger.Debug("Processed query text: '%s'", queryText[:min(len(queryText), 100)])
+			logger.Debug("PostgreSQL - Processed query text: '%s'", queryText[:min(len(queryText), 100)])
 		}
 
 		// Truncate query text if too long
@@ -1591,6 +1595,9 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			"timestamp":        time.Unix(0, timestamp).Format(time.RFC3339Nano),
 		}
 
+		// Log query data map
+		logger.Debug("PostgreSQL - Created query data map with query field: %s", queryText[:min(len(queryText), 50)])
+
 		// Add optional fields only if they're valid
 		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
 			queryData["wait_event_type"] = waitEventTypeNull.String
@@ -1602,6 +1609,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 
 		// Add to the active queries list
 		activeQueries = append(activeQueries, queryData)
+		logger.Debug("PostgreSQL - Added query to activeQueries list (total: %d)", len(activeQueries))
 
 		// Create tags for this specific query (for backward compatibility with existing metrics)
 		tags := append([]MetricTag{}, baseTags...)
@@ -1663,15 +1671,19 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 		})
 	}
 
-	logger.Debug("Collected %d active queries", queryCount)
+	logger.Debug("PostgreSQL - Collected %d active queries", queryCount)
 
 	// Add the active queries as a single JSON object
 	if len(activeQueries) > 0 {
+		logger.Debug("PostgreSQL - Converting %d active queries to JSON", len(activeQueries))
 		activeQueriesJSON, err := json.Marshal(activeQueries)
 		if err != nil {
-			logger.Error("Error marshalling active queries: %v", err)
+			logger.Error("PostgreSQL - Error marshalling active queries: %v", err)
 		} else {
 			activeQueriesStr := string(activeQueriesJSON)
+			logger.Debug("PostgreSQL - Successfully marshalled active queries to JSON (length: %d bytes)", len(activeQueriesStr))
+			logger.Debug("PostgreSQL - First 200 chars of JSON: %s", activeQueriesStr[:min(len(activeQueriesStr), 200)])
+
 			*metrics = append(*metrics, Metric{
 				Name:        "postgresql.active_queries",
 				Value:       MetricValue{StringValue: &activeQueriesStr},
@@ -1679,8 +1691,10 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 				Timestamp:   timestamp,
 				Description: "List of currently running SQL queries",
 			})
-			logger.Debug("Added active_queries metric with %d queries", len(activeQueries))
+			logger.Debug("PostgreSQL - Added active_queries metric with %d queries", len(activeQueries))
 		}
+	} else {
+		logger.Debug("PostgreSQL - No active queries found to convert to JSON")
 	}
 }
 
