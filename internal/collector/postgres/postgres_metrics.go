@@ -1478,7 +1478,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			wait_event,
 			query
 		FROM pg_stat_activity
-		WHERE state = 'active'
+		WHERE state = 'active' and usename!='replicator'
 		  AND pid <> pg_backend_pid()
 		  AND query NOT LIKE '%pg_stat_activity%'
 		ORDER BY duration_seconds DESC
