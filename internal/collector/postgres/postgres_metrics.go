@@ -45,8 +45,16 @@ func (qi *QueryInfo) ToMap() map[string]interface{} {
 		completionTime = ""
 	}
 
+	// Format query_start properly - handle zero time
+	var queryStartFormatted string
+	if qi.QueryStart.IsZero() {
+		queryStartFormatted = ""
+	} else {
+		queryStartFormatted = qi.QueryStart.Format(time.RFC3339Nano)
+	}
+
 	return map[string]interface{}{
-		"pid":              qi.PID,
+		"pid":              int64(qi.PID), // Convert to int64 to prevent scientific notation
 		"database_name":    qi.DatabaseName,
 		"username":         qi.Username,
 		"application_name": qi.ApplicationName,
@@ -57,7 +65,7 @@ func (qi *QueryInfo) ToMap() map[string]interface{} {
 		"wait_event_type":  qi.WaitEventType,
 		"wait_event":       qi.WaitEvent,
 		"timestamp":        qi.StartTime.Format(time.RFC3339Nano),
-		"query_start":      qi.QueryStart.Format(time.RFC3339Nano),
+		"query_start":      queryStartFormatted,
 		"completion_time":  completionTime,
 	}
 }
