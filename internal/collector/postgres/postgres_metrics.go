@@ -9,16 +9,138 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/logger"
 )
 
+// QueryInfo represents information about a PostgreSQL query
+type QueryInfo struct {
+	PID             int       `json:"pid"`
+	DatabaseName    string    `json:"database_name"`
+	Username        string    `json:"username"`
+	ApplicationName string    `json:"application_name"`
+	ClientAddr      string    `json:"client_addr"`
+	State           string    `json:"state"`
+	QueryText       string    `json:"query"`
+	QueryStart      time.Time `json:"query_start"`
+	DurationSeconds float64   `json:"duration_seconds"`
+	WaitEventType   string    `json:"wait_event_type,omitempty"`
+	WaitEvent       string    `json:"wait_event,omitempty"`
+	StartTime       time.Time `json:"start_time"`
+}
+
+// ToMap converts QueryInfo to map[string]interface{} for JSON serialization
+func (qi *QueryInfo) ToMap() map[string]interface{} {
+	return map[string]interface{}{
+		"pid":              qi.PID,
+		"database_name":    qi.DatabaseName,
+		"username":         qi.Username,
+		"application_name": qi.ApplicationName,
+		"client_addr":      qi.ClientAddr,
+		"state":            qi.State,
+		"query":            qi.QueryText,
+		"duration_seconds": qi.DurationSeconds,
+		"wait_event_type":  qi.WaitEventType,
+		"wait_event":       qi.WaitEvent,
+		"timestamp":        qi.StartTime.Format(time.RFC3339Nano),
+		"query_start":      qi.QueryStart.Format(time.RFC3339Nano),
+	}
+}
+
+// QueryTracker tracks active queries to detect completed ones
+type QueryTracker struct {
+	previousQueries map[int]*QueryInfo // PID -> Query Info
+	mutex           sync.RWMutex
+}
+
+// NewQueryTracker creates a new query tracker
+func NewQueryTracker() *QueryTracker {
+	return &QueryTracker{
+		previousQueries: make(map[int]*QueryInfo),
+	}
+}
+
+// UpdateQueries updates the tracker with current active queries and returns completed queries
+func (qt *QueryTracker) UpdateQueries(currentQueries map[int]*QueryInfo) []*QueryInfo {
+	qt.mutex.Lock()
+	defer qt.mutex.Unlock()
+
+	var completedQueries []*QueryInfo
+
+	// Find completed queries (PIDs that were in previous but not in current)
+	for pid, prevQuery := range qt.previousQueries {
+		if _, exists := currentQueries[pid]; !exists {
+			// This query completed - calculate final duration
+			completedQuery := &QueryInfo{
+				PID:             prevQuery.PID,
+				DatabaseName:    prevQuery.DatabaseName,
+				Username:        prevQuery.Username,
+				ApplicationName: prevQuery.ApplicationName,
+				ClientAddr:      prevQuery.ClientAddr,
+				State:           "completed",
+				QueryText:       prevQuery.QueryText,
+				QueryStart:      prevQuery.QueryStart,
+				DurationSeconds: time.Since(prevQuery.QueryStart).Seconds(),
+				WaitEventType:   prevQuery.WaitEventType,
+				WaitEvent:       prevQuery.WaitEvent,
+				StartTime:       time.Now(), // When we detected completion
+			}
+			completedQueries = append(completedQueries, completedQuery)
+
+			logger.Debug("Query completed - PID: %d, Duration: %.3f seconds, Query: %.100s...",
+				pid, completedQuery.DurationSeconds, completedQuery.QueryText)
+		}
+	}
+
+	// Update previous queries with current ones
+	qt.previousQueries = make(map[int]*QueryInfo)
+	for pid, query := range currentQueries {
+		qt.previousQueries[pid] = query
+	}
+
+	logger.Debug("Query tracking update: %d active queries, %d completed queries detected",
+		len(currentQueries), len(completedQueries))
+
+	return completedQueries
+}
+
+// GetActiveQueries returns a copy of currently tracked active queries
+func (qt *QueryTracker) GetActiveQueries() map[int]*QueryInfo {
+	qt.mutex.RLock()
+	defer qt.mutex.RUnlock()
+
+	activeQueries := make(map[int]*QueryInfo)
+	for pid, query := range qt.previousQueries {
+		activeQueries[pid] = query
+	}
+
+	return activeQueries
+}
+
+// Clear clears all tracked queries
+func (qt *QueryTracker) Clear() {
+	qt.mutex.Lock()
+	defer qt.mutex.Unlock()
+
+	qt.previousQueries = make(map[int]*QueryInfo)
+	logger.Debug("Query tracker cleared")
+}
+
 // PostgreSQLMetricsCollector collects time-series metrics for PostgreSQL
 type PostgreSQLMetricsCollector struct {
-	cfg       *config.AgentConfig
-	collector *PostgresCollector
+	cfg                *config.AgentConfig
+	lastCollectionTime time.Time
+	collectionInterval time.Duration
+	maxRetries         int
+	backoffDuration    time.Duration
+	isHealthy          bool
+	lastHealthCheck    time.Time
+	queryTracker       *QueryTracker
+	collector          *PostgresCollector
 }
 
 // MetricValue represents a metric value with different types
@@ -57,8 +179,14 @@ type MetricBatch struct {
 // NewPostgreSQLMetricsCollector creates a new PostgreSQL metrics collector
 func NewPostgreSQLMetricsCollector(cfg *config.AgentConfig) *PostgreSQLMetricsCollector {
 	return &PostgreSQLMetricsCollector{
-		cfg:       cfg,
-		collector: NewPostgresCollector(cfg),
+		cfg:                cfg,
+		collectionInterval: 25 * time.Second,
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+		queryTracker:       NewQueryTracker(),
+		collector:          NewPostgresCollector(cfg),
 	}
 }
 
@@ -218,6 +346,9 @@ func (p *PostgreSQLMetricsCollector) CollectDatabaseMetrics() (*MetricBatch, err
 	}
 	defer db.Close()
 
+	// Base tags for all metrics
+	baseTags := []MetricTag{{Key: "host", Value: p.getHostname()}}
+
 	// Collect various database metrics
 	p.collectConnectionMetrics(db, &metrics, timestamp)
 	p.collectDatabaseStats(db, &metrics, timestamp)
@@ -228,6 +359,9 @@ func (p *PostgreSQLMetricsCollector) CollectDatabaseMetrics() (*MetricBatch, err
 
 	// Collect query performance metrics
 	p.collectQueryPerformanceMetrics(db, &metrics, timestamp)
+
+	// Collect active queries with PID tracking for completion detection
+	p.collectActiveQueries(db, &metrics, timestamp, baseTags)
 
 	return &MetricBatch{
 		AgentID:             p.getAgentID(),
@@ -1467,14 +1601,16 @@ func (p *PostgreSQLMetricsCollector) collectDatabaseQueryStats(db *sql.DB, metri
 
 // collectActiveQueries collects currently running queries for historical analysis
 func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[]Metric, timestamp int64, baseTags []MetricTag) {
-	// Query to get active queries with details
+	// Query to get active queries with PID for tracking
 	query := `
 		SELECT 
+			pid,
 			datname AS database_name,
 			usename AS username,
 			application_name,
 			client_addr,
 			state,
+			query_start,
 			EXTRACT(EPOCH FROM (NOW() - query_start)) AS duration_seconds,
 			wait_event_type,
 			wait_event,
@@ -1490,7 +1626,7 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 		ORDER BY duration_seconds DESC
 	`
 
-	logger.Debug("PostgreSQL - Executing active queries collection query: %s", query)
+	logger.Debug("PostgreSQL - Executing active queries collection query with PID tracking")
 	rows, err := db.Query(query)
 	if err != nil {
 		logger.Error("PostgreSQL - Failed to collect active queries: %v", err)
@@ -1500,11 +1636,13 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 
 	queryCount := 0
 	activeQueries := []interface{}{}
+	currentQueries := make(map[int]*QueryInfo)
 
-	logger.Debug("PostgreSQL - Starting to scan active query results")
+	logger.Debug("PostgreSQL - Starting to scan active query results with PID tracking")
 
 	for rows.Next() {
 		queryCount++
+		var pid int
 		var dbNameNull sql.NullString
 		var usernameNull sql.NullString
 		var appNameNull sql.NullString
@@ -1513,14 +1651,17 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 		var waitEventNull sql.NullString
 		var queryTextNull sql.NullString
 		var clientAddr sql.NullString
+		var queryStart time.Time
 		var durationSeconds float64
 
 		err := rows.Scan(
+			&pid,
 			&dbNameNull,
 			&usernameNull,
 			&appNameNull,
 			&clientAddr,
 			&stateNull,
+			&queryStart,
 			&durationSeconds,
 			&waitEventTypeNull,
 			&waitEventNull,
@@ -1531,51 +1672,21 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			continue
 		}
 
-		// Debug log to check query text
-		logger.Debug("PostgreSQL - Active query #%d scan complete", queryCount)
-
-		if queryTextNull.Valid {
-			queryLen := len(queryTextNull.String)
-			previewLen := min(queryLen, 100)
-			logger.Debug("PostgreSQL - Query text found (length: %d): '%s'", queryLen, queryTextNull.String[:previewLen])
-
-			// Additional debug for query content
-			if queryLen > 0 {
-				logger.Debug("PostgreSQL - Query first char code: %d, last char code: %d",
-					int(queryTextNull.String[0]), int(queryTextNull.String[queryLen-1]))
-
-				// Check for special characters
-				if strings.Contains(queryTextNull.String, "\u0000") {
-					logger.Debug("PostgreSQL - Query contains NULL bytes which may cause issues")
-				}
-			} else {
-				logger.Debug("PostgreSQL - Query text is empty string (length 0)")
-			}
-		} else {
-			logger.Debug("PostgreSQL - Query text is NULL")
-		}
+		logger.Debug("PostgreSQL - Active query #%d scan complete, PID: %d", queryCount, pid)
 
 		// Handle NULL query text
 		queryText := "UNKNOWN_QUERY"
 		if queryTextNull.Valid {
 			queryText = queryTextNull.String
 
-			// Log original query text before processing
-			logger.Debug("PostgreSQL - Original query before processing: '%s'", queryText[:min(len(queryText), 100)])
-
-			// Replace newlines with spaces for better readability in metrics
+			// Clean up query text
 			queryText = strings.Replace(queryText, "\n", " ", -1)
 			queryText = strings.Replace(queryText, "\r", " ", -1)
 			queryText = strings.Replace(queryText, "\t", " ", -1)
-
-			// Remove NULL bytes which can cause JSON issues
 			queryText = strings.Replace(queryText, "\u0000", "", -1)
-
-			// Remove extra spaces
 			queryText = strings.Join(strings.Fields(queryText), " ")
 
-			// Log processed query text
-			logger.Debug("PostgreSQL - Processed query text: '%s'", queryText[:min(len(queryText), 100)])
+			logger.Debug("PostgreSQL - Processed query text for PID %d: '%s'", pid, queryText[:min(len(queryText), 100)])
 		}
 
 		// Truncate query text if too long
@@ -1583,156 +1694,76 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 			queryText = queryText[:1000] + "..."
 		}
 
+		// Create QueryInfo for tracking
+		queryInfo := &QueryInfo{
+			PID:             pid,
+			DatabaseName:    dbNameNull.String,
+			Username:        usernameNull.String,
+			ApplicationName: appNameNull.String,
+			ClientAddr:      clientAddr.String,
+			State:           stateNull.String,
+			QueryText:       queryText,
+			QueryStart:      queryStart,
+			DurationSeconds: durationSeconds,
+			WaitEventType:   waitEventTypeNull.String,
+			WaitEvent:       waitEventNull.String,
+			StartTime:       time.Now(),
+		}
+
+		// Add to current queries for tracking
+		currentQueries[pid] = queryInfo
+
 		// Create a map for each active query in the format expected by the API
-		queryData := map[string]interface{}{
-			"database_name":    dbNameNull.String,
-			"username":         usernameNull.String,
-			"application_name": appNameNull.String,
-			"client_addr":      clientAddr.String,
-			"state":            stateNull.String,
-			"duration_seconds": durationSeconds,
-			"query":            queryText, // API expects "query" field
-			"timestamp":        time.Unix(0, timestamp).Format(time.RFC3339Nano),
-		}
+		queryData := queryInfo.ToMap()
 
-		// Debug log for each field in queryData
-		logger.Debug("PostgreSQL - Created queryData map:")
-		logger.Debug("PostgreSQL -   database_name: '%s' (from NULL: %v)", queryData["database_name"], !dbNameNull.Valid)
-		logger.Debug("PostgreSQL -   username: '%s' (from NULL: %v)", queryData["username"], !usernameNull.Valid)
-		logger.Debug("PostgreSQL -   application_name: '%s' (from NULL: %v)", queryData["application_name"], !appNameNull.Valid)
-		logger.Debug("PostgreSQL -   client_addr: '%s' (from NULL: %v)", queryData["client_addr"], !clientAddr.Valid)
-		logger.Debug("PostgreSQL -   state: '%s' (from NULL: %v)", queryData["state"], !stateNull.Valid)
-		logger.Debug("PostgreSQL -   duration_seconds: %v (type: %T)", queryData["duration_seconds"], queryData["duration_seconds"])
-		logger.Debug("PostgreSQL -   query: '%s' (length: %d, from NULL: %v)", queryData["query"], len(queryText), !queryTextNull.Valid)
-		logger.Debug("PostgreSQL -   timestamp: '%s'", queryData["timestamp"])
-
-		// Log query data map
-		logger.Debug("PostgreSQL - Created query data map with query field: %s", queryText[:min(len(queryText), 50)])
-
-		// Add optional fields only if they're valid
-		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
-			queryData["wait_event_type"] = waitEventTypeNull.String
-			logger.Debug("PostgreSQL -   wait_event_type: '%s'", queryData["wait_event_type"])
-		}
-
-		if waitEventNull.Valid && waitEventNull.String != "" {
-			queryData["wait_event"] = waitEventNull.String
-			logger.Debug("PostgreSQL -   wait_event: '%s'", queryData["wait_event"])
-		}
+		logger.Debug("PostgreSQL - Created queryData for PID %d with query field: %s", pid, queryText[:min(len(queryText), 50)])
 
 		// Add to the active queries list
 		activeQueries = append(activeQueries, queryData)
-		logger.Debug("PostgreSQL - Added query to activeQueries list (total: %d)", len(activeQueries))
-
-		// Create tags for this specific query (for backward compatibility with existing metrics)
-		tags := append([]MetricTag{}, baseTags...)
-
-		// Handle NULL database name
-		dbName := "unknown"
-		if dbNameNull.Valid {
-			dbName = dbNameNull.String
-		}
-
-		// Handle NULL username
-		username := "unknown"
-		if usernameNull.Valid {
-			username = usernameNull.String
-		}
-
-		// Handle NULL application name
-		appName := "unknown"
-		if appNameNull.Valid {
-			appName = appNameNull.String
-		}
-
-		// Handle NULL state
-		state := "unknown"
-		if stateNull.Valid {
-			state = stateNull.String
-		}
-
-		// Handle NULL client address
-		clientAddrValue := "unknown"
-		if clientAddr.Valid {
-			clientAddrValue = clientAddr.String
-		}
-
-		tags = append(tags,
-			MetricTag{Key: "database", Value: dbName},
-			MetricTag{Key: "username", Value: username},
-			MetricTag{Key: "application", Value: appName},
-			MetricTag{Key: "state", Value: state},
-			MetricTag{Key: "client_addr", Value: clientAddrValue},
-		)
-
-		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
-			tags = append(tags, MetricTag{Key: "wait_event_type", Value: waitEventTypeNull.String})
-		}
-
-		if waitEventNull.Valid && waitEventNull.String != "" {
-			tags = append(tags, MetricTag{Key: "wait_event", Value: waitEventNull.String})
-		}
-
-		// Add query duration as a separate metric
-		*metrics = append(*metrics, Metric{
-			Name:        "postgresql.active_query.duration",
-			Value:       MetricValue{DoubleValue: &durationSeconds},
-			Tags:        tags,
-			Timestamp:   timestamp,
-			Unit:        "seconds",
-			Description: "Duration of currently running query in seconds",
-		})
+		logger.Debug("PostgreSQL - Added query PID %d to activeQueries list (total: %d)", pid, len(activeQueries))
 	}
 
-	logger.Debug("PostgreSQL - Collected %d active queries", queryCount)
+	// Update query tracker and get completed queries
+	completedQueries := p.queryTracker.UpdateQueries(currentQueries)
 
-	// Add the active queries as a single JSON object
+	// Process completed queries and add them to active queries list with "completed" state
+	for _, completedQuery := range completedQueries {
+		logger.Info("PostgreSQL - Query completed: PID %d, Duration: %.3f seconds, Query: %.100s...",
+			completedQuery.PID, completedQuery.DurationSeconds, completedQuery.QueryText)
+
+		// Add completed query to the list for API
+		completedQueryData := completedQuery.ToMap()
+		activeQueries = append(activeQueries, completedQueryData)
+	}
+
+	logger.Debug("PostgreSQL - Total queries collected: %d active + %d completed = %d total",
+		len(currentQueries), len(completedQueries), len(activeQueries))
+
+	// Convert to JSON and add to metadata
 	if len(activeQueries) > 0 {
-		logger.Debug("PostgreSQL - Converting %d active queries to JSON", len(activeQueries))
-
-		// Debug log for each query before JSON marshalling
-		for i, query := range activeQueries {
-			logger.Debug("PostgreSQL - Query %d before JSON marshalling:", i+1)
-			if queryMap, ok := query.(map[string]interface{}); ok {
-				for key, value := range queryMap {
-					logger.Debug("PostgreSQL -   %s: %v (type: %T)", key, value, value)
-				}
-			}
-		}
-
 		activeQueriesJSON, err := json.Marshal(activeQueries)
 		if err != nil {
-			logger.Error("PostgreSQL - Error marshalling active queries: %v", err)
-		} else {
-			activeQueriesStr := string(activeQueriesJSON)
-			logger.Debug("PostgreSQL - Successfully marshalled active queries to JSON (length: %d bytes)", len(activeQueriesStr))
-			logger.Debug("PostgreSQL - Full JSON: %s", activeQueriesStr)
-
-			// Parse back the JSON to verify it's correct
-			var verifyQueries []map[string]interface{}
-			if err := json.Unmarshal(activeQueriesJSON, &verifyQueries); err != nil {
-				logger.Error("PostgreSQL - Error verifying JSON: %v", err)
-			} else {
-				logger.Debug("PostgreSQL - JSON verification successful, parsed %d queries", len(verifyQueries))
-				if len(verifyQueries) > 0 {
-					logger.Debug("PostgreSQL - First query after JSON round-trip:")
-					for key, value := range verifyQueries[0] {
-						logger.Debug("PostgreSQL -   %s: %v (type: %T)", key, value, value)
-					}
-				}
-			}
-
-			*metrics = append(*metrics, Metric{
-				Name:        "postgresql.active_queries",
-				Value:       MetricValue{StringValue: &activeQueriesStr},
-				Tags:        baseTags,
-				Timestamp:   timestamp,
-				Description: "List of currently running SQL queries",
-			})
-			logger.Debug("PostgreSQL - Added active_queries metric with %d queries", len(activeQueries))
+			logger.Error("PostgreSQL - Failed to marshal active queries to JSON: %v", err)
+			return
 		}
+
+		logger.Debug("PostgreSQL - Active queries JSON created, length: %d bytes", len(activeQueriesJSON))
+		logger.Debug("PostgreSQL - Active queries JSON preview: %s", string(activeQueriesJSON)[:min(len(activeQueriesJSON), 500)])
+
+		// Add as a metric for API processing
+		activeQueriesMetric := Metric{
+			Name:        "postgresql.active_queries",
+			Value:       MetricValue{StringValue: &[]string{string(activeQueriesJSON)}[0]},
+			Tags:        baseTags,
+			Timestamp:   timestamp,
+			Unit:        "json",
+			Description: "Active and recently completed PostgreSQL queries",
+		}
+
+		*metrics = append(*metrics, activeQueriesMetric)
+		logger.Debug("PostgreSQL - Added active queries metric to metrics list")
 	} else {
-		logger.Debug("PostgreSQL - No active queries found to convert to JSON")
+		logger.Debug("PostgreSQL - No active or completed queries to report")
 	}
 }
 
@@ -1783,4 +1814,64 @@ func (p *PostgreSQLMetricsCollector) CollectAllMetrics() ([]*MetricBatch, error)
 	}
 
 	return batches, nil
+}
+
+// TestQueryTracking tests the PID tracking functionality
+func (p *PostgreSQLMetricsCollector) TestQueryTracking() error {
+	logger.Info("PostgreSQL - Testing PID tracking functionality...")
+
+	// Get database connection
+	db, err := p.collector.openDB()
+	if err != nil {
+		return fmt.Errorf("failed to get database connection: %w", err)
+	}
+	defer db.Close()
+
+	// Test query tracking for 3 cycles
+	for i := 0; i < 3; i++ {
+		logger.Info("PostgreSQL - Test cycle %d/3", i+1)
+
+		timestamp := time.Now().UnixNano()
+		var metrics []Metric
+		baseTags := []MetricTag{{Key: "host", Value: p.getHostname()}}
+
+		// Collect active queries
+		p.collectActiveQueries(db, &metrics, timestamp, baseTags)
+
+		// Check if we have active queries metric
+		for _, metric := range metrics {
+			if metric.Name == "postgresql.active_queries" {
+				if metric.Value.StringValue != nil {
+					logger.Info("PostgreSQL - Test cycle %d: Found active queries metric with %d bytes of data",
+						i+1, len(*metric.Value.StringValue))
+
+					// Parse and log the queries
+					var queries []interface{}
+					if err := json.Unmarshal([]byte(*metric.Value.StringValue), &queries); err == nil {
+						logger.Info("PostgreSQL - Test cycle %d: Successfully parsed %d queries", i+1, len(queries))
+
+						// Log details of each query
+						for j, q := range queries {
+							if queryMap, ok := q.(map[string]interface{}); ok {
+								pid := queryMap["pid"]
+								state := queryMap["state"]
+								duration := queryMap["duration_seconds"]
+								logger.Info("PostgreSQL - Query %d: PID=%v, State=%v, Duration=%.3fs",
+									j+1, pid, state, duration)
+							}
+						}
+					}
+				}
+				break
+			}
+		}
+
+		// Wait 2 seconds between cycles to see query completion detection
+		if i < 2 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	logger.Info("PostgreSQL - PID tracking test completed")
+	return nil
 }
