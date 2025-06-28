@@ -93,7 +93,7 @@ func (qt *QueryTracker) UpdateQueries(currentQueries map[int]*QueryInfo) []*Quer
 	// Find completed queries (PIDs that were in previous but not in current)
 	for pid, prevQuery := range qt.previousQueries {
 		if _, exists := currentQueries[pid]; !exists {
-			// This query completed - calculate final duration
+			// This query completed - use PostgreSQL's duration for consistency
 			completedQuery := &QueryInfo{
 				PID:             prevQuery.PID,
 				DatabaseName:    prevQuery.DatabaseName,
@@ -103,7 +103,7 @@ func (qt *QueryTracker) UpdateQueries(currentQueries map[int]*QueryInfo) []*Quer
 				State:           "completed",
 				QueryText:       prevQuery.QueryText,
 				QueryStart:      prevQuery.QueryStart,
-				DurationSeconds: time.Since(prevQuery.QueryStart).Seconds(),
+				DurationSeconds: prevQuery.DurationSeconds, // Use PostgreSQL's calculated duration
 				WaitEventType:   prevQuery.WaitEventType,
 				WaitEvent:       prevQuery.WaitEvent,
 				StartTime:       time.Now(), // When we detected completion
