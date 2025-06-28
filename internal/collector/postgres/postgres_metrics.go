@@ -1492,19 +1492,25 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 	defer rows.Close()
 
 	for rows.Next() {
-		var dbName, username, appName, state, waitEventType, waitEvent, queryText string
+		var dbNameNull sql.NullString
+		var usernameNull sql.NullString
+		var appNameNull sql.NullString
+		var stateNull sql.NullString
+		var waitEventTypeNull sql.NullString
+		var waitEventNull sql.NullString
+		var queryText string
 		var clientAddr sql.NullString
 		var durationSeconds float64
 
 		err := rows.Scan(
-			&dbName,
-			&username,
-			&appName,
+			&dbNameNull,
+			&usernameNull,
+			&appNameNull,
 			&clientAddr,
-			&state,
+			&stateNull,
 			&durationSeconds,
-			&waitEventType,
-			&waitEvent,
+			&waitEventTypeNull,
+			&waitEventNull,
 			&queryText,
 		)
 		if err != nil {
@@ -1519,23 +1525,51 @@ func (p *PostgreSQLMetricsCollector) collectActiveQueries(db *sql.DB, metrics *[
 
 		// Create tags for this specific query
 		tags := append([]MetricTag{}, baseTags...)
+
+		// Handle NULL database name
+		dbName := "unknown"
+		if dbNameNull.Valid {
+			dbName = dbNameNull.String
+		}
+
+		// Handle NULL username
+		username := "unknown"
+		if usernameNull.Valid {
+			username = usernameNull.String
+		}
+
+		// Handle NULL application name
+		appName := "unknown"
+		if appNameNull.Valid {
+			appName = appNameNull.String
+		}
+
+		// Handle NULL state
+		state := "unknown"
+		if stateNull.Valid {
+			state = stateNull.String
+		}
+
+		// Handle NULL client address
+		clientAddrValue := "unknown"
+		if clientAddr.Valid {
+			clientAddrValue = clientAddr.String
+		}
+
 		tags = append(tags,
 			MetricTag{Key: "database", Value: dbName},
 			MetricTag{Key: "username", Value: username},
 			MetricTag{Key: "application", Value: appName},
 			MetricTag{Key: "state", Value: state},
+			MetricTag{Key: "client_addr", Value: clientAddrValue},
 		)
 
-		if clientAddr.Valid {
-			tags = append(tags, MetricTag{Key: "client_addr", Value: clientAddr.String})
+		if waitEventTypeNull.Valid && waitEventTypeNull.String != "" {
+			tags = append(tags, MetricTag{Key: "wait_event_type", Value: waitEventTypeNull.String})
 		}
 
-		if waitEventType != "" {
-			tags = append(tags, MetricTag{Key: "wait_event_type", Value: waitEventType})
-		}
-
-		if waitEvent != "" {
-			tags = append(tags, MetricTag{Key: "wait_event", Value: waitEvent})
+		if waitEventNull.Valid && waitEventNull.String != "" {
+			tags = append(tags, MetricTag{Key: "wait_event", Value: waitEventNull.String})
 		}
 
 		// Add query text as a string value metric
