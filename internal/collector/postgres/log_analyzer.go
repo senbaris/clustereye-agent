@@ -476,7 +476,7 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 	buffer.processId = matches[2]
 
 	// Check if this is from the PostgreSQL UTC format with user/db details (postgresUTCRegex)
-	if len(matches) > 5 && matches[3] != "" {
+	if len(matches) > 5 {
 		// PostgreSQL UTC format has user and db in matches[3] and matches[4]
 		buffer.userName = matches[3]
 		buffer.database = matches[4]
