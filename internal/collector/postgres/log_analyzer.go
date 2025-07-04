@@ -346,25 +346,55 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	// Yanıt olarak hangi log girdilerini döndüreceğimize karar ver
 	var resultEntries []*pb.PostgresLogEntry
 
+	// Sadece SQL sorguları içeren girdileri filtrele (archive-push ve diğer sistem loglarını hariç tut)
+	var sqlEntries []*pb.PostgresLogEntry
+	for _, entry := range logEntries {
+		// SQL sorguları içeren girdileri belirle
+		if entry.InternalQuery != "" ||
+			strings.Contains(entry.Message, "duration:") ||
+			strings.Contains(entry.Message, "ERROR:") ||
+			strings.Contains(entry.Message, "FATAL:") ||
+			strings.Contains(entry.Message, "WARNING:") ||
+			(strings.Contains(entry.Message, "LOG:") &&
+				!strings.Contains(entry.Message, "archive-push") &&
+				!strings.Contains(entry.Message, "pushed WAL") &&
+				!strings.Contains(entry.Message, "checkpoint") &&
+				!strings.Contains(entry.Message, "autovacuum") &&
+				!strings.Contains(entry.Message, "automatic")) {
+			sqlEntries = append(sqlEntries, entry)
+		}
+	}
+
+	log.Printf("Filtreleme sonuçları: Toplam=%d, SQL girdileri=%d, Son 24 saat=%d",
+		len(logEntries), len(sqlEntries), len(last24HourEntries))
+
 	// Eğer yavaş sorgu eşiği belirlenmişse ve yavaş sorgular varsa, onları döndür
 	if slowQueryThresholdMs > 0 && len(slowQueryEntries) > 0 {
 		resultEntries = slowQueryEntries
 		log.Printf("Yavaş sorgu eşiğini (%d ms) geçen %d adet girdi döndürülüyor", slowQueryThresholdMs, len(resultEntries))
 	} else if slowQueryThresholdMs > 0 && len(slowQueryEntries) == 0 {
-		// Yavaş sorgu eşiği belirlenmişse ama yavaş sorgu yoksa, son 24 saatlik logları döndür
-		if len(last24HourEntries) > 0 {
+		// Yavaş sorgu eşiği belirlenmişse ama yavaş sorgu yoksa, SQL girdilerini öncelikle döndür
+		if len(sqlEntries) > 0 {
+			// En fazla 100 SQL girdi döndür
+			maxSample := 100
+			if len(sqlEntries) > maxSample {
+				resultEntries = sqlEntries[len(sqlEntries)-maxSample:]
+			} else {
+				resultEntries = sqlEntries
+			}
+			log.Printf("Yavaş sorgu bulunamadı, %d adet SQL log kaydı döndürülüyor", len(resultEntries))
+		} else if len(last24HourEntries) > 0 {
 			resultEntries = last24HourEntries
-			log.Printf("Yavaş sorgu bulunamadı, son 24 saate ait %d adet log kaydı döndürülüyor", len(resultEntries))
+			log.Printf("SQL sorgu bulunamadı, son 24 saate ait %d adet log kaydı döndürülüyor", len(resultEntries))
 		} else {
-			// Son 24 saate ait log yoksa, tüm loglardan örnek bir grup döndür (en fazla 100 girdi)
+			// Son çare olarak tüm loglardan örnek bir grup döndür
 			maxSample := 100
 			if len(logEntries) > maxSample {
-				// Son 100 girdiyi al
 				resultEntries = logEntries[len(logEntries)-maxSample:]
 			} else {
 				resultEntries = logEntries
 			}
-			log.Printf("Yavaş sorgu ve son 24 saatlik log bulunamadı, örnek %d adet log kaydı döndürülüyor", len(resultEntries))
+			log.Printf("Hiç uygun log bulunamadı, örnek %d adet log kaydı döndürülüyor", len(resultEntries))
 		}
 	} else {
 		// Yavaş sorgu eşiği belirtilmemişse, tüm geçerli girdileri döndür
