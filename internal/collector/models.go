@@ -16,6 +16,13 @@ type PostgresInfo struct {
 	TotalMemory       int64  // Toplam RAM miktarı (byte cinsinden)
 	ConfigPath        string // PostgreSQL configuration file path
 	DataPath          string // PostgreSQL data directory path
+	// Patroni-related fields
+	PatroniEnabled   bool   // Patroni ile yönetiliyor mu?
+	PatroniCluster   string // Patroni cluster adı
+	PatroniRole      string // Patroni role (Leader/Replica)
+	PatroniState     string // Patroni durumu
+	PatroniRestAPI   int    // Patroni REST API portu
+	PatroniDetection string // Patroni tespit bilgisi
 }
 
 type MSSQLInfo struct {

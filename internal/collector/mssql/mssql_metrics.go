@@ -619,8 +619,8 @@ func (m *MSSQLMetricsCollector) collectDatabaseSizes(db *sql.DB, metrics *[]Metr
 	query := `
 		SELECT 
 			DB_NAME(database_id) as database_name,
-			SUM(CASE WHEN type = 0 THEN size END) * 8 * 1024 as data_size_bytes,
-			SUM(CASE WHEN type = 1 THEN size END) * 8 * 1024 as log_size_bytes
+			SUM(CASE WHEN type = 0 THEN CAST(size AS bigint) END) * 8 * 1024 as data_size_bytes,
+			SUM(CASE WHEN type = 1 THEN CAST(size AS bigint) END) * 8 * 1024 as log_size_bytes
 		FROM sys.master_files
 		WHERE database_id > 4  -- Exclude system databases
 		GROUP BY database_id

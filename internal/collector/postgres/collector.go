@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +25,17 @@ import (
 	"github.com/senbaris/clustereye-agent/internal/config"
 	"github.com/senbaris/clustereye-agent/internal/logger"
 )
+
+// PatroniInfo contains information about Patroni configuration
+type PatroniInfo struct {
+	IsEnabled     bool   `json:"is_enabled"`
+	ClusterName   string `json:"cluster_name,omitempty"`
+	MemberName    string `json:"member_name,omitempty"`
+	Role          string `json:"role,omitempty"`          // "Leader", "Replica", "Unknown"
+	State         string `json:"state,omitempty"`         // "running", "stopped", etc.
+	RestAPIPort   int    `json:"rest_api_port,omitempty"` // Usually 8008
+	DetectionInfo string `json:"detection_info,omitempty"`
+}
 
 // PostgresCollector represents a PostgreSQL collector with rate limiting and circuit breaker
 type PostgresCollector struct {
@@ -278,6 +292,9 @@ func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 		normalizedCpu = 1
 	}
 
+	// Detect Patroni management
+	patroniInfo := c.DetectPatroni()
+
 	// Create info object with format-consistent values
 	info := map[string]interface{}{
 		"hostname":              hostname,
@@ -294,6 +311,13 @@ func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
 		"data_path":             c.getDataPath(),
 		"timestamp":             time.Now().Unix(),
 		"collection_successful": true,
+		// Patroni information
+		"patroni_enabled":   patroniInfo.IsEnabled,
+		"patroni_cluster":   patroniInfo.ClusterName,
+		"patroni_role":      patroniInfo.Role,
+		"patroni_state":     patroniInfo.State,
+		"patroni_rest_api":  patroniInfo.RestAPIPort,
+		"patroni_detection": patroniInfo.DetectionInfo,
 	}
 
 	// Apply normalization to ensure consistency
@@ -2479,29 +2503,367 @@ func (c *PostgresCollector) BatchCollectSystemMetrics() map[string]interface{} {
 func (c *PostgresCollector) measurePostgreSQLResponseTime() float64 {
 	start := time.Now()
 
-	// Get database connection
+	// Open database connection
 	db, err := c.openDB()
 	if err != nil {
-		log.Printf("DEBUG: PostgreSQL response time measurement failed - DB connection error: %v", err)
+		log.Printf("DEBUG: PostgreSQL - Failed to open DB for response time measurement: %v", err)
 		return -1.0
 	}
 	defer db.Close()
 
-	// Execute simple test query
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
+	// Execute simple query
 	var result int
-	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
-
-	elapsed := time.Since(start)
-	responseTimeMs := float64(elapsed.Nanoseconds()) / 1000000.0
-
+	err = db.QueryRow("SELECT 1").Scan(&result)
 	if err != nil {
-		log.Printf("DEBUG: PostgreSQL response time measurement failed - Query error: %v", err)
+		log.Printf("DEBUG: PostgreSQL - Failed to execute response time query: %v", err)
 		return -1.0
 	}
 
-	log.Printf("DEBUG: PostgreSQL response time measurement successful: %.6f ms", responseTimeMs)
+	duration := time.Since(start)
+	responseTimeMs := float64(duration.Nanoseconds()) / float64(time.Millisecond)
+
+	log.Printf("DEBUG: PostgreSQL - Response time measurement: %v (%.6f ms)", duration, responseTimeMs)
 	return responseTimeMs
+}
+
+// DetectPatroni detects if PostgreSQL is managed by Patroni
+func (c *PostgresCollector) DetectPatroni() *PatroniInfo {
+	logger.Info("PostgreSQL - Starting Patroni detection...")
+
+	patroniInfo := &PatroniInfo{
+		IsEnabled:     false,
+		DetectionInfo: "Detection started",
+	}
+
+	// Method 1: Check Patroni REST API (most reliable)
+	if c.checkPatroniRestAPI(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via REST API")
+		return patroniInfo
+	}
+
+	// Method 2: Check PostgreSQL parameters for Patroni-specific settings
+	if c.checkPatroniPostgreSQLParams(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via PostgreSQL parameters")
+		return patroniInfo
+	}
+
+	// Method 3: Check system processes for Patroni
+	if c.checkPatroniProcess(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via system process")
+		return patroniInfo
+	}
+
+	// Method 4: Check for Patroni configuration files
+	if c.checkPatroniConfigFiles(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via configuration files")
+		return patroniInfo
+	}
+
+	logger.Info("PostgreSQL - Patroni not detected")
+	patroniInfo.DetectionInfo = "Patroni not detected - checked REST API, PostgreSQL params, processes, and config files"
+	return patroniInfo
+}
+
+// checkPatroniRestAPI checks Patroni REST API (usually on port 8008)
+func (c *PostgresCollector) checkPatroniRestAPI(patroniInfo *PatroniInfo) bool {
+	// Common Patroni REST API ports
+	ports := []int{8008, 8009, 8010}
+
+	for _, port := range ports {
+		url := fmt.Sprintf("http://localhost:%d/patroni", port)
+
+		logger.Debug("PostgreSQL - Checking Patroni REST API at %s", url)
+
+		client := &http.Client{
+			Timeout: 3 * time.Second,
+		}
+
+		resp, err := client.Get(url)
+		if err != nil {
+			logger.Debug("PostgreSQL - Patroni REST API check failed for port %d: %v", port, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				logger.Warning("PostgreSQL - Failed to read Patroni REST API response: %v", err)
+				continue
+			}
+
+			var patroniResponse map[string]interface{}
+			if err := json.Unmarshal(body, &patroniResponse); err != nil {
+				logger.Warning("PostgreSQL - Failed to parse Patroni REST API response: %v", err)
+				continue
+			}
+
+			// Extract Patroni information
+			patroniInfo.IsEnabled = true
+			patroniInfo.RestAPIPort = port
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via REST API on port %d", port)
+
+			if cluster, ok := patroniResponse["cluster"].(string); ok {
+				patroniInfo.ClusterName = cluster
+			}
+
+			if member, ok := patroniResponse["member"].(string); ok {
+				patroniInfo.MemberName = member
+			}
+
+			if role, ok := patroniResponse["role"].(string); ok {
+				patroniInfo.Role = strings.Title(role)
+			}
+
+			if state, ok := patroniResponse["state"].(string); ok {
+				patroniInfo.State = state
+			}
+
+			logger.Info("PostgreSQL - Patroni REST API found: cluster=%s, member=%s, role=%s, state=%s",
+				patroniInfo.ClusterName, patroniInfo.MemberName, patroniInfo.Role, patroniInfo.State)
+			return true
+		}
+	}
+
+	return false
+}
+
+// checkPatroniPostgreSQLParams checks PostgreSQL parameters for Patroni-specific settings
+func (c *PostgresCollector) checkPatroniPostgreSQLParams(patroniInfo *PatroniInfo) bool {
+	db, err := c.openDB()
+	if err != nil {
+		logger.Warning("PostgreSQL - Failed to connect to database for Patroni parameter check: %v", err)
+		return false
+	}
+	defer db.Close()
+
+	// Check for Patroni-specific parameters
+	patroniParams := []string{
+		"cluster_name",
+		"wal_level",
+		"hot_standby",
+		"max_connections",
+		"max_wal_senders",
+		"max_replication_slots",
+	}
+
+	detectedParams := make(map[string]string)
+	patroniIndicators := 0
+
+	for _, param := range patroniParams {
+		var value string
+		query := fmt.Sprintf("SELECT setting FROM pg_settings WHERE name = '%s'", param)
+		err := db.QueryRow(query).Scan(&value)
+		if err != nil {
+			continue
+		}
+
+		detectedParams[param] = value
+
+		// Check for Patroni-typical configurations
+		switch param {
+		case "wal_level":
+			if value == "replica" || value == "logical" {
+				patroniIndicators++
+			}
+		case "hot_standby":
+			if value == "on" {
+				patroniIndicators++
+			}
+		case "max_wal_senders":
+			if val, err := strconv.Atoi(value); err == nil && val > 0 {
+				patroniIndicators++
+			}
+		case "max_replication_slots":
+			if val, err := strconv.Atoi(value); err == nil && val > 0 {
+				patroniIndicators++
+			}
+		}
+	}
+
+	// Check for cluster_name parameter specifically (Patroni usually sets this)
+	if clusterName, exists := detectedParams["cluster_name"]; exists && clusterName != "" {
+		patroniInfo.ClusterName = clusterName
+		patroniIndicators += 2 // cluster_name is a strong indicator
+	}
+
+	// Check for Patroni-specific functions or views
+	var patroniViewCount int
+	viewQuery := `
+		SELECT COUNT(*) 
+		FROM information_schema.tables 
+		WHERE table_schema = 'public' 
+		AND table_name LIKE '%patroni%'
+	`
+	db.QueryRow(viewQuery).Scan(&patroniViewCount)
+
+	if patroniViewCount > 0 {
+		patroniIndicators++
+	}
+
+	// If we have enough indicators, consider it Patroni-managed
+	if patroniIndicators >= 3 {
+		patroniInfo.IsEnabled = true
+		patroniInfo.DetectionInfo = fmt.Sprintf("Detected via PostgreSQL parameters (indicators: %d)", patroniIndicators)
+
+		// Try to determine role from replication status
+		var isInRecovery bool
+		err = db.QueryRow("SELECT pg_is_in_recovery()").Scan(&isInRecovery)
+		if err == nil {
+			if isInRecovery {
+				patroniInfo.Role = "Replica"
+			} else {
+				patroniInfo.Role = "Leader"
+			}
+		}
+
+		logger.Info("PostgreSQL - Patroni detected via parameters: cluster=%s, role=%s",
+			patroniInfo.ClusterName, patroniInfo.Role)
+		return true
+	}
+
+	return false
+}
+
+// checkPatroniProcess checks if Patroni process is running
+func (c *PostgresCollector) checkPatroniProcess(patroniInfo *PatroniInfo) bool {
+	// Check for Patroni process using ps command
+	cmd := exec.Command("ps", "aux")
+	output, err := cmd.Output()
+	if err != nil {
+		logger.Warning("PostgreSQL - Failed to execute ps command for Patroni process check: %v", err)
+		return false
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), "patroni") {
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = "Detected via system process"
+
+			// Try to extract more information from the process line
+			if strings.Contains(line, "patroni") && strings.Contains(line, "python") {
+				patroniInfo.State = "running"
+			}
+
+			logger.Info("PostgreSQL - Patroni process found: %s", strings.TrimSpace(line))
+			return true
+		}
+	}
+
+	// Also check with pgrep if available
+	cmd = exec.Command("pgrep", "-f", "patroni")
+	output, err = cmd.Output()
+	if err == nil && len(output) > 0 {
+		patroniInfo.IsEnabled = true
+		patroniInfo.DetectionInfo = "Detected via pgrep"
+		patroniInfo.State = "running"
+		logger.Info("PostgreSQL - Patroni process found via pgrep")
+		return true
+	}
+
+	return false
+}
+
+// checkPatroniConfigFiles checks for Patroni configuration files
+func (c *PostgresCollector) checkPatroniConfigFiles(patroniInfo *PatroniInfo) bool {
+	// Common Patroni config file locations
+	configPaths := []string{
+		"/etc/patroni/patroni.yml",
+		"/etc/patroni.yml",
+		"/opt/patroni/patroni.yml",
+		"/usr/local/etc/patroni.yml",
+		"/var/lib/postgresql/patroni.yml",
+	}
+
+	for _, configPath := range configPaths {
+		if _, err := os.Stat(configPath); err == nil {
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via config file: %s", configPath)
+
+			// Try to read basic info from config file
+			if content, err := os.ReadFile(configPath); err == nil {
+				contentStr := string(content)
+
+				// Extract cluster name from YAML config
+				if lines := strings.Split(contentStr, "\n"); len(lines) > 0 {
+					for _, line := range lines {
+						line = strings.TrimSpace(line)
+						if strings.HasPrefix(line, "name:") {
+							if parts := strings.Split(line, ":"); len(parts) > 1 {
+								patroniInfo.ClusterName = strings.TrimSpace(parts[1])
+							}
+						}
+						if strings.HasPrefix(line, "scope:") {
+							if parts := strings.Split(line, ":"); len(parts) > 1 {
+								if patroniInfo.ClusterName == "" {
+									patroniInfo.ClusterName = strings.TrimSpace(parts[1])
+								}
+							}
+						}
+					}
+				}
+			}
+
+			logger.Info("PostgreSQL - Patroni config file found: %s, cluster=%s",
+				configPath, patroniInfo.ClusterName)
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestPatroniDetection tests the Patroni detection functionality
+func (c *PostgresCollector) TestPatroniDetection() {
+	logger.Info("PostgreSQL - Testing Patroni detection functionality...")
+
+	patroniInfo := c.DetectPatroni()
+
+	logger.Info("========== PATRONI DETECTION TEST RESULTS ==========")
+	logger.Info("Patroni Enabled: %t", patroniInfo.IsEnabled)
+	logger.Info("Cluster Name: %s", patroniInfo.ClusterName)
+	logger.Info("Member Name: %s", patroniInfo.MemberName)
+	logger.Info("Role: %s", patroniInfo.Role)
+	logger.Info("State: %s", patroniInfo.State)
+	logger.Info("REST API Port: %d", patroniInfo.RestAPIPort)
+	logger.Info("Detection Info: %s", patroniInfo.DetectionInfo)
+	logger.Info("=================================================")
+
+	if patroniInfo.IsEnabled {
+		logger.Info("✅ Patroni DETECTED - PostgreSQL cluster is managed by Patroni")
+		logger.Info("   - Detection method: %s", patroniInfo.DetectionInfo)
+		if patroniInfo.ClusterName != "" {
+			logger.Info("   - Cluster: %s", patroniInfo.ClusterName)
+		}
+		if patroniInfo.Role != "" {
+			logger.Info("   - Role: %s", patroniInfo.Role)
+		}
+		if patroniInfo.RestAPIPort > 0 {
+			logger.Info("   - REST API Port: %d", patroniInfo.RestAPIPort)
+		}
+	} else {
+		logger.Info("❌ Patroni NOT DETECTED - PostgreSQL appears to be standalone or managed by other HA solution")
+		logger.Info("   - Check details: %s", patroniInfo.DetectionInfo)
+	}
+}
+
+// Global TestPatroniDetection function for easy testing
+func TestPatroniDetection() {
+	logger.Info("Starting global Patroni detection test...")
+
+	// Use default configuration
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		logger.Error("Failed to load configuration: %v", err)
+		return
+	}
+
+	// Create collector instance
+	collector := NewPostgresCollector(cfg)
+
+	// Run the test
+	collector.TestPatroniDetection()
 }

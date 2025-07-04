@@ -3,11 +3,12 @@ module github.com/senbaris/clustereye-agent
 go 1.24.1
 
 require (
+	github.com/StackExchange/wmi v1.2.1
 	github.com/google/uuid v1.6.0
 	github.com/kardianos/service v1.2.2
 	github.com/lib/pq v1.10.9
 	github.com/microsoft/go-mssqldb v1.8.0
-	github.com/sefaphlvn/clustereye-test v1.0.142
+	github.com/sefaphlvn/clustereye-test v1.0.168
 	go.mongodb.org/mongo-driver v1.17.3
 	golang.org/x/sys v0.33.0
 	google.golang.org/grpc v1.72.0
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/go-ole/go-ole v1.2.5 // indirect
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
 	github.com/golang-sql/sqlexp v0.1.0 // indirect

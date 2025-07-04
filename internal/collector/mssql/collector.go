@@ -293,6 +293,74 @@ func (c *MSSQLCollector) GetMSSQLVersion() (string, string) {
 	return "Unknown", edition
 }
 
+// isNodeDefinitelyStandalone checks if a node is definitely standalone (never been part of cluster)
+func (c *MSSQLCollector) isNodeDefinitelyStandalone() bool {
+	// Check cache first for any historical cluster membership
+	haState, hasHAState := c.getHAStateFromCache("mssql_ha_state")
+	if hasHAState && haState.group != "" {
+		log.Printf("Node daha önce bir cluster üyesi olmuş: %s, standalone değil", haState.group)
+		return false
+	}
+
+	// Check if cache file indicates cluster membership
+	cacheFile := getCacheFilePath()
+	existingData, _ := os.ReadFile(cacheFile)
+
+	if len(existingData) > 0 {
+		var existingCache struct {
+			IsClusterMember bool   `json:"is_cluster_member"`
+			Group           string `json:"group"`
+		}
+
+		if json.Unmarshal(existingData, &existingCache) == nil {
+			if existingCache.IsClusterMember || existingCache.Group != "" {
+				log.Printf("Önbellekte cluster üyeliği işaretlenmiş, standalone değil")
+				return false
+			}
+		}
+	}
+
+	// Try database connection to check current status
+	db, err := c.GetClient()
+	if err != nil {
+		log.Printf("Veritabanı bağlantısı kurulamadı, standalone kontrolü yapılamıyor: %v", err)
+		// If we can't connect and there's no cache indicating cluster membership,
+		// we cannot be sure this is standalone - return false to be safe
+		return false
+	}
+	defer db.Close()
+
+	// Check if AlwaysOn has ever been configured on this instance
+	var alwaysOnConfigured int
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, `
+		SELECT CASE 
+			WHEN EXISTS (
+				SELECT 1 FROM sys.availability_groups
+			) OR EXISTS (
+				SELECT 1 FROM sys.availability_replicas
+			) OR SERVERPROPERTY('IsHadrEnabled') = 1
+			THEN 1
+			ELSE 0
+		END AS AlwaysOnConfigured
+	`).Scan(&alwaysOnConfigured)
+
+	if err != nil {
+		log.Printf("AlwaysOn konfigürasyon kontrolü başarısız: %v", err)
+		return false // Be safe, don't assume standalone
+	}
+
+	if alwaysOnConfigured == 1 {
+		log.Printf("Bu instance'da AlwaysOn yapılandırılmış, standalone değil")
+		return false
+	}
+
+	log.Printf("Bu node kesinlikle standalone olarak belirlendi")
+	return true
+}
+
 // GetNodeStatus returns the node's role in HA configuration
 func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 	// Comprehensive debug logging
@@ -372,7 +440,14 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 			return haState.role, true
 		}
 
-		return "STANDALONE", false
+		// Sadece kesinlikle standalone olduğundan eminsen STANDALONE döndür
+		if c.isNodeDefinitelyStandalone() {
+			log.Printf("Node kesinlikle standalone olarak belirlendi")
+			return "STANDALONE", false
+		} else {
+			log.Printf("Node durumu belirsiz, failover veya geçici sorun olabilir")
+			return "UNKNOWN", false
+		}
 	}
 	defer func() {
 		logger.Debug("GetNodeStatus: Closing database connection")
@@ -397,7 +472,15 @@ func (c *MSSQLCollector) GetNodeStatus() (string, bool) {
 
 	if err != nil || isHAEnabled == 0 {
 		log.Printf("AlwaysOn özelliği etkin değil veya kontrol edilemiyor: %v", err)
-		return "STANDALONE", false
+
+		// Sadece kesinlikle standalone olduğundan eminsen STANDALONE döndür
+		if c.isNodeDefinitelyStandalone() {
+			log.Printf("Node kesinlikle standalone olarak belirlendi")
+			return "STANDALONE", false
+		} else {
+			log.Printf("Node durumu belirsiz, failover veya geçici sorun olabilir")
+			return "UNKNOWN", false
+		}
 	}
 
 	log.Printf("AlwaysOn özelliği etkin, node rolü tespit ediliyor...")
@@ -1566,8 +1649,17 @@ func (c *MSSQLCollector) GetMSSQLInfo() *MSSQLInfo {
 				}
 			}
 		} else {
-			nodeStatus = "STANDALONE"
-			isHAEnabled = false
+			// Sadece kesinlikle standalone olduğundan eminsen STANDALONE olarak işaretle
+			if c.isNodeDefinitelyStandalone() {
+				nodeStatus = "STANDALONE"
+				isHAEnabled = false
+				log.Printf("Node kesinlikle standalone olarak belirlendi")
+			} else {
+				// Emin değilsek, UNKNOWN olarak işaretle
+				nodeStatus = "UNKNOWN"
+				isHAEnabled = false
+				log.Printf("Node durumu belirsiz, failover veya geçici sorun olabilir")
+			}
 		}
 	}
 
@@ -2149,6 +2241,23 @@ func (c *MSSQLCollector) getCachedMemory() int64 {
 
 // ToProto converts MSSQLInfo to protobuf message
 func (m *MSSQLInfo) ToProto() *pb.MSSQLInfo {
+	// Son kontrol: Eğer NodeStatus STANDALONE ise ama IsHAEnabled true ise,
+	// bu çelişkili bir durumdur ve muhtemelen failover anında yakalanmıştır
+	if m.NodeStatus == "STANDALONE" && m.IsHAEnabled {
+		log.Printf("ÖNEMLİ UYARI: Çelişkili durum tespit edildi - NodeStatus=STANDALONE ama IsHAEnabled=true")
+		log.Printf("Bu failover anında yakalanmış olabilir, NodeStatus'u UNKNOWN olarak değiştiriliyor")
+		m.NodeStatus = "UNKNOWN"
+		m.HARole = "UNKNOWN"
+	}
+
+	// Eğer ClusterName varsa ama NodeStatus STANDALONE ise, bu da çelişkili bir durumdur
+	if m.ClusterName != "" && m.NodeStatus == "STANDALONE" {
+		log.Printf("ÖNEMLİ UYARI: Çelişkili durum tespit edildi - ClusterName='%s' ama NodeStatus=STANDALONE", m.ClusterName)
+		log.Printf("Bu failover anında yakalanmış olabilir, NodeStatus'u UNKNOWN olarak değiştiriliyor")
+		m.NodeStatus = "UNKNOWN"
+		m.HARole = "UNKNOWN"
+		m.IsHAEnabled = true
+	}
 	// Ensure consistent numeric formatting to prevent false change detection
 	// API compares values as strings, so we need to avoid scientific notation
 
@@ -3517,6 +3626,21 @@ func (c *MSSQLCollector) shouldCollectAlwaysOnMetrics() bool {
 	// Cache exists and is fresh (less than 5 minutes old), skip collection
 	log.Printf("Fresh AlwaysOn metrics cache available, skipping collection to reduce load")
 	return false
+}
+
+// ForceStandaloneMode forces this node to be treated as standalone by clearing all HA cache
+func (c *MSSQLCollector) ForceStandaloneMode() error {
+	log.Printf("MSSQL node zorla standalone moduna alınıyor...")
+
+	// HA cache'ini tamamen temizle
+	cacheFile := getCacheFilePath()
+	if err := os.Remove(cacheFile); err != nil && !os.IsNotExist(err) {
+		log.Printf("HA cache dosyası silinemedi: %v", err)
+		return fmt.Errorf("HA cache dosyası silinemedi: %v", err)
+	}
+
+	log.Printf("HA cache temizlendi, node artık standalone olarak algılanacak")
+	return nil
 }
 
 // ClearCaches clears all MSSQL related cache files to remove any inconsistent data

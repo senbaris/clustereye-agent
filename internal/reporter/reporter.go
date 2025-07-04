@@ -742,6 +742,25 @@ func (r *Reporter) SendMSSQLInfo() error {
 		return fmt.Errorf("MSSQL bilgileri alınamadı")
 	}
 
+	// KRİTİK KONTROL: Eğer NodeStatus STANDALONE ise ama ClusterName varsa veya IsHAEnabled true ise,
+	// bu çelişkili bir durumdur ve muhtemelen failover anında yakalanmıştır
+	// Bu durumda API'ye STANDALONE olarak göndermek yerine, veri göndermeyi tamamen atla
+	if mssqlInfo.NodeStatus == "STANDALONE" && (mssqlInfo.ClusterName != "" || mssqlInfo.IsHAEnabled) {
+		log.Printf("KRİTİK UYARI: Çelişkili durum tespit edildi - NodeStatus=STANDALONE ama ClusterName='%s' veya IsHAEnabled=%v",
+			mssqlInfo.ClusterName, mssqlInfo.IsHAEnabled)
+		log.Printf("Bu failover anında yakalanmış olabilir, API'ye veri gönderimi atlanıyor")
+		log.Printf("Önbellekteki HA bilgilerini koruyarak, bir sonraki toplama döngüsünde doğru bilgi gönderilecek")
+		return nil // Hata döndürmek yerine, sessizce atla
+	}
+
+	// Eğer NodeStatus UNKNOWN ise ve ClusterName varsa, bu da potansiyel bir failover durumudur
+	// Bu durumda da API'ye göndermek yerine bekle
+	if mssqlInfo.NodeStatus == "UNKNOWN" && mssqlInfo.ClusterName != "" {
+		log.Printf("UYARI: NodeStatus=UNKNOWN ama ClusterName='%s' - failover durumunda olabilir", mssqlInfo.ClusterName)
+		log.Printf("Doğru bilgi netleşene kadar API'ye veri gönderimi atlanıyor")
+		return nil // Hata döndürmek yerine, sessizce atla
+	}
+
 	// MSSQL bilgilerini protobuf mesajına dönüştür
 	protoInfo := mssqlInfo.ToProto()
 
@@ -3642,7 +3661,10 @@ func (r *Reporter) reconnect() error {
 			go func() {
 				time.Sleep(1 * time.Second)
 				if err := r.SendMSSQLInfo(); err != nil {
-					log.Printf("Yeniden bağlantı sonrası MSSQL bilgileri gönderilemedi: %v", err)
+					// SendMSSQLInfo artık çelişkili durumda nil döndürüyor, bu normal bir durum
+					if err.Error() != "" {
+						log.Printf("Yeniden bağlantı sonrası MSSQL bilgileri gönderilemedi: %v", err)
+					}
 				} else {
 					log.Printf("Yeniden bağlantı sonrası MSSQL bilgileri başarıyla gönderildi")
 				}
@@ -3708,6 +3730,13 @@ func (r *Reporter) SendPostgresInfo() error {
 	}
 	log.Printf("PostgreSQL veri dizini: %s", dataPath)
 
+	// PostgreSQL collector instance'ı oluştur ve Patroni tespiti yap
+	pgCollector := postgres.NewPostgresCollector(r.cfg)
+	patroniInfo := pgCollector.DetectPatroni()
+
+	log.Printf("Patroni tespit sonucu: Enabled=%t, Cluster=%s, Role=%s, State=%s, Detection=%s",
+		patroniInfo.IsEnabled, patroniInfo.ClusterName, patroniInfo.Role, patroniInfo.State, patroniInfo.DetectionInfo)
+
 	// PostgreSQL bilgilerini oluştur
 	pgInfo := &pb.PostgresInfo{
 		ClusterName:       r.cfg.PostgreSQL.Cluster,
@@ -3725,6 +3754,13 @@ func (r *Reporter) SendPostgresInfo() error {
 		TotalMemory:       totalMemory,
 		ConfigPath:        configPath,
 		DataPath:          dataPath,
+		// Patroni bilgileri
+		PatroniEnabled:   patroniInfo.IsEnabled,
+		PatroniCluster:   patroniInfo.ClusterName,
+		PatroniRole:      patroniInfo.Role,
+		PatroniState:     patroniInfo.State,
+		PatroniRestApi:   int32(patroniInfo.RestAPIPort),
+		PatroniDetection: patroniInfo.DetectionInfo,
 	}
 
 	// PostgreSQL bilgilerini logla
