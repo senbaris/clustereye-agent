@@ -2610,20 +2610,28 @@ func (c *PostgresCollector) checkPatroniService(patroniInfo *PatroniInfo) bool {
 			return true
 		}
 
-		// Check exit code - service might exist but not be loaded
+		// Check exit code for proper interpretation
 		if exitError, ok := err.(*exec.ExitError); ok {
 			exitCode := exitError.ExitCode()
 			logger.Debug("PostgreSQL - Service '%s' check returned exit code: %d", serviceName, exitCode)
 
-			// Exit code 4 usually means service exists but not loaded
-			// Exit code 3 means service not found
-			if exitCode == 4 {
+			// Systemctl exit codes:
+			// 0: running
+			// 1: dead
+			// 2: dead and pid file exists
+			// 3: not running (service exists but stopped)
+			// 4: no such service (unit not found) - means Patroni is NOT installed
+
+			if exitCode == 3 {
+				// Service exists but is stopped - Patroni is installed but not running
 				patroniInfo.IsEnabled = true
-				patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service (not loaded): %s", serviceName)
-				patroniInfo.State = "not_loaded"
-				logger.Info("PostgreSQL - Patroni service found but not loaded: %s", serviceName)
+				patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service (stopped): %s", serviceName)
+				patroniInfo.State = "stopped"
+				logger.Info("PostgreSQL - Patroni service found but stopped: %s", serviceName)
 				return true
 			}
+			// Exit code 4 means "Unit not found" - Patroni is NOT installed, continue checking
+			logger.Debug("PostgreSQL - Service '%s' not found (exit code %d)", serviceName, exitCode)
 		}
 	}
 
