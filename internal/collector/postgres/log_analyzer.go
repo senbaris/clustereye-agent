@@ -293,7 +293,12 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 				if buffer.isStatement {
 					buffer.query = append(buffer.query, line)
 					buffer.isMultiLine = true
-					if statementEndRegex.MatchString(line) {
+
+					// Check if this line ends the statement (with semicolon or natural end)
+					if statementEndRegex.MatchString(line) ||
+						strings.Contains(line, "RETURNING") ||
+						strings.Contains(line, "LIMIT") ||
+						strings.Contains(line, "OFFSET") {
 						multiLineQueries++
 						log.Printf("Çok satırlı sorgu tamamlandı (%d satır)", len(buffer.query))
 					}
@@ -503,16 +508,29 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 
 	// Check if this is a statement
 	message := buffer.message[0]
-	if strings.Contains(message, "statement:") {
-		parts := strings.SplitN(message, "statement:", 2)
+	if strings.Contains(message, "statement:") || strings.Contains(message, "STATEMENT:") {
+		var parts []string
+		if strings.Contains(message, "statement:") {
+			parts = strings.SplitN(message, "statement:", 2)
+		} else {
+			parts = strings.SplitN(message, "STATEMENT:", 2)
+		}
+
 		if len(parts) > 1 {
 			query := strings.TrimSpace(parts[1])
 			buffer.query = append(buffer.query, query)
 			buffer.isStatement = true
 
-			// Check if this might be a multi-line statement
-			if statementStartRegex.MatchString(query) && !statementEndRegex.MatchString(query) {
-				buffer.isMultiLine = true
+			// For statement logs, consider it single-line unless it's clearly incomplete
+			// PostgreSQL statements in logs are typically complete even without semicolons
+			if statementStartRegex.MatchString(query) {
+				// This is a valid SQL statement, don't mark as multi-line unless it's obviously incomplete
+				buffer.isMultiLine = false
+				truncatedQuery := query
+				if len(query) > 100 {
+					truncatedQuery = query[:100] + "..."
+				}
+				log.Printf("SQL statement bulundu: %s", truncatedQuery)
 			}
 		}
 	} else if strings.Contains(message, "execute <unnamed>:") {
@@ -523,9 +541,14 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 			buffer.query = append(buffer.query, query)
 			buffer.isStatement = true
 
-			// Check if this might be a multi-line statement
-			if statementStartRegex.MatchString(query) && !statementEndRegex.MatchString(query) {
-				buffer.isMultiLine = true
+			// For execute statements, consider complete unless obviously incomplete
+			if statementStartRegex.MatchString(query) {
+				buffer.isMultiLine = false
+				truncatedQuery := query
+				if len(query) > 100 {
+					truncatedQuery = query[:100] + "..."
+				}
+				log.Printf("SQL execute statement bulundu: %s", truncatedQuery)
 			}
 		}
 	} else if strings.Contains(message, "execute ") && strings.Contains(message, ": ") {
@@ -536,10 +559,13 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 			buffer.query = append(buffer.query, query)
 			buffer.isStatement = true
 
-			// Check if this might be a multi-line statement
-			if !statementEndRegex.MatchString(query) {
-				buffer.isMultiLine = true
+			// For execute statements, consider complete unless obviously incomplete
+			buffer.isMultiLine = false
+			truncatedQuery := query
+			if len(query) > 100 {
+				truncatedQuery = query[:100] + "..."
 			}
+			log.Printf("SQL execute statement (format 3) bulundu: %s", truncatedQuery)
 		}
 	}
 
@@ -574,10 +600,21 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 
 // processBufferedEntry converts a buffer to a log entry and performs final processing
 func processBufferedEntry(buffer *LogBuffer) *pb.PostgresLogEntry {
-	if buffer.isMultiLine {
-		// For multi-line queries, ensure we have a complete statement
+	if buffer.isMultiLine && len(buffer.query) > 0 {
+		// For multi-line queries, check if it looks reasonably complete
 		lastQuery := buffer.query[len(buffer.query)-1]
-		if !statementEndRegex.MatchString(lastQuery) {
+
+		// A query is considered complete if:
+		// 1. It ends with semicolon, OR
+		// 2. It contains SQL keywords that typically end statements, OR
+		// 3. It's a single-line query (not truly multi-line)
+		isComplete := statementEndRegex.MatchString(lastQuery) ||
+			strings.Contains(lastQuery, "RETURNING") ||
+			strings.Contains(lastQuery, "LIMIT") ||
+			strings.Contains(lastQuery, "OFFSET") ||
+			len(buffer.query) == 1
+
+		if !isComplete {
 			log.Printf("Eksik sonlandırılmış çok satırlı sorgu: %s", strings.Join(buffer.query, "\n"))
 		}
 	}
