@@ -2535,15 +2535,15 @@ func (c *PostgresCollector) DetectPatroni() *PatroniInfo {
 		DetectionInfo: "Detection started",
 	}
 
-	// Method 1: Check Patroni REST API (most reliable)
-	if c.checkPatroniRestAPI(patroniInfo) {
-		logger.Info("PostgreSQL - Patroni detected via REST API")
+	// Method 1: Check Patroni systemd service (most reliable and fast)
+	if c.checkPatroniService(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via systemd service")
 		return patroniInfo
 	}
 
-	// Method 2: Check PostgreSQL parameters for Patroni-specific settings
-	if c.checkPatroniPostgreSQLParams(patroniInfo) {
-		logger.Info("PostgreSQL - Patroni detected via PostgreSQL parameters")
+	// Method 2: Check Patroni REST API (reliable but requires running service)
+	if c.checkPatroniRestAPI(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via REST API")
 		return patroniInfo
 	}
 
@@ -2559,9 +2559,84 @@ func (c *PostgresCollector) DetectPatroni() *PatroniInfo {
 		return patroniInfo
 	}
 
+	// Method 5: Check PostgreSQL parameters for Patroni-specific settings (least reliable - prone to false positives)
+	if c.checkPatroniPostgreSQLParams(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via PostgreSQL parameters")
+		return patroniInfo
+	}
+
 	logger.Info("PostgreSQL - Patroni not detected")
 	patroniInfo.DetectionInfo = "Patroni not detected - checked REST API, PostgreSQL params, processes, and config files"
 	return patroniInfo
+}
+
+// checkPatroniService checks if Patroni systemd service exists and is installed
+func (c *PostgresCollector) checkPatroniService(patroniInfo *PatroniInfo) bool {
+	logger.Debug("PostgreSQL - Checking for Patroni systemd service...")
+
+	// Common Patroni service names
+	serviceNames := []string{
+		"patroni",
+		"patroni.service",
+		"postgresql-patroni",
+		"postgresql-patroni.service",
+	}
+
+	for _, serviceName := range serviceNames {
+		// Check if service exists (regardless of status)
+		cmd := exec.Command("systemctl", "status", serviceName)
+		output, err := cmd.Output()
+
+		if err == nil {
+			// Service exists - parse output for more details
+			outputStr := string(output)
+			logger.Debug("PostgreSQL - Found Patroni service '%s': %s", serviceName, strings.Split(outputStr, "\n")[0])
+
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service: %s", serviceName)
+
+			// Try to extract state from systemctl output
+			if strings.Contains(outputStr, "Active: active (running)") {
+				patroniInfo.State = "running"
+			} else if strings.Contains(outputStr, "Active: inactive") {
+				patroniInfo.State = "stopped"
+			} else if strings.Contains(outputStr, "Active: failed") {
+				patroniInfo.State = "failed"
+			} else {
+				patroniInfo.State = "unknown"
+			}
+
+			logger.Info("PostgreSQL - Patroni service found: %s (state: %s)", serviceName, patroniInfo.State)
+			return true
+		}
+
+		// Check exit code - service might exist but not be loaded
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode := exitError.ExitCode()
+			logger.Debug("PostgreSQL - Service '%s' check returned exit code: %d", serviceName, exitCode)
+
+			// Exit code 4 usually means service exists but not loaded
+			// Exit code 3 means service not found
+			if exitCode == 4 {
+				patroniInfo.IsEnabled = true
+				patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service (not loaded): %s", serviceName)
+				patroniInfo.State = "not_loaded"
+				logger.Info("PostgreSQL - Patroni service found but not loaded: %s", serviceName)
+				return true
+			}
+		}
+	}
+
+	// Also try to check if patroni command exists in PATH
+	cmd := exec.Command("which", "patroni")
+	if err := cmd.Run(); err == nil {
+		logger.Debug("PostgreSQL - Patroni binary found in PATH")
+		// Binary exists but no service - could be manual setup
+		// This alone is not enough for detection, let other methods check
+	}
+
+	logger.Debug("PostgreSQL - No Patroni systemd service found")
+	return false
 }
 
 // checkPatroniRestAPI checks Patroni REST API (usually on port 8008)
@@ -2701,10 +2776,22 @@ func (c *PostgresCollector) checkPatroniPostgreSQLParams(patroniInfo *PatroniInf
 		patroniIndicators++
 	}
 
-	// If we have enough indicators, consider it Patroni-managed
-	if patroniIndicators >= 3 {
+	// Check for Patroni-specific settings that are more conclusive
+	var patroniSpecificParams int
+
+	// Check for Patroni-specific parameter combinations that are strong indicators
+	if clusterName, exists := detectedParams["cluster_name"]; exists && clusterName != "" {
+		// Only count cluster_name if it follows Patroni naming patterns
+		if isPatroniClusterName(clusterName) {
+			patroniSpecificParams += 3
+		}
+	}
+
+	// If we have strong Patroni-specific indicators AND enough general indicators, consider it Patroni-managed
+	// Raised threshold to be more conservative and avoid false positives
+	if patroniSpecificParams >= 3 && patroniIndicators >= 5 {
 		patroniInfo.IsEnabled = true
-		patroniInfo.DetectionInfo = fmt.Sprintf("Detected via PostgreSQL parameters (indicators: %d)", patroniIndicators)
+		patroniInfo.DetectionInfo = fmt.Sprintf("Detected via PostgreSQL parameters (indicators: %d, specific: %d)", patroniIndicators, patroniSpecificParams)
 
 		// Try to determine role from replication status
 		var isInRecovery bool
@@ -2721,6 +2808,8 @@ func (c *PostgresCollector) checkPatroniPostgreSQLParams(patroniInfo *PatroniInf
 			patroniInfo.ClusterName, patroniInfo.Role)
 		return true
 	}
+
+	logger.Debug("PostgreSQL - Patroni parameter indicators (%d) below threshold for detection", patroniIndicators)
 
 	return false
 }
@@ -2814,6 +2903,39 @@ func (c *PostgresCollector) checkPatroniConfigFiles(patroniInfo *PatroniInfo) bo
 	}
 
 	return false
+}
+
+// isPatroniClusterName checks if cluster name follows Patroni naming patterns
+func isPatroniClusterName(clusterName string) bool {
+	// Patroni typically doesn't use simple version/path patterns like "15/main"
+	// which are more common in traditional PostgreSQL setups
+
+	// Common non-Patroni patterns that should be rejected
+	nonPatroniPatterns := []string{
+		"/main",    // PostgreSQL version paths like "15/main", "14/main"
+		"/primary", // Traditional setup patterns
+		"/data",    // Data directory patterns
+	}
+
+	for _, pattern := range nonPatroniPatterns {
+		if strings.Contains(clusterName, pattern) {
+			return false
+		}
+	}
+
+	// Simple version numbers alone are not typically Patroni clusters
+	if matched, _ := regexp.MatchString("^[0-9]+(\\.?[0-9]+)*$", clusterName); matched {
+		return false
+	}
+
+	// Version/path patterns like "15/main" are not typically Patroni
+	if matched, _ := regexp.MatchString("^[0-9]+/[a-z]+$", clusterName); matched {
+		return false
+	}
+
+	// If none of the exclusion patterns match, it could be a Patroni cluster name
+	// Patroni cluster names are usually more descriptive like "postgres-prod", "pg-cluster" etc.
+	return len(clusterName) > 2 && !strings.Contains(clusterName, "/")
 }
 
 // TestPatroniDetection tests the Patroni detection functionality
