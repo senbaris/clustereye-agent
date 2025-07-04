@@ -118,6 +118,11 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 	var slowQueryEntries []*pb.PostgresLogEntry  // Yavaş sorgu eşiğini geçen girdiler
 	var last24HourEntries []*pb.PostgresLogEntry // Son 24 saatlik loglar
 	scanner := bufio.NewScanner(file)
+
+	// Increase buffer size for very long log lines (default is 64KB, we set to 1MB)
+	const maxCapacity = 1024 * 1024
+	buf := make([]byte, maxCapacity)
+	scanner.Buffer(buf, maxCapacity)
 	totalLines := 0
 	validEntries := 0
 	slowQueries := 0
@@ -370,6 +375,9 @@ func AnalyzePostgresLog(logFilePath string, slowQueryThresholdMs int64) (*pb.Pos
 		file.Seek(0, 0)
 		scanner = bufio.NewScanner(file)
 
+		// Increase buffer size for very long log lines
+		scanner.Buffer(buf, maxCapacity)
+
 		// Şu anki zaman için varsayılan timestamp
 		currentTime := time.Now().Unix()
 
@@ -406,7 +414,10 @@ func parseLogLine(line string, matches []string, buffer *LogBuffer) bool {
 	var err error
 
 	// Try different timestamp formats based on which regex matched
-	if strings.Contains(timestampStr, "+") || strings.Contains(timestampStr, "-") && strings.Contains(timestampStr, ":") {
+	// Check for timezone indicators at the end of the timestamp (like "+03" or "-03")
+	hasTimezone := strings.Contains(timestampStr, " +") || strings.Contains(timestampStr, " -")
+
+	if hasTimezone {
 		// Format with timezone: 2025-04-19 13:08:29.513 +03
 		// Convert +03 format to +0300 format for proper parsing
 		if strings.Contains(timestampStr, " +03") {
